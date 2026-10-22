@@ -171,14 +171,42 @@ func IsAccountRestricted(body string) bool {
 	return hasBusinessCode(body, "11140")
 }
 
-// isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128
-// "request illegal"）。11128 还承载内容审核变体（"blocked by security policy"，
-// 归 ErrContentBlocked），故必须 code + 文案双条件，不能按 code 一刀切。
+// channelRefusedMarkers 是 WorkBuddy 11128 通道校验失败的典型文案集合。
+// 上游在通道校验拦截时，code 为 11128，但 msg 会随触发原因变化：
+//   - "request illegal"
+//   - "conversation id missing"
+//   - "first message is not system prompt"
+// 且 displayTips 含 "failed channel verification" / "渠道校验" / "通路驗證"。
+var channelRefusedMarkers = []string{
+	accountRestrictedMsg,
+	"conversation id missing",
+	"first message is not system prompt",
+	"failed channel verification",
+	"渠道校验",
+	"通路驗證",
+}
+
+// isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128）。
+// 11128 还承载内容审核变体（"blocked by security policy" / "unapproved channel" /
+// "illegal api invocation"，归 ErrContentBlocked 走提示词降级重试），故先排除
+// contentBlockedMarkers，再按业务码（兼容真实整型 11128 与脱敏串 "11-128"）+
+// 通道校验文案双条件判定。
 func isChannelRefused(body string) bool {
-	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
+	if !hasBusinessCode(body, "11128") && !hasBusinessCode(body, "11-128") {
 		return false
 	}
-	return hasBusinessCode(body, "11-128")
+	lower := strings.ToLower(body)
+	for _, m := range contentBlockedMarkers {
+		if strings.Contains(lower, m) {
+			return false
+		}
+	}
+	for _, m := range channelRefusedMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。

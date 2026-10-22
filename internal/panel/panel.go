@@ -851,13 +851,20 @@ func (p *Panel) refreshCreditsQuiet(uid string) {
 	if a == nil {
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err :=
-		p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	remain, total, expiring, earliestAt, earliestRemaining, buckets, err :=
+		p.cfg.Upstream.UserResourceSnapshot(a, p.expiringSoonWindow())
 	if err != nil {
 		log.Printf("panel: compensation 后刷新余额失败 uid=%s: %v", uid, err)
 		return
 	}
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	p.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:            remain,
+		Total:             total,
+		Expiring:          expiring,
+		EarliestAt:        earliestAt,
+		EarliestRemaining: earliestRemaining,
+		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	})
 }
 
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。

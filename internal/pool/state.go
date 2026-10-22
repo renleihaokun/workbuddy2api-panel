@@ -710,7 +710,7 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		mc := e.modelCooldowns[m]
 		if !mc.Until.IsZero() && now.Before(mc.Until) {
 			kind := "rate_limit"
-			if strings.HasPrefix(mc.Reason, "11102") {
+			if strings.HasPrefix(mc.Reason, "11102") || strings.HasPrefix(mc.Reason, "11158") {
 				kind = "model_unavailable"
 			}
 			row := RateLimitedModel{

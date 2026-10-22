@@ -503,7 +503,9 @@ func TestApplyErrorPolicyChannelRefusedDoesNotDisable(t *testing.T) {
 		wantDisabled bool
 		wantCooling  bool
 	}{
-		{"11128 channel refused", `{"code":"11-128","msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
+		{"11128 channel refused (int code)", `{"code":11128,"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
+		{"11128 channel refused (conversation id missing)", `{"code":11128,"msg":"conversation id missing","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
+		{"11128 channel refused (sanitized code)", `{"code":"11-128","msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, upstream.ErrChannelRefused, false, false},
 		{"11140 account restricted", `{"code":11140,"msg":"request illegal"}`, upstream.ErrAccountFault, true, false},
 		{"11140 rate-limiting variant", `{"code":11140,"msg":"The model provider is rate-limiting requests."}`, upstream.ErrSoftRate, false, true},
 	}

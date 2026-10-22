@@ -109,6 +109,7 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		out, serr := h.cfg.Upstream.Search(ctx, acct, query, maxResults, meta)
 		h.cfg.Pool.Release(acct.UID)
 		if serr == nil {
+			h.cfg.Pool.NoteSuccess(acct.UID)
 			return out, nil
 		}
 		lastErr = serr

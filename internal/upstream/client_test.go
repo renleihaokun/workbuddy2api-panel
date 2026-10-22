@@ -34,6 +34,10 @@ func TestClassify(t *testing.T) {
 		//   11128 = 通道校验失败（上游认为不是官方客户端发出），账号健康 → 不罚号。
 		//   11140 = 账号被上游限制（异常行为/风控）→ account_fault。
 		// 只看文案会把健康账号误禁用，只按 code 会把 11140 的限流变体误判。
+		{400, `{"code":11128,"msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, ErrChannelRefused},
+		{403, `{"code":11128,"msg":"request illegal"}`, ErrChannelRefused},
+		{400, `{"code":11128,"msg":"conversation id missing","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, ErrChannelRefused},
+		{400, `{"code":11128,"msg":"first message is not system prompt","displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。"}}`, ErrChannelRefused},
 		{400, `{"code":"11-128","msg":"request illegal","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`, ErrChannelRefused},
 		{403, `{"code":"11-128","msg":"request illegal"}`, ErrChannelRefused},
 		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
@@ -684,12 +688,18 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 // 连字符丢失（实现与测试同写成 11-128），双方自洽所以测试全绿，但线上永远命中不了
 // 真实业务码——本用例用字节构造业务码，防止「实现和测试一起写错」再次通过。
 func TestClassifyRealChannelRefusedBody(t *testing.T) {
-	code := string([]rune{49, 49, 45, 49, 50, 56}) // "11-128"
-	body := `{"code":"` + code + `","msg":"request illegal","requestId":"b1bc87ea","displayTips":{"en":"This call failed channel verification."}}`
-	if got := Classify(400, body); got != ErrChannelRefused {
-		t.Fatalf("Classify(real 11-128)=%v want ErrChannelRefused", got)
+	realCode := string([]rune{49, 49, 49, 50, 56}) // "11128"
+	for _, body := range []string{
+		`{"code":` + realCode + `,"msg":"request illegal","requestId":"b1bc87ea","displayTips":{"en":"This call failed channel verification."}}`,
+		`{"code":` + realCode + `,"msg":"conversation id missing","requestId":"479dc754","displayTips":{"en":"This call failed channel verification."}}`,
+		`{"code":` + realCode + `,"msg":"first message is not system prompt","displayTips":{"zh":"这次调用没通过渠道校验"}}`,
+		`{"code":"11-128","msg":"request illegal","requestId":"b1bc87ea","displayTips":{"en":"This call failed channel verification."}}`,
+	} {
+		if got := Classify(400, body); got != ErrChannelRefused {
+			t.Fatalf("Classify(%s)=%v want ErrChannelRefused", body, got)
+		}
 	}
-	if got := Classify(403, `{"code":"`+code+`","msg":"request illegal"}`); got != ErrChannelRefused {
-		t.Fatalf("Classify(real 11-128, 403)=%v want ErrChannelRefused", got)
+	if got := Classify(403, `{"code":`+realCode+`,"msg":"request illegal"}`); got != ErrChannelRefused {
+		t.Fatalf("Classify(real 11128, 403)=%v want ErrChannelRefused", got)
 	}
 }

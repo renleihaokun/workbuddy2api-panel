@@ -690,15 +690,17 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 // 独立于 Run 的小时制排程：余额是分钟级观测量，不值得为它扩展 nextFire 的粒度。
 // 运行期可用 SetBalanceInterval 热改间隔（下一轮生效）。
 func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		return
+	if interval < 0 {
+		interval = 0
 	}
 	s.balanceInterval.Store(int64(interval))
 	go func() {
 		// 启动即刷一轮：进程重启（含升级到带按日批次的版本）后旧 state 可能没有
 		// credits_expiry_buckets；不等第一个 ticker，首页快照就能拿到与「检查」
 		// 同口径的完整数据，避免升级后前 5 分钟仍显示旧口径。
-		s.RunBalanceRefreshNow()
+		if interval > 0 {
+			s.RunBalanceRefreshNow()
+		}
 		var logged time.Duration
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
@@ -737,8 +739,8 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 // 事件上报）成本高；清扫只做 accept/claim 两条幂等读改请求，分钟级跑也几乎零
 // 负担，却能补上「达标的任务没人领奖」这条长期缺失的链路（issue #174）。
 func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		return
+	if interval < 0 {
+		interval = 0
 	}
 	s.sweepInterval.Store(int64(interval))
 	go func() {

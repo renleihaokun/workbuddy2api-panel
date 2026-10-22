@@ -281,6 +281,11 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	conversationID := meta.ConversationID
 	if conversationID == "" {
 		conversationID = session.NewMessageID()
+	} else if strings.HasPrefix(conversationID, "d-") {
+		// 派生粘性键（d-<32hex>）不能原样发给上游：d- 前缀会暴露网关特征，且无账号
+		// 隔离段导致换号重试时多账号共用同一 X-Conversation-ID。按 uid+key 派生为
+		// 标准 32 位 hex，既保持同账号同会话稳定，又实现跨账号隔离与官方形态对齐。
+		conversationID = session.RequestIDForKey(req.Header.Get("X-User-Id") + "|" + conversationID)
 	}
 	req.Header.Set("X-Conversation-ID", conversationID)
 	req.Header.Set("X-Conversation-Request-ID", convReqID)

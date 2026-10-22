@@ -54,6 +54,35 @@ func TestChatHeadersPreservesConversationID(t *testing.T) {
 	}
 }
 
+// TestChatHeadersDerivedKeySanitizedAndIsolated 派生会话键（d-<hex>）必须转为 32 hex
+// 并按账号 UID 隔离，不得向上游泄露 "d-" 前缀或跨账号共用同一会话 ID。
+func TestChatHeadersDerivedKeySanitizedAndIsolated(t *testing.T) {
+	c := &Client{}
+	const derived = "d-0123456789abcdef0123456789abcdef"
+	req1, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	req2, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+	reqOther, _ := http.NewRequest(http.MethodPost, "https://example.com/v2/chat/completions", nil)
+
+	c.ChatHeaders(req1, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{ConversationID: derived})
+	c.ChatHeaders(req2, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{ConversationID: derived})
+	c.ChatHeaders(reqOther, &auth.Auth{UID: "u2", AccessToken: "at"}, "", ChatMeta{ConversationID: derived})
+
+	got1 := req1.Header.Get("X-Conversation-ID")
+	got2 := req2.Header.Get("X-Conversation-ID")
+	gotOther := reqOther.Header.Get("X-Conversation-ID")
+
+	hex32 := regexp.MustCompile(`^[0-9a-f]{32}$`)
+	if !hex32.MatchString(got1) {
+		t.Fatalf("derived X-Conversation-ID = %q, want 32 hex without d- prefix", got1)
+	}
+	if got1 != got2 {
+		t.Errorf("same account + same derived key should be stable: %q != %q", got1, got2)
+	}
+	if got1 == gotOther {
+		t.Errorf("different accounts must not share derived X-Conversation-ID: %q", got1)
+	}
+}
+
 // testAuth 返回最小的 CN 账号（ChatHeaders 会读 UID/凭证，nil 会解引用）。
 func testAuth() *auth.Auth {
 	return &auth.Auth{UID: "u1", AccessToken: "at"}
