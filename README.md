@@ -14,12 +14,20 @@
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
+  <img alt="Fork" src="https://img.shields.io/badge/Fork-renleihaokun-2ea44f?style=flat-square">
 </p>
 
 ---
 
+> [!NOTE]
+> **本仓库是 [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel) 的个人维护 fork**（后者是 [`Sliverkiss/workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的增强分支）。
+>
+> fork 的主要动机：**修好 DSH（DeepSeek Harness）接入时被上游 `11-128` 通道校验拦截的提示词问题**。DSH 的 system 身份句会被 WorkBuddy 当成「非官方渠道调用」，整单返回 HTTP 400/403；本 fork 在网关侧完成脱敏、system→user 搬移重试与错误分类，DSH 侧无需修改提示词。详见 [本 fork 修了什么](#本-fork-修了什么)。
+>
+> 上游已停止维护，本 fork 也只做最小维护（以自用为主）：不承诺持续更新，不保证上游协议变化后仍可用。
+
 > [!IMPORTANT]
-> **项目已停止维护（2026-10-21）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。
+> **上游项目已停止维护（2026-10-21）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。
 >
 > 原因有三：
 > 1. **上游已开始禁用反代**——WorkBuddy 对非官方客户端的识别与拦截正在收紧（通道校验、账号限制等），反代通道的稳定性与存活周期已不可控，继续做适配意义有限；
@@ -29,10 +37,12 @@
 > 仓库保持现状可用（已合入的修复不会回退），但请自行评估风险：**上游随时可能彻底收紧导致不可用**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
 > **维护方式披露**：本仓库近期的 issue / PR 处置、代码审查、测试与修复实现**大量由 AI 辅助完成**（自动化编码 agent），合并与发布决策由维护者作出。请知悉后再使用或参与贡献。
+>
+> 本 fork 在上游停止维护后仅做最小维护：目前只包含 DSH 提示词兼容与少量自用修复（见 [本 fork 修了什么](#本-fork-修了什么)），不承诺持续更新，也不保证上游协议变化后仍可用。
 
-> **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
-> 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
-> 在上游基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
+> **血缘**：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) → [`linguo2625469/workbuddy2api-panel`](https://github.com/linguo2625469/workbuddy2api-panel)（增强分支，含 Web 面板）→ **本 fork**。
+> 上游 Sliverkiss 仓库已删除；`linguo2625469` 分支在删库前已同步至上游 `b5077d5`（第三轮，2026-09-15），并在 `73a7560`（2026-10-21）发布停止维护声明。**本 fork 以 `73a7560` 为基线**，只追加 DSH 提示词兼容与少量自用修复，不改变基线已有能力。
+> 基线分支重构的可视化运维层、账号池调度、错误分类与提示词体系均保留；本 fork 的增量见 [本 fork 修了什么](#本-fork-修了什么)，基线差异见 [与上游的差异](#-与上游的差异)。
 
 > ⚠️ **本项目仅限自用账号（签到 / 保活 / 个人工具接入），不支持同时也是禁止批量小号分发额度、二次打包或收费售卖。** 详见 [使用声明（必读）](#使用声明必读)。
 
@@ -65,6 +75,70 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
+## 本 fork 修了什么
+
+> 一句话：**让 DSH（DeepSeek Harness）的 system 提示词不再被上游 `11-128` 通道校验整单拒绝**，同时保证 user / tool 消息不被改写。
+
+### 问题现象
+
+DSH 会在 system prompt 里带一句固定身份句：
+
+```text
+You are an AI agent powered by DeepSeek Harness...
+```
+
+WorkBuddy 的通道校验按**逐字精确匹配**读取 system（以及历史里的 assistant 消息），命中后返回：
+
+```text
+HTTP 400 / 403
+{"code":11128,"msg":"request illegal", ...}
+```
+
+也可能是不带 code 的文案：`Illegal API invocation from an unapproved channel` / `failed channel verification` / `first message is not system prompt`。
+
+这不是账号问题，也不是内容审核（内容审核的文案是 `blocked by security policy`）——换号、重试、改 DSH 配置都没用。旧网关把它当普通 4xx 轮转，换号重试仍然 400。
+
+### 网关侧怎么修的
+
+| 层 | 行为 | 配置 |
+|---|---|---|
+| 1. 提示词模式 | 默认 `passthrough`：DSH 的 system 原样透传，保留原生指令与工具约定；需要网关人格时再显式切 `custom` / `append` | `prompt.mode` |
+| 2. 已知指纹脱敏 | 对 **system / developer / assistant** 消息整句改写：DSH 身份句 → 中性身份句；Claude Code / Codex 模板句、审查插件身份句同理。**user / tool 消息逐字原样** | `features.sanitize_blacklist_fingerprints`（默认 `true`） |
+| 3. system→user 搬移 | 仍撞「身份句被拒」的 11-128 时：首条 system 换成中性提示词、原文搬进首条 user（`<instructions>` 包裹）、后续 system 就地转 user；**同账号、同请求内**重发一次。成功后记住该段 system（哈希，24h / 上限 512），后续直接搬 | `features.system_as_user_fallback`（默认 `true`） |
+| 4. 终止 | 搬完仍被拒（指纹在 assistant 历史里）或结构性拒绝（首条不是 system / 缺会话 id）→ 立即 `400 channel_refused` + `gateway_hint`，不再换号空转 | — |
+
+### 口径与边界
+
+- **只洗三类角色**：`system` / `developer` / `assistant`；`user` 与 `tool` 逐字原样。在 DSH 里讨论 `11128`、贴错误码、翻译原文、让模型读改本仓库文档都不会被改写。
+- **整句替换，不做裸词替换**：只改 `You are an AI agent powered by DeepSeek Harness...` 这一整句（以及审查插件身份句），不碰单独出现的 `DeepSeek Harness` 品牌词。
+- **通道拒绝 ≠ 内容审核**：`unapproved channel` / `illegal api invocation` / `request illegal` 归 `ErrChannelRefused`，走搬移重试；`blocked by security policy` 才归 `ErrContentBlocked`，走 Degraded 提示词降级。
+- **不罚号**：11-128 不冷却、不熔断、不扣权重；搬移重试不占换号名额，`MaxRotate=1` 也能重试一次。
+- **默认配置即可用**：`config.example.json` 已包含两个开关的 `true`；DSH 侧无需修改 system prompt。
+
+### 验证
+
+```bash
+# 脱敏 / system 搬移 / 11-128 分类 / handler 接线
+go test ./internal/upstream ./internal/prompt ./internal/server ./cmd/server
+```
+
+起服务后让 DSH 正常对话即可。命中 11-128 时日志会出现：
+
+```text
+INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxxxxxxx)
+```
+
+若随后仍返回 `channel_refused`，看响应里的 `gateway_hint`：通常是 assistant 历史（上一轮回复）里带了指纹，清掉或重开会话即可。
+
+### 本 fork 的提交（相对基线 `73a7560`）
+
+| 提交 | 内容 |
+|---|---|
+| `f661291` | 11-128 分流、派生会话键脱敏与若干运维修复 |
+| `3bcb868` | DSH 指纹脱敏 + system→user 搬移重试 + 学习表 / 配置 / 面板开关 |
+| `5e75d0a` | 脱敏覆盖官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件身份句 |
+| `637c86e` | 对齐 magpie 粒度：只洗 system/assistant、整句替换、通道/内容错误分流、`<instructions>` 搬移 |
+
 ## 核心能力
 
 | 能力 | 说明 |
@@ -77,8 +151,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
-| 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试；撞 11-128 通道校验时把 system 搬进 user 角色单次重试 |
-| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹**整句**清洗（Claude Code / Codex / DSH 身份句 / 审查插件提示词）；**只洗 system 与 assistant 消息**，user 与 tool 消息逐字原样 |
+| 💬 **系统提示词体系** | 默认 `passthrough` 透传客户端 system（保留 DSH / Claude Code 原生指令）；可选 `custom` 替换、`append` 追加；撞 11-128 通道校验时把 system 搬进 user 角色单次重试，`passthrough` / `append` 遇内容策略拦截自动降级 |
+| 🧩 **DSH 提示词兼容** | DSH 的 system 身份句被上游 `11-128` 拦截时：system / assistant 整句脱敏 + system→user 搬移重试一次；user / tool 逐字原样，不影响讨论错误码与仓库文档 |
+| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹**整句**清洗（Claude Code / Codex / DSH 身份句 / 审查插件提示词）；**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
@@ -163,16 +238,16 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 ## 🆚 与上游的差异
 
-本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
+本 fork 以 `linguo2625469/workbuddy2api-panel` 的 `73a7560` 为基线。相对基线，本 fork 的增量见 [本 fork 修了什么](#本-fork-修了什么)；下面保留基线分支相对 [Sliverkiss 上游 master](https://github.com/Sliverkiss/workbuddy2api) 的差异清单（均已在真实多账号环境验证）：
 
-### 新增
+### 基线分支新增
 
 | 能力 | 说明 |
 |---|---|
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
-| **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
+| **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 指纹脱敏与 system→user 兜底开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
 | **限时补偿可观测（issue #189）** | 官方补偿（例：「模型服务异常额外补偿 500 积分」）在账号侧可见，网关改为**先查 `compensation-status` 再决定是否领**：面板「官方补偿」卡片列出待领账号 + 领取截止倒计时（≤48h 标红）+ 逐号/全量领取按钮；**查询失败的账号在卡片上显形为红色行，不会与「没有补偿」混为一谈**；每日签到排程同步走「查→领」，**状态查询失败与领取失败一律显式告警**（旧实现把「没有 / 已领 / 领取失败」三态压成同一形态，带截止日的补偿会静默过期） |
 | **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
@@ -180,12 +255,12 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
 | **安全加固** | 常量时间密钥比较（`internal/httpauth`）、CSP 与安全响应头、UID 白名单防路径穿越、前端属性转义修复 |
-| **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
+| **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；基线分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
 
 ### 同步上游
 
-**第一轮（fork 基线 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
+**第一轮（基线分支 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
 
 **第二轮（`9a87758` → `ea8b1e5`，2026-09-14，只吸收底层）**：
 
@@ -198,9 +273,19 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
+**第三轮（`ea8b1e5` → `b5077d5`，2026-09-15，基础设施优先）**：
+
+| 上游改动 | 吸收内容 |
+|---|---|
+| 会话头族与请求指纹 | 出站注入 `X-Conversation-ID` / `X-Request-ID` / `Message-ID` / `X-Trace-ID` / `X-B3-*`；`prompt_cache_key` 按账号 + 会话硬隔离，复用上游前缀缓存 |
+| 6004 模型级冷却 | 每账号每模型独立计时，`/status` 台账透出多模型行 |
+| 请求生命周期 | 客户端断开即取消上游请求；refresh 两段式（网络 IO 移出锁）；`http.Server` 补 `ReadTimeout` / `IdleTimeout` |
+| 提示词默认值 | `prompt.mode` 缺省由 `custom` 改为 `passthrough`（透传客户端 system，更保守） |
+| 其他 | 11140 硬禁用、14017 软冷却、非对话模型过滤、SSE `tool_calls` name 收敛、选号防惊群、快过期积分权重调整 |
+
 未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
 
-> 上游仓库此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，本分支已完整吸收。此后本仓库与上游不再有同步关系，演进以本仓库为准。
+> 上游 Sliverkiss 仓库随后删除，`b5077d5` 是已知的最后一次上游同步点；`73a7560`（2026-10-21）是 `linguo2625469` 分支的停止维护声明提交。本 fork 即从 `73a7560` 拉出，此后不再跟进上游。
 
 ## 架构总览
 
@@ -209,7 +294,7 @@ flowchart LR
     Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
 
     subgraph GWI["WorkBuddy2API 网关 :7863"]
-        H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
+        H["HTTP Handler\n鉴权 · 提示词改写 · 错误分类 · 轮转"] --> P
         H --> S
         P["账号池\n快过期加权 · 成本分层 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
@@ -401,12 +486,12 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
-| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体**整句**指纹脱敏：Claude Code / Codex 模板句、裸 `11128`、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件的身份句。**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样（上游通道校验只读前两者，2026-10-21 真机 A/B） |
+| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 三段式默认：CN `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`，global `WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1`；可用 `client_version` / `cli_version` 调版本段）。官网「使用端」列按出站 UA 服务端归因 |
+| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体**整句**指纹脱敏：Claude Code / Codex 模板句、裸 `11128`、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件的身份句。**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样（上游通道校验只读 system / developer 与 assistant，2026-10-21 真机 A/B） |
 | `features.system_as_user_fallback` | `true` | **system→user 搬移重试**：只在「身份句被拒」（`request illegal` / `unapproved channel` / `illegal api invocation`）时把 system 原文搬进首条 user（`<instructions>` 包裹）、system 留中性提示词、同请求内重发一次；成功后记住该段 system（哈希，24h / 上限 512）。结构性拒绝（首条不是 system、缺会话 id）不重试；搬完仍拒 → `400 channel_refused` 终止轮转。`false` = 关闭搬移 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
-| `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
-| `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
+| `prompt.mode` | `passthrough` | 系统提示词模式：`passthrough` = 透传客户端原始 system（默认，保留 DSH / CLI 原生指令；降级重试仍切中性提示词）；`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动） |
+| `prompt.file` | 空 | `custom` / `append` 模式的提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
@@ -443,46 +528,54 @@ curl -s http://localhost:7863/v1/search/messages \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS`(逗号分隔多个) · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 ## 核心行为语义
 
 ### 系统提示词体系
 
-客户端（Claude Code / Codex 等 CLI）会在 system prompt 注入固定模板句，上游内容审核按**逐字精确匹配**误杀合法流量（HTTP 400 + 审核文案）。网关提供两层防护，互不替代：
+客户端（Claude Code / Codex / DSH 等）会在 system prompt 注入固定模板句。上游有两条**互不相同**的拒绝链路：
 
-1. **提示词体系**（解决 **system / developer 来源**的误报）：由 `prompt.mode` 控制
-2. **指纹脱敏**（兜底 **system / assistant 消息**里的指纹串）：由 `features.sanitize_blacklist_fingerprints` 控制。口径与 magpie 的 WorkBuddy 插件一致：**整句替换**（不做裸词替换），且**user / tool 消息逐字原样**——上游通道校验只读 system 与 assistant（2026-10-21 真机 A/B）。因此讨论 DSH、贴错误码、翻译原文、让模型读改仓库文档都不受影响；覆盖范围含 CLI 模板句、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 的身份句。
+- **内容策略拦截**（HTTP 400 + `blocked by security policy`）：按内容审核文案判定，`ErrContentBlocked`；由提示词降级路径处理。
+- **通道校验失败**（HTTP 400/403 + code `11128` / `11-128`，文案 `request illegal` / `Illegal API invocation from an unapproved channel` / `failed channel verification`）：上游认为请求不是官方客户端发出的，`ErrChannelRefused`；由指纹脱敏 + system→user 搬移路径处理。
+
+网关提供三层防护，互不替代：
+
+1. **提示词模式**（决定 system 的来源形态）：`prompt.mode`，默认 `passthrough`
+2. **指纹脱敏**（消灭已知 system / assistant 指纹）：`features.sanitize_blacklist_fingerprints`
+3. **system→user 搬移**（兜底未知 system 指纹）：`features.system_as_user_fallback`
 
 | 模式 | 语义 |
 |---|---|
-| `custom`（默认） | 出站前用网关自有提示词**替换**客户端 system / developer 消息（删除全部 system / developer，头部插入单条 system）；user / assistant / tool 消息逐字不动 |
+| `passthrough`（默认） | 透传客户端原始 system，不做改写；DSH / Claude Code 的原生指令、工具约定完整保留。已知指纹由脱敏清洗，未知指纹由搬移兜底 |
+| `custom` | 出站前用网关自有提示词**替换**客户端 system / developer 消息（删除全部 system / developer，头部插入单条 system）；user / assistant / tool 消息逐字不动 |
 | `append` | 开头连续 system / developer 块之后**插入**一条网关自有 system，既有消息（含客户端项目规范/工具约定）逐字不动——两者并用；降级期退化为 replace（带指纹原文重试只会确定性再撞 400） |
-| `passthrough` | 透传客户端原始 system，不做改写 |
 
-内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制）。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
+内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制），仅在 `custom` / `append` 模式下使用。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
 
-### system 指纹被拦：system→user 伪装重试
+指纹脱敏的口径与 magpie 的 WorkBuddy 插件一致：**整句替换**（不做裸词替换），且**只作用于 system / developer / assistant 消息**，**user / tool 消息逐字原样**——上游通道校验只读 system（含 developer）与 assistant（2026-10-21 真机 A/B）。因此讨论 DSH、贴错误码、翻译原文、让模型读改仓库文档都不受影响；覆盖范围含 CLI 模板句、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 的身份句。
 
-上游对 system / assistant 来源的内容做逐字指纹校验，命中即 `400 11-128`（`request illegal` / `Illegal API invocation from an unapproved channel` / `first message is not system prompt`）。指纹脱敏能消灭**已知**指纹；未知指纹由「角色搬移」兜底——把 system 指令搬进 user 角色，system 只保留一条中性提示词：
+### 通道校验被拦：system→user 搬移重试
 
-| 层 | 行为 |
+上游对 **system / assistant** 来源做逐字指纹校验，命中即 `400 11-128`（`request illegal` / `Illegal API invocation from an unapproved channel` / `failed channel verification`）。指纹脱敏能消灭**已知**指纹；未知指纹由「角色搬移」兜底：
+
+| 阶段 | 行为 |
 |---|---|
-| 第一次 | 原样发，system 仍是 system |
+| 首次 | 原样出站，system 仍是 system |
 | 撞「身份句」11-128 | 把 system 原文搬进首条 user（`<instructions>…</instructions>` 包裹）、system 换成中性提示词、**后续 system 就地转成 user**；**同账号、同请求内**重发一次；不罚号、不退避、不占换号名额 |
-| 之后 | 搬移成功后记住该段 system 原文的哈希（进程内存、24h 过期、上限 512 条），同一段 system 的下一次对话直接搬，不再先撞一次 400 |
-| 兜底 | 搬完仍被拒（指纹在 assistant 消息里搬不走）→ 立即 `400 channel_refused` + `gateway_hint`，只试一次、不再循环；结构性拒绝（首条不是 system、缺会话 id）**不重试** |
+| 已学习 | 搬移成功后记住该段 system 原文的哈希（进程内存、24h 过期、上限 512 条）；同一段 system 的下一次请求直接以搬移形态出站，不再先撞一次 400 |
+| 兜底 | 搬完仍被拒（指纹在 assistant 历史里搬不走）→ 立即 `400 channel_refused` + `gateway_hint`，只试一次、不再循环；结构性拒绝（首条不是 system、缺会话 id）**不重试** |
 
-由 `features.system_as_user_fallback` 控制（默认开启、面板热生效）。关闭后不做搬移，但通道拒绝仍会立即终止轮转——换号不改变请求形状。
+由 `features.system_as_user_fallback` 控制（默认开启、面板热生效）。关闭后不做搬移，但通道拒绝仍会立即终止轮转——换号不改变请求形状。搬移只改**出站 body 的角色形态**，会话头、粘性键与用量口径均在搬移前确定，不受影响。
 
 ### 内容拦截误报与降级重试
 
-`passthrough` 模式请求被上游内容策略拦截（HTTP 400 + `blocked by security policy` / `unapproved channel` / `illegal api invocation` 文案）时，判定为 system 指纹误报：**同请求内**换 Degraded 中性提示词重试一次；第二次仍被拦（用户内容本身触发审核）→ 走既有错误路径返回客户端，并如实报给调用方。
+`passthrough` / `append` 模式请求被上游内容策略拦截（HTTP 400 + `blocked by security policy`）时，判定为 system 指纹误报：**同请求内**换 Degraded 中性提示词重试一次；第二次仍被拦（用户内容本身触发审核）→ `400 content_blocked` 透传上游原文，不轮转、不罚号。`custom` 模式已整段替换 system，不走此降级。
 
-- 触发降级后持续到**次日 00:00 CST**（Asia/Shanghai）重置；降级期内 `passthrough` 请求直达中性提示词，不再先撞 400
+- 触发降级后持续到**次日 00:00 CST**（Asia/Shanghai）重置；降级期内 `passthrough` / `append` 请求直达中性提示词，不再先撞 400
 - 降级状态是**进程内存态**，重启清零
 - 内容问题非账号问题：`ErrContentBlocked` 不罚账号（无冷却 / 熔断 / 计错），由网关降级重试消化
-- 与上一节的 system→user 伪装**互相独立**：内容拦截走本节的 Degraded 降级，通道校验失败（`ErrChannelRefused`）走角色伪装
+- 与上一节的 system→user 搬移**互相独立**：内容拦截走本节的 Degraded 降级，通道校验失败（`ErrChannelRefused`）走角色搬移
 
 ### 原生工具调用标记还原
 
@@ -747,7 +840,7 @@ http://127.0.0.1:7863/panel/
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
-| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / 粘性路由）、日志（调用来源记录开关） |
+| **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长任务五类时点与开关 + 余额刷新间隔）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / system→user 兜底 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
@@ -809,7 +902,7 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；无网关侧请求体上限（超限由上游返回） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -866,7 +959,7 @@ http://127.0.0.1:7863/panel/
 | `activity/growth/tasks/accept` | POST | 接受任务（`{"task_codes":[...]}`） |
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
-出站请求统一携带 `CLI/2.63.2 CodeBuddy/2.63.2` UA（可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
+出站请求统一携带官方桌面端形态 UA（默认 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`；global 平台段为 `WorkBuddy AI`，可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
 
 ## 请求级日志
 
@@ -1017,21 +1110,23 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 - **用 `./login.sh` 重新登录**覆盖凭证，重启后自动回池；
 - 或源码侧调用 `Pool.ReviveDisabled(uid)` 清除 `disabled` 状态（`state.json` 同步刷新）。
 
-### 系统提示词被内容策略误杀怎么办？
+### 系统提示词被内容策略 / 通道校验误杀怎么办？
 
-默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
+默认 `prompt.mode=passthrough` 透传客户端 system（保留 DSH / Claude Code 原生指令）；system / developer / assistant 消息里的已知指纹由 `features.sanitize_blacklist_fingerprints` 整句清洗，未知 system 指纹由 `features.system_as_user_fallback` 搬移兜底。`passthrough` / `append` 模式遇到 `blocked by security policy` 内容拦截时，还会换 Degraded 中性提示词同请求重试一次。
 
-若错误是 **11-128 通道校验失败**（`request illegal` / `Illegal API invocation from an unapproved channel` / `first message is not system prompt`）而不是内容审核文案：身份句被拒时网关会自动把 system 指令搬进 user 角色（`<instructions>` 包裹）重试一次（`features.system_as_user_fallback`，默认开启），成功后记住该段 system、后续直接搬移出站；搬完仍 400 说明指纹在 assistant 历史里，按响应里的 `gateway_hint` 清理即可。user / tool 消息从不被改写，所以在 DSH 里讨论错误码、读改本仓库文档不受影响。
+若错误是 **11-128 通道校验失败**（`request illegal` / `Illegal API invocation from an unapproved channel` / `failed channel verification` / `first message is not system prompt`）而不是内容审核文案：身份句被拒时网关会把 system 指令搬进 user 角色（`<instructions>` 包裹）重试一次（默认开启），成功后记住该段 system、后续直接搬移出站；搬完仍 400 说明指纹在 assistant 历史里，按响应里的 `gateway_hint` 清理即可。user / tool 消息从不被改写，所以在 DSH 里讨论错误码、读改本仓库文档不受影响。
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认保持 `CLI/2.63.2 CodeBuddy/2.63.2` 现状（指纹净化考虑，可配而非改死）。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认为官方桌面端三段式 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`（global 平台段为 `WorkBuddy AI`），版本段可用 `client_version` / `cli_version` 调整。
 
 ## 关键断言 ↔ 代码出处
 
 | 断言 | 出处 |
 |---|---|
-| `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
+| `prompt.mode` 默认 `passthrough` | `cmd/server/config.go:320` |
+| `features.sanitize_blacklist_fingerprints` 默认 `true` | `cmd/server/config.go:316` |
+| `features.system_as_user_fallback` 默认 `true` | `cmd/server/config.go:319` |
 | 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` chatCompletions 读 body 段 |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
@@ -1044,7 +1139,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
-| 出站 UA 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`） | `cmd/server/config.go:73`；接线 `cmd/server/main.go:96` |
+| 出站 UA 默认三段式与覆盖（空 = `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`） | `cmd/server/config.go:154`；接线 `cmd/server/main.go:158`；默认值 `internal/upstream/headers.go:19` |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |
 | `ReviveDisabled` 人工复活 | `internal/pool/pool.go:951` |
 | disabled 账号透出 `disabled_reason` | `internal/pool/pool.go:1162-1165` |
