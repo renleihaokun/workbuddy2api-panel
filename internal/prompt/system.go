@@ -11,6 +11,7 @@
 package prompt
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 )
@@ -77,35 +78,54 @@ func contentTextOf(v any) string {
 	return ""
 }
 
-// SystemAsUser 把 system/developer 指令搬进 user 角色，首条保留一条中性 system。
+// InstructionsOpen / InstructionsClose 包住「搬进 user 的 system 原文」。
 //
-// 语义：
-//   - 删除 messages 里所有 role 为 system/developer 的消息，内容按序拼接；
+// 与 magpie 插件同一形态：模型能看清这段是「系统指令」而不是用户自己说的话，
+// 既保住指令权重，又不让这段文字以 system 角色出站（上游只按 system/assistant
+// 里的身份句判渠道）。
+const (
+	InstructionsOpen  = "<instructions>\n"
+	InstructionsClose = "\n</instructions>"
+)
+
+// wrapInstructions 把 system 原文包成 <instructions>…</instructions>。
+func wrapInstructions(system string) string {
+	return InstructionsOpen + system + InstructionsClose
+}
+
+// SystemAsUser 把首条 system 的指令搬进 user 角色，system 只留中性提示词。
+//
+// 语义（对齐 magpie workbuddy 插件的 systemAsUser）：
+//   - 首条 system/developer 的正文被搬进**第一条 user 消息**，用
+//     <instructions>…</instructions> 包住；user 原有内容接在后面；
 //   - messages[0] 固定为 {"role":"system","content":neutral}（neutral 为空回落
-//     Degraded）——满足上游「首条必须是 system」的渠道校验；
-//   - 拼接内容并入**第一条 user 消息**：字符串内容 → 前缀 + "\n\n" + 原文；
-//     数组内容 → 头部插一个 text part；没有 user 消息 → 在 system 之后插入一条；
+//     Degraded）——上游的「首条必须是 system」渠道校验不能丢；
+//   - **后续** system/developer 消息就地改成 user（内容逐字保留），不再合并；
 //   - 其余消息（assistant/tool/未知角色）逐字不动。
 //
-// 守卫与 Rewrite 一致：空 body / 坏 JSON / 无 messages → 原样返回（绝不失败）。
-// 幂等：对已伪装的 body 再调用，结果完全相同（此时已无 system 可抽，只剩中性 system）。
+// 返回 nil 表示「没有可搬的东西」：无 messages、没有 system/developer、首条
+// system 正文为空或本身就是中性提示词（已搬过）。调用方据此跳过重试——搬一次
+// 不可能改变结果，白发一次上游请求。
+//
+// 守卫：空 body / 坏 JSON → nil（绝不失败）。
 func SystemAsUser(body []byte, neutral string) []byte {
 	if len(body) == 0 {
-		return body
+		return nil
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
+		return nil
 	}
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {
-		return body
+		return nil
 	}
 	if strings.TrimSpace(neutral) == "" {
 		neutral = Degraded
 	}
+	firstText := ""
+	seenFirst := false
 	kept := make([]any, 0, len(msgs)+1)
-	var sysParts []string
 	for _, raw := range msgs {
 		m, ok := raw.(map[string]any)
 		if !ok {
@@ -113,69 +133,95 @@ func SystemAsUser(body []byte, neutral string) []byte {
 			continue
 		}
 		role, _ := m["role"].(string)
-		if role == "system" || role == "developer" {
-			if t := contentTextOf(m["content"]); t != "" {
-				sysParts = append(sysParts, t)
-			}
+		if role != "system" && role != "developer" {
+			kept = append(kept, raw)
 			continue
 		}
-		kept = append(kept, raw)
+		if !seenFirst {
+			// 首条 system：正文搬去 user，消息本身丢弃（中性 system 后面补在头部）。
+			seenFirst = true
+			firstText = contentTextOf(m["content"])
+			continue
+		}
+		// 后续 system：就地降级为 user，内容逐字保留（magpie 同口径）。
+		m["role"] = "user"
+		kept = append(kept, m)
 	}
-	if merged := strings.Join(sysParts, "\n\n"); merged != "" {
-		// 已是伪装形态（唯一的 system 就是中性提示词）：原样返回，保证幂等。
-		// 正常链路只调用一次（handler 用 systemConverted 守），这里防的是重复调用
-		// 把中性提示词又搬进一遍 user 正文。
-		if len(sysParts) == 1 && merged == neutral {
-			return body
-		}
-		mergedInto := false
-		for i, raw := range kept {
-			m, ok := raw.(map[string]any)
-			if !ok {
-				continue
+	if !seenFirst {
+		return nil
+	}
+	if strings.TrimSpace(firstText) == "" || strings.TrimSpace(firstText) == strings.TrimSpace(neutral) {
+		return nil // 没有可搬的正文，或已经是搬过的形态（幂等）。
+	}
+	moved := false
+	hasUser := false
+	for _, raw := range kept {
+		if m, ok := raw.(map[string]any); ok {
+			if role, _ := m["role"].(string); role == "user" {
+				hasUser = true
+				break
 			}
-			if role, _ := m["role"].(string); role != "user" {
-				continue
-			}
-			m["content"] = mergeSystemIntoContent(m["content"], merged)
-			kept[i] = m
-			mergedInto = true
-			break
-		}
-		if !mergedInto {
-			// 没有 user 消息（纯 assistant/tool 历史）：单独插一条承载 system 原文。
-			kept = append([]any{map[string]any{"role": "user", "content": merged}}, kept...)
 		}
 	}
-	out := make([]any, 0, len(kept)+1)
+	out := make([]any, 0, len(kept)+2)
 	out = append(out, map[string]any{"role": "system", "content": neutral})
-	out = append(out, kept...)
+	if !hasUser {
+		// 没有 user 消息（纯 assistant/tool 历史）：指令块紧随 system 插入——
+		// 「用户说的第一件事」就该是这段系统指令。
+		out = append(out, map[string]any{"role": "user", "content": wrapInstructions(firstText)})
+		moved = true
+	}
+	for _, raw := range kept {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		if role, _ := m["role"].(string); role == "user" && !moved {
+			m["content"] = mergeInstructions(m["content"], firstText)
+			moved = true
+		}
+		out = append(out, m)
+	}
 	obj["messages"] = out
-	rewritten, err := json.Marshal(obj)
+	rewritten, err := marshalNoHTMLEscape(obj)
 	if err != nil {
-		return body
+		return nil
 	}
 	return rewritten
 }
 
-// mergeSystemIntoContent 把 system 原文并入一条 user 消息的 content：
-//   - 字符串：system 原文 + "\n\n" + 原内容（原内容为空则只留 system 原文）；
-//   - 数组：头部插一个 {"type":"text","text":system}，其余 part 原样保留；
-//   - 其他（nil/未知）：直接用 system 原文替换。
-func mergeSystemIntoContent(content any, system string) any {
+// marshalNoHTMLEscape 序列化时不把 < > & 转成 \u003c 等：搬移后的
+// <instructions> 标签要原样出现在出站 body 里（模型与排障日志都读它），
+// 转义只影响可读性、不影响语义，但没必要让每次请求都带一串 \u003c。
+func marshalNoHTMLEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// mergeInstructions 把包好的 system 原文并入一条 user 消息的 content：
+//   - 字符串：<instructions>…</instructions> + "\n\n" + 原内容（原内容为空则只留指令块）；
+//   - 数组：头部插一个 text part，其余 part（含图片）原样保留；
+//   - 其他（nil/未知）：直接用指令块替换。
+func mergeInstructions(content any, system string) any {
+	block := wrapInstructions(system)
 	switch c := content.(type) {
 	case string:
 		if strings.TrimSpace(c) == "" {
-			return system
+			return block
 		}
-		return system + "\n\n" + c
+		return block + "\n\n" + c
 	case []any:
-		part := map[string]any{"type": "text", "text": system}
 		merged := make([]any, 0, len(c)+1)
-		merged = append(merged, part)
+		merged = append(merged, map[string]any{"type": "text", "text": block})
 		merged = append(merged, c...)
 		return merged
 	default:
-		return system
+		return block
 	}
 }

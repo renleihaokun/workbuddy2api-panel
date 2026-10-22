@@ -53,9 +53,12 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
 		{500, `rate-limited upstream`, ErrSoftRate}, // 限流文案优先于 5xx 分类
 		// 内容策略拦截（HTTP 400 + 审核文案）：误报信号，不罚账号，走降级重试。
-		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":"11-128","msg":"blocked by security policy"}`, ErrContentBlocked},
-		{400, `unapproved channel`, ErrContentBlocked},
+		// "unapproved channel" / "illegal api invocation" 是**通道校验**拒绝，不是内容审核：
+		// 上游对 system/assistant 里的已知身份句回的就是这两句（2026-10-21 magpie 真机
+		// A/B）。归 ErrChannelRefused 才能走 system→user 搬移重试。
+		{400, `Illegal API invocation from an unapproved channel`, ErrChannelRefused},
+		{400, `unapproved channel`, ErrChannelRefused},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
@@ -701,5 +704,27 @@ func TestClassifyRealChannelRefusedBody(t *testing.T) {
 	}
 	if got := Classify(403, `{"code":`+realCode+`,"msg":"request illegal"}`); got != ErrChannelRefused {
 		t.Fatalf("Classify(real 11128, 403)=%v want ErrChannelRefused", got)
+	}
+}
+
+// TestIsSystemMovedRefusal 只有「身份句被拒」值得搬 system 重试；结构性拒绝
+// （首条不是 system、缺会话 id）搬了也没用，必须排除，避免白发一次上游请求。
+func TestIsSystemMovedRefusal(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"code":11128,"msg":"request illegal"}`, true},
+		{`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, true},
+		{`{"code":"11-128","msg":"request illegal"}`, true},
+		{`{"code":11128,"msg":"conversation id missing"}`, false},
+		{`{"code":11128,"msg":"first message is not system prompt"}`, false},
+		{`{"code":11128,"msg":"blocked by security policy"}`, false},
+		{`rate limit`, false},
+	}
+	for _, c := range cases {
+		if got := IsSystemMovedRefusal(c.body); got != c.want {
+			t.Errorf("IsSystemMovedRefusal(%s)=%v want %v", c.body, got, c.want)
+		}
 	}
 }

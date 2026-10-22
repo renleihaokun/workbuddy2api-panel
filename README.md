@@ -78,7 +78,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试；撞 11-128 通道校验时把 system 搬进 user 角色单次重试 |
-| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹清洗（Claude Code / Codex / **DeepSeek Harness** / **官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件提示词**，可关闭），与提示词体系两层叠加 |
+| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹**整句**清洗（Claude Code / Codex / DSH 身份句 / 审查插件提示词）；**只洗 system 与 assistant 消息**，user 与 tool 消息逐字原样 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
@@ -402,8 +402,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
-| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏（Claude Code / Codex 模板句、裸 `11128`、**DeepSeek Harness** 品牌词、**官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件的提示词身份句**等） |
-| `features.system_as_user_fallback` | `true` | **system→user 伪装重试**：撞 11-128 通道校验（system 指纹）时把 system 指令搬进 user 角色、同一请求内重发一次；成功后记住该段 system 原文（哈希，24h / 上限 512），后续同段 system 直接以伪装形态出站。伪装后仍被拒 → 立即 `400 channel_refused` 终止轮转，只试一次。`false` = 关闭伪装（通道拒绝仍直接终止，不再白撞轮换） |
+| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体**整句**指纹脱敏：Claude Code / Codex 模板句、裸 `11128`、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件的身份句。**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样（上游通道校验只读前两者，2026-10-21 真机 A/B） |
+| `features.system_as_user_fallback` | `true` | **system→user 搬移重试**：只在「身份句被拒」（`request illegal` / `unapproved channel` / `illegal api invocation`）时把 system 原文搬进首条 user（`<instructions>` 包裹）、system 留中性提示词、同请求内重发一次；成功后记住该段 system（哈希，24h / 上限 512）。结构性拒绝（首条不是 system、缺会话 id）不重试；搬完仍拒 → `400 channel_refused` 终止轮转。`false` = 关闭搬移 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
@@ -452,7 +452,7 @@ curl -s http://localhost:7863/v1/search/messages \
 客户端（Claude Code / Codex 等 CLI）会在 system prompt 注入固定模板句，上游内容审核按**逐字精确匹配**误杀合法流量（HTTP 400 + 审核文案）。网关提供两层防护，互不替代：
 
 1. **提示词体系**（解决 **system / developer 来源**的误报）：由 `prompt.mode` 控制
-2. **指纹脱敏**（兜底 **用户 / assistant 消息**里的指纹串）：由 `features.sanitize_blacklist_fingerprints` 控制——除 CLI 模板句与 DSH 品牌词外，也覆盖**审查插件**（官方 `dsh-auto-review` 与三方 `auto-review-zh`）注入的提示词身份句。这类提示词是独立一次模型调用的正文，上游同样按逐字指纹拦，故与其它模板句同口径处理（`reviewer` → `checker` 一词之差即可绕过，语义不变）。
+2. **指纹脱敏**（兜底 **system / assistant 消息**里的指纹串）：由 `features.sanitize_blacklist_fingerprints` 控制。口径与 magpie 的 WorkBuddy 插件一致：**整句替换**（不做裸词替换），且**user / tool 消息逐字原样**——上游通道校验只读 system 与 assistant（2026-10-21 真机 A/B）。因此讨论 DSH、贴错误码、翻译原文、让模型读改仓库文档都不受影响；覆盖范围含 CLI 模板句、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 的身份句。
 
 | 模式 | 语义 |
 |---|---|
@@ -464,16 +464,16 @@ curl -s http://localhost:7863/v1/search/messages \
 
 ### system 指纹被拦：system→user 伪装重试
 
-上游对 system 来源的内容做逐字指纹校验，命中即 `400 11-128`（`request illegal` / `Illegal API invocation from an unapproved channel` / `first message is not system prompt`）。指纹脱敏能消灭**已知**指纹；未知指纹由「角色伪装」兜底——把 system 指令搬进 user 角色，system 只保留一条中性提示词：
+上游对 system / assistant 来源的内容做逐字指纹校验，命中即 `400 11-128`（`request illegal` / `Illegal API invocation from an unapproved channel` / `first message is not system prompt`）。指纹脱敏能消灭**已知**指纹；未知指纹由「角色搬移」兜底——把 system 指令搬进 user 角色，system 只保留一条中性提示词：
 
 | 层 | 行为 |
 |---|---|
 | 第一次 | 原样发，system 仍是 system |
-| 撞 11-128 | 立即把 system 原文搬进首条 user 消息（**首位保留中性 system**，否则会撞 `first message is not system prompt`），**同账号、同请求内**重发一次；不罚号、不退避、不占换号名额 |
-| 之后 | 伪装成功后记住该段 system 原文的哈希（进程内存、24h 过期、上限 512 条），同一段 system 的下一次对话直接走伪装，不再先撞一次 400 |
-| 兜底 | 伪装后仍被拒（指纹在 assistant / tool 历史里搬不走）→ 立即 `400 channel_refused` + `gateway_hint`，只试一次、不再循环 |
+| 撞「身份句」11-128 | 把 system 原文搬进首条 user（`<instructions>…</instructions>` 包裹）、system 换成中性提示词、**后续 system 就地转成 user**；**同账号、同请求内**重发一次；不罚号、不退避、不占换号名额 |
+| 之后 | 搬移成功后记住该段 system 原文的哈希（进程内存、24h 过期、上限 512 条），同一段 system 的下一次对话直接搬，不再先撞一次 400 |
+| 兜底 | 搬完仍被拒（指纹在 assistant 消息里搬不走）→ 立即 `400 channel_refused` + `gateway_hint`，只试一次、不再循环；结构性拒绝（首条不是 system、缺会话 id）**不重试** |
 
-由 `features.system_as_user_fallback` 控制（默认开启、面板热生效）。关闭后不做伪装，但通道拒绝仍会立即终止轮转——换号不改变请求形状。
+由 `features.system_as_user_fallback` 控制（默认开启、面板热生效）。关闭后不做搬移，但通道拒绝仍会立即终止轮转——换号不改变请求形状。
 
 ### 内容拦截误报与降级重试
 
@@ -530,8 +530,8 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
-| 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
-| 通道校验失败 | HTTP 400/403 + code `11128` / `11-128`（`request illegal` / `conversation id missing` / `first message is not system prompt`） | **不罚账号**；先原样发，撞了自动 system→user 重试一次；仍拒 → `400 channel_refused` 立即终止轮转（换号无用） | 即时（按 `gateway_hint` 排查 assistant / tool 历史） |
+| 内容拦截 | HTTP 400 + `blocked by security policy` | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
+| 通道校验失败 | HTTP 400/403 + code `11128` / `11-128`，或文案 `unapproved channel` / `illegal api invocation` | **不罚账号**；身份句被拒时自动 system→user 搬移重试一次；搬完仍拒或结构性拒绝 → `400 channel_refused` 立即终止轮转（换号无用） | 即时（按 `gateway_hint` 排查 assistant 历史） |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
 请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关不做请求体截断与预拦截，`11101` 均为客户端发来的畸形 JSON。
@@ -1021,7 +1021,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 默认 `prompt.mode=custom` 已用网关自有提示词替换客户端 system，从源头消除大部分误报；用户 / assistant 消息中的指纹串由 `features.sanitize_blacklist_fingerprints` 清洗，两层叠加。`passthrough` 模式下首遇拦截会自动换 Degraded 中性提示词同请求重试一次。
 
-若错误是 **11-128 通道校验失败**（`request illegal` / `Illegal API invocation from an unapproved channel` / `first message is not system prompt`）而不是内容审核文案：网关会自动把 system 指令搬进 user 角色重试一次（`features.system_as_user_fallback`，默认开启），成功后记住该段 system 原文、后续直接伪装出站；伪装后仍 400 说明指纹在 assistant / tool 历史里，按响应里的 `gateway_hint` 清理历史消息即可。DSH 客户端另可在脱敏开启时自动把 `DeepSeek Harness` 品牌词改写掉。
+若错误是 **11-128 通道校验失败**（`request illegal` / `Illegal API invocation from an unapproved channel` / `first message is not system prompt`）而不是内容审核文案：身份句被拒时网关会自动把 system 指令搬进 user 角色（`<instructions>` 包裹）重试一次（`features.system_as_user_fallback`，默认开启），成功后记住该段 system、后续直接搬移出站；搬完仍 400 说明指纹在 assistant 历史里，按响应里的 `gateway_hint` 清理即可。user / tool 消息从不被改写，所以在 DSH 里讨论错误码、读改本仓库文档不受影响。
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
@@ -1038,9 +1038,9 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
 | `reasoning_content` 多轮回填（assistant 消息） | `internal/upstream/thinking.go:54` |
 | Degraded 中性提示词常量 | `internal/prompt/prompt.go:25` |
-| system→user 伪装改写（保留首条中性 system） | `internal/prompt/system.go`（`SystemAsUser` / `SystemText`） |
-| system 伪装学习表（24h / 上限 512）与 11-128 单次重试接线 | `internal/server/systemmode.go`（`systemModeGate`）、`internal/server/handler.go` chatCompletions 轮转内 |
-| DSH 品牌词脱敏（`DeepSeek Harness` → `DeepSeekRuntime`） | `internal/upstream/sanitize.go`（`sanitizeFeatures` / `sanitizeRewrites`） |
+| system→user 搬移改写（`<instructions>` 包裹、首条中性 system、后续 system 就地转 user） | `internal/prompt/system.go`（`SystemAsUser` / `SystemText`） |
+| system 搬移学习表（24h / 上限 512）与 11-128 单次重试接线 | `internal/server/systemmode.go`（`systemModeGate`）、`internal/server/handler.go` chatCompletions 轮转内 |
+| 指纹脱敏角色范围（仅 system / developer / assistant）与 DSH 整句改写 | `internal/upstream/sanitize.go`（`sanitizeMessages` / `sanitizeFeatures` / `sanitizeRewrites`） |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
 | 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |

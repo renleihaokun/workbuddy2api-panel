@@ -53,7 +53,9 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	}
 	key := buildCacheKey(uid, conv)
 	obj["prompt_cache_key"] = key
-	out, err := json.Marshal(obj)
+	// 与 prepareBody 同一条序列化口径（不转义 < > &）：否则 system→user 搬移后的
+	// <instructions> 会在这里被重新转义成 \u003c。
+	out, err := marshalBodyJSON(obj)
 	if err != nil {
 		return body
 	}

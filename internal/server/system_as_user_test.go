@@ -106,9 +106,13 @@ func TestSystemAsUserRetryOnChannelRefused(t *testing.T) {
 	if !strings.Contains(string(calls[1]), `"role":"system"`) {
 		t.Fatalf("converted body lost first system message: %s", calls[1])
 	}
-	// system 原文必须还在（搬进 user），不能丢指令。
+	// system 原文必须还在（搬进 user 的 <instructions> 块），不能丢指令。
 	if !strings.Contains(string(calls[1]), "SYS-FP") {
 		t.Fatalf("converted body dropped system text: %s", calls[1])
+	}
+	if !strings.Contains(string(calls[1]), "<instructions>") ||
+		!strings.Contains(string(calls[1]), "</instructions>") {
+		t.Fatalf("converted system text should be wrapped in <instructions>: %s", calls[1])
 	}
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
@@ -175,6 +179,41 @@ func TestSystemAsUserStopsAfterConvertedStillRefused(t *testing.T) {
 	key := systemModeKey(prompt.SystemText(calls[0]))
 	if h.sysMode.Known(key) {
 		t.Error("failed conversion must not be remembered")
+	}
+}
+
+// TestSystemAsUserSkipsStructuralRefusal 结构性 11-128（首条不是 system、缺会话 id）
+// 搬 system 也救不回来 → 不重发，只打一次上游。
+func TestSystemAsUserSkipsStructuralRefusal(t *testing.T) {
+	for _, body := range []string{
+		`{"code":11128,"msg":"first message is not system prompt"}`,
+		`{"code":11128,"msg":"conversation id missing"}`,
+	} {
+		var calls [][]byte
+		up := &upstream.Client{
+			HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				raw, _ := io.ReadAll(r.Body)
+				calls = append(calls, raw)
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(body)),
+				}, nil
+			})},
+			ChatBaseCN:    "https://fake.example",
+			BillingBaseCN: "https://fake.example",
+		}
+		p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+		h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough", SystemAsUserFallback: true})
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(systemFingerprintRequest())))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code=%d want 400 (body=%s)", body, rec.Code, rec.Body)
+		}
+		if len(calls) != 1 {
+			t.Fatalf("%s: upstream calls=%d want 1 (structural refusal must not retry)", body, len(calls))
+		}
 	}
 }
 

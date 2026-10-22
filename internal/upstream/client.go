@@ -186,16 +186,32 @@ var channelRefusedMarkers = []string{
 	"通路驗證",
 }
 
+// unapprovedChannelMarkers 是「非官方渠道」拒绝的确定性文案（比裸 code 更具体）。
+//
+// 它们此前被归进 contentBlockedMarkers 走提示词降级，但语义是通道校验失败：
+// magpie 插件 2026-10-21 在两个 build 上用真实账号复现，system/assistant 里出现
+// 已知身份句时上游回的正是 "Illegal API invocation from an unapproved channel"。
+// 归 ErrChannelRefused 后由 system→user 搬移重试处理，语义与处置都更准确。
+var unapprovedChannelMarkers = []string{
+	"unapproved channel",
+	"illegal api invocation",
+}
+
 // isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128）。
-// 11128 还承载内容审核变体（"blocked by security policy" / "unapproved channel" /
-// "illegal api invocation"，归 ErrContentBlocked 走提示词降级重试），故先排除
-// contentBlockedMarkers，再按业务码（兼容真实整型 11128 与脱敏串 "11-128"）+
-// 通道校验文案双条件判定。
+//   - "unapproved channel" / "illegal api invocation"：确定性文案，命中即成立
+//     （上游可能不带 code 直接回这句）；
+//   - 其余按业务码（兼容真实整型 11128 与脱敏串 "11-128"）+ 通道校验文案双条件；
+//     内容审核变体（"blocked by security policy"）先排除，归 ErrContentBlocked。
 func isChannelRefused(body string) bool {
+	lower := strings.ToLower(body)
+	for _, m := range unapprovedChannelMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
 	if !hasBusinessCode(body, "11128") && !hasBusinessCode(body, "11-128") {
 		return false
 	}
-	lower := strings.ToLower(body)
 	for _, m := range contentBlockedMarkers {
 		if strings.Contains(lower, m) {
 			return false
@@ -209,16 +225,39 @@ func isChannelRefused(body string) bool {
 	return false
 }
 
+// IsSystemMovedRefusal 报告这次 11128 是否值得把 system 搬进 user 再试一次。
+//
+// 只有「身份句被拒」这一类搬得走：结构性拒绝——首条不是 system（
+// "first message is not system prompt"）、缺会话 id（"conversation id missing"）
+// ——换什么角色都没用，直接排除，避免白发一次上游请求。其余 11128（
+// "request illegal" / "unapproved channel" / "illegal api invocation"）都按
+// 可搬处理；被拒的若是 assistant 里的句子，搬完仍会拒，由上层兜底终止。
+func IsSystemMovedRefusal(body string) bool {
+	lower := strings.ToLower(body)
+	for _, m := range []string{"conversation id missing", "first message is not system prompt"} {
+		if strings.Contains(lower, m) {
+			return false
+		}
+	}
+	for _, m := range []string{"unapproved channel", "illegal api invocation", "request illegal"} {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
 // 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
 // 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
 // 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
 // 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
+//
+// 注意 "unapproved channel" / "illegal api invocation" **不在这里**：它们是通道
+// 校验拒绝（见 unapprovedChannelMarkers），归 ErrChannelRefused。
 var contentBlockedMarkers = []string{
 	"blocked by security policy",
-	"unapproved channel",
-	"illegal api invocation",
 }
 
 // badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游

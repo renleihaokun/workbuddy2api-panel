@@ -5,6 +5,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"strings"
@@ -85,11 +86,25 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 			sanitizeMessages(msgs)
 		}
 	}
-	out, err := json.Marshal(obj)
+	out, err := marshalBodyJSON(obj)
 	if err != nil {
 		return src
 	}
 	return out
+}
+
+// marshalBodyJSON 序列化出站 body，不做 HTML 转义：Go 的 json.Marshal 会把
+// `<` `>` `&` 转成 \u003c 等，system→user 搬移后的 <instructions> 标签就会以
+// 转义形态出现在 body 与排障日志里。转义不影响语义，但让日志难读、也让上游侧
+// 抓包对比变噪音，统一关掉。
+func marshalBodyJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游

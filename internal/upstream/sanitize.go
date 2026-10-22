@@ -20,9 +20,11 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
-	"DeepSeek Harness",                                // DSH 身份句品牌词：上游按「非官方渠道」整单拦（11-128）
-	"deepseek-harness",                                // DSH 包路径/小写形态
-	"DeepSeekHarness",                                 // DSH 无空格形态
+	// DSH 身份句（整句，不是品牌词）：上游按逐字匹配把这一行当成「非官方渠道」
+	// 整单拦（400 11-128）。品牌词本身不在上游的匹配表里——magpie 插件 2026-10-21
+	// 的真机复现也只命中整句，所以这里不再匹配裸 "DeepSeek Harness"：否则用户
+	// 在对话里讨论 DSH、或让模型读/改含品牌词的仓库文档时，正文会被无谓改写。
+	"You are an AI agent powered by DeepSeek Harness",
 	// 审查插件（官方 dsh-auto-review + 三方 auto-review-zh）的 system/policy 身份句：
 	// 这些提示词由客户端作为独立一次模型调用的正文发出，同样按逐字指纹被拦。
 	"You are a read-only safety reviewer for a coding agent",                     // 官方 REVIEW_SYSTEM_PROMPT
@@ -77,33 +79,23 @@ var sanitizeRewrites = [][2]string{
 		"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
 	},
 	{
-		// 上游反探测：只要请求体里出现裸数字 11128 就整单拦截（与该数字的上下文无关——
-		// "code=11128" / 裸 "11128" / "错误码 11128" / "Code=11128" 全部命中；
-		// 相邻的 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码，
-		// 上游据此识别"在讨论/回显其内部错误码"的请求。
-		// 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是拦截条件，
-		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
+		// 上游反探测：请求里出现裸数字 11128 会被整单拦截（"code=11128" / 裸
+		// "11128" / "错误码 11128" 全部命中；相邻的 11148 / 11101 / 11115 放行）。
+		// 11128 正是本类拦截自身的错误码，上游据此识别"在讨论/回显其内部错误码"。
+		// 注意作用域：只在 system / developer / assistant 消息里洗（见
+		// sanitizeMessages）——user 与 tool 消息逐字原样出站，用户在对话里讨论这个
+		// 错误码、或模型读取含它的仓库文件时，正文不再被无谓改写。
 		"11128",
 		"11-128",
 	},
 	{
-		// DSH（DeepSeek Harness）注入的身份句会被上游当成「非官方渠道调用」整单拦截：
-		// 400 11-128 Illegal API invocation from an unapproved channel。社区真机实测
-		// 换一个词即绕过（同一份请求改写前 6/6 被拦、改写后 0/2），语义不变且可见可 diff。
-		//
-		// 按短语全局替换而非只认开头：同一品牌词在长提示词正文里会出现多次，且可能
-		// 落在 system/user/assistant 任一角色（sanitizeMessages 全覆盖）。只改写品牌词，
-		// 不碰裸 "DeepSeek"——那会误伤用户对模型的正常讨论。
-		"DeepSeek Harness",
-		"DeepSeekRuntime",
-	},
-	{
-		"deepseek-harness",
-		"deepseek-runtime",
-	},
-	{
-		"DeepSeekHarness",
-		"DeepSeekRuntime",
+		// DSH（DeepSeek Harness）的**整句**身份句才会被上游当成「非官方渠道调用」
+		// 整单拦（400 11-128 Illegal API invocation from an unapproved channel）。
+		// 改写整句（与 magpie 插件同一替换文案）：只换掉这一行的身份表述，品牌词
+		// 在别处出现一律不动，避免误伤用户讨论与仓库文档。
+		// 匹配串不带结尾标点，句号/换行随手保留，两种收尾形态一并覆盖。
+		"You are an AI agent powered by DeepSeek Harness",
+		"You are an AI agent that helps the user with programming tasks",
 	},
 	{
 		// 官方自动审查插件 dsh-auto-review 的 REVIEW_SYSTEM_PROMPT：
@@ -233,13 +225,25 @@ func sanitizeToolCalls(v any) bool {
 	return changed
 }
 
-// sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。
+// sanitizeMessages 净化 system / developer / assistant 消息里的 content、
+// reasoning 与 tool_calls；任一命中返回 true。
+//
+// 角色范围有实测依据：2026-10-21 在两个 build 上用真实账号（glm-5.3 /
+// deepseek-v4.1-flash / gpt-5.5）验证，通道校验只读 system 与 assistant 消息——
+// 同样的被拒句放进 user 消息、工具结果、user 的多模态 part 都不会触发，放回
+// system / assistant 才拒。因此 user 与 tool 消息**逐字原样出站**：讨论被拦串、
+// 让模型读改含这些串的仓库文件、翻译原文都不会被改写。
 func sanitizeMessages(messages []any) bool {
 	changed := false
 	for _, msg := range messages {
 		m, ok := msg.(map[string]any)
 		if !ok {
 			continue
+		}
+		switch role, _ := m["role"].(string); role {
+		case "system", "developer", "assistant":
+		default:
+			continue // user / tool / 未知角色：上游不读，原样出站
 		}
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。

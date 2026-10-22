@@ -828,8 +828,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	systemConverted := false
 	var channelRefusedConverted bool
 	if h.systemAsUserEnabled() && sysKey != "" && h.sysMode.Known(sysKey) {
-		body = prompt.SystemAsUser(body, prompt.Degraded)
-		systemConverted = true
+		// 已学习：直接以搬移形态出站。nil = 已无可搬内容（幂等保护）。
+		if moved := prompt.SystemAsUser(body, prompt.Degraded); moved != nil {
+			body = moved
+			systemConverted = true
+		}
 	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -931,22 +934,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if errors.As(terr, &uerr) {
 			status = uerr.Status
 		}
-		// system→user 伪装重试（层 2）：11-128 是请求形状/通道指纹问题，换号必然
-		// 同样失败——先把 system 指令搬进 user 角色、用**同一个账号**立刻重发一次。
-		// 不罚号、不退避、不占换号名额（inline 重发，MaxRotate=1 时也能重试）。
+		// system→user 搬移重试（层 2）：只看「身份句被拒」这一类 11-128——结构性
+		// 拒绝（首条不是 system、缺会话 id）搬了也没用，直接跳过。同账号、同请求内
+		// 重发一次；不罚号、不退避、不占换号名额（inline 重发，MaxRotate=1 也能重试）。
 		// 只做一次：systemConverted 置位后，再撞 11-128 走下方终止分支（层 4）。
 		if status >= 400 && !systemConverted && h.systemAsUserEnabled() &&
-			attemptKind(status, respBody, uerr) == upstream.ErrChannelRefused {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
-			systemConverted = true
-			body = prompt.SystemAsUser(body, prompt.Degraded)
-			log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
-				logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(sysKey))
-			attemptStarted = time.Now()
-			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
-			uerr = nil
-			if errors.As(terr, &uerr) {
-				status = uerr.Status
+			attemptKind(status, respBody, uerr) == upstream.ErrChannelRefused &&
+			upstream.IsSystemMovedRefusal(string(respBody)) {
+			if moved := prompt.SystemAsUser(body, prompt.Degraded); moved != nil {
+				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+				systemConverted = true
+				body = moved
+				log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(sysKey))
+				attemptStarted = time.Now()
+				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+				uerr = nil
+				if errors.As(terr, &uerr) {
+					status = uerr.Status
+				}
 			}
 		}
 		if uerr == nil && terr != nil {
