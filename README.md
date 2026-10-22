@@ -321,7 +321,9 @@ flowchart LR
 
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+> ⚠️ 下面的 `ghcr.io/linguo2625469/...` 是**上游镜像**，不含本 fork 的 DSH 提示词修复；要用本 fork 的代码，请本地 `docker compose build`，或直接下载下方 [Releases](https://github.com/renleihaokun/workbuddy2api-panel/releases) 的预编译二进制。
+
+上游 CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
 
 ```bash
 # 1. 准备配置与数据目录
@@ -1005,7 +1007,7 @@ http://127.0.0.1:7863/panel/
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
 | `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节） |
 
-二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
+二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）；也可直接从 [Releases](https://github.com/renleihaokun/workbuddy2api-panel/releases) 下载五平台预编译包。
 
 ### 探测模型真实输出上限
 
@@ -1057,9 +1059,9 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **预编译 release**：从 [Releases](https://github.com/renleihaokun/workbuddy2api-panel/releases) 下载五平台二进制（Linux amd64/arm64、macOS amd64/arm64、Windows amd64），每个 release 附 `checksums.txt`（SHA-256）；也可从源码自构建
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
+- **校验和**：release 资产附 `checksums.txt`；`go.sum` 仅约束 Go 模块依赖，不覆盖发布产物
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界
