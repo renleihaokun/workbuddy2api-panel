@@ -441,6 +441,85 @@ func TestPrepareBodyRewritesDeepSeekHarness(t *testing.T) {
 	}
 }
 
+// 审查插件（官方 dsh-auto-review + 三方 auto-review-zh）的提示词身份句同样是逐字
+// 指纹：客户端把它们作为独立一次模型调用的正文发出，上游照样按「非官方渠道」拦。
+// 口径与既有规则一致——只把 reviewer 换成 checker，语义不变、破坏逐字匹配。
+func TestReviewPluginPromptsRewritten(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"official REVIEW_SYSTEM_PROMPT",
+			"You are a read-only safety reviewer for a coding agent. Follow the verdict rules in the user message exactly.",
+			"You are a read-only safety checker for a coding agent.",
+		},
+		{
+			"official auto-review request",
+			"You are the auto-review safety reviewer of DeepSeek Harness. A tool call is about to cross a permission boundary.",
+			"You are the auto-review safety checker of DeepSeekRuntime.",
+		},
+		{
+			"official read-only sentence",
+			"the evidence below ONLY. You are a READ-ONLY reviewer: you cannot and must not execute",
+			"You are a READ-ONLY checker: you cannot and must not execute",
+		},
+		{
+			"official eval reviewer",
+			"You are the eval reviewer of the dsh-eval engine. You judge whether one finished",
+			"You are the eval checker of the dsh-eval engine.",
+		},
+		{
+			"third-party auto-review-zh",
+			"You are the final authorization reviewer for exactly one pending tool call. Your decision replaces human approval for this call.",
+			"You are the final authorization checker for exactly one pending tool call.",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := sanitizeText(tc.in)
+			if strings.Contains(out, "reviewer") {
+				t.Errorf("reviewer fingerprint survived: %q", out)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("rewrite missing: got %q want substring %q", out, tc.want)
+			}
+			if again := sanitizeText(out); again != out {
+				t.Errorf("not idempotent: %q -> %q", out, again)
+			}
+		})
+	}
+}
+
+// 预检快路径必须认出审查插件身份句（否则整段净化被跳过、指纹原样出站）。
+func TestReviewPluginPromptsDetected(t *testing.T) {
+	for _, s := range []string{
+		"You are a read-only safety reviewer for a coding agent.",
+		"You are the auto-review safety reviewer of DeepSeek Harness. A tool call",
+		"You are a READ-ONLY reviewer: you cannot and must not execute",
+		"You are the eval reviewer of the dsh-eval engine.",
+		"You are the final authorization reviewer for exactly one pending tool call.",
+	} {
+		if !hasFingerprint(s) {
+			t.Errorf("review-plugin prompt not detected: %q", s)
+		}
+	}
+}
+
+// 全链路：审查插件的 system 提示词经 prepareBody 后不再含原身份句。
+func TestPrepareBodyRewritesReviewPluginPrompt(t *testing.T) {
+	sys := "You are a read-only safety reviewer for a coding agent. Follow the verdict rules in the user message exactly. Return exactly one JSON object and nothing else."
+	body := []byte(`{"model":"glm-5.2","messages":[{"role":"system","content":"` + sys + `"},{"role":"user","content":"review this call"}]}`)
+	out := string(PrepareBodyOpt(body, true))
+	if strings.Contains(out, "You are a read-only safety reviewer for a coding agent") {
+		t.Fatalf("review-plugin system prompt survived: %s", out)
+	}
+	if !strings.Contains(out, "You are a read-only safety checker for a coding agent") {
+		t.Errorf("review-plugin system prompt not rewritten: %s", out)
+	}
+}
+
 // newTestUpstream 起一个假上游并捕获请求。
 func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()

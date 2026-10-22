@@ -78,7 +78,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试；撞 11-128 通道校验时把 system 搬进 user 角色单次重试 |
-| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹清洗（Claude Code / Codex / **DeepSeek Harness**，可关闭），与提示词体系两层叠加 |
+| 🗑️ **指纹脱敏** | 出站请求体黑名单指纹清洗（Claude Code / Codex / **DeepSeek Harness** / **官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件提示词**，可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题，七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
@@ -402,7 +402,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
-| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏（Claude Code / Codex 模板句、裸 `11128`、**DeepSeek Harness** 品牌词等） |
+| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏（Claude Code / Codex 模板句、裸 `11128`、**DeepSeek Harness** 品牌词、**官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件的提示词身份句**等） |
 | `features.system_as_user_fallback` | `true` | **system→user 伪装重试**：撞 11-128 通道校验（system 指纹）时把 system 指令搬进 user 角色、同一请求内重发一次；成功后记住该段 system 原文（哈希，24h / 上限 512），后续同段 system 直接以伪装形态出站。伪装后仍被拒 → 立即 `400 channel_refused` 终止轮转，只试一次。`false` = 关闭伪装（通道拒绝仍直接终止，不再白撞轮换） |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`=只藏该域。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
@@ -452,7 +452,7 @@ curl -s http://localhost:7863/v1/search/messages \
 客户端（Claude Code / Codex 等 CLI）会在 system prompt 注入固定模板句，上游内容审核按**逐字精确匹配**误杀合法流量（HTTP 400 + 审核文案）。网关提供两层防护，互不替代：
 
 1. **提示词体系**（解决 **system / developer 来源**的误报）：由 `prompt.mode` 控制
-2. **指纹脱敏**（兜底 **用户 / assistant 消息**里的指纹串）：由 `features.sanitize_blacklist_fingerprints` 控制
+2. **指纹脱敏**（兜底 **用户 / assistant 消息**里的指纹串）：由 `features.sanitize_blacklist_fingerprints` 控制——除 CLI 模板句与 DSH 品牌词外，也覆盖**审查插件**（官方 `dsh-auto-review` 与三方 `auto-review-zh`）注入的提示词身份句。这类提示词是独立一次模型调用的正文，上游同样按逐字指纹拦，故与其它模板句同口径处理（`reviewer` → `checker` 一词之差即可绕过，语义不变）。
 
 | 模式 | 语义 |
 |---|---|
