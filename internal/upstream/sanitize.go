@@ -20,6 +20,9 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
+	"DeepSeek Harness",                                // DSH 身份句品牌词：上游按「非官方渠道」整单拦（11-128）
+	"deepseek-harness",                                // DSH 包路径/小写形态
+	"DeepSeekHarness",                                 // DSH 无空格形态
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -75,6 +78,25 @@ var sanitizeRewrites = [][2]string{
 		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
 		"11128",
 		"11-128",
+	},
+	{
+		// DSH（DeepSeek Harness）注入的身份句会被上游当成「非官方渠道调用」整单拦截：
+		// 400 11-128 Illegal API invocation from an unapproved channel。社区真机实测
+		// 换一个词即绕过（同一份请求改写前 6/6 被拦、改写后 0/2），语义不变且可见可 diff。
+		//
+		// 按短语全局替换而非只认开头：同一品牌词在长提示词正文里会出现多次，且可能
+		// 落在 system/user/assistant 任一角色（sanitizeMessages 全覆盖）。只改写品牌词，
+		// 不碰裸 "DeepSeek"——那会误伤用户对模型的正常讨论。
+		"DeepSeek Harness",
+		"DeepSeekRuntime",
+	},
+	{
+		"deepseek-harness",
+		"deepseek-runtime",
+	},
+	{
+		"DeepSeekHarness",
+		"DeepSeekRuntime",
 	},
 }
 

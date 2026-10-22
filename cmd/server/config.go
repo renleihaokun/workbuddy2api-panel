@@ -172,6 +172,10 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// SystemAsUserFallback 撞 11-128 通道校验时把 system 指令搬进 user 角色
+		// 重发一次，并记住该段 system 原文（默认 true；false = 只按既有轮转处理）。
+		// 与指纹脱敏正交：脱敏改写内容，本开关只改 role 形态。
+		SystemAsUserFallback bool `json:"system_as_user_fallback"`
 	} `json:"features"`
 
 	Models struct {
@@ -310,6 +314,9 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	// system→user 伪装重试默认开启：上游开始按 system 来源拦指纹后，这是不换客户端
+	// 就能继续用的唯一兜底；关闭即完全回到「撞 11-128 就轮转 / 报 400」的旧行为。
+	c.Features.SystemAsUserFallback = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3

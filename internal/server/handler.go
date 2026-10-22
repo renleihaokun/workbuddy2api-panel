@@ -56,6 +56,12 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
+	// SystemAsUserFallback 撞 11-128 通道校验时把 system 指令搬进 user 角色
+	// 重发一次，并记住该段 system 原文（见 internal/prompt/system.go 与
+	// internal/server/systemmode.go）。运行期以 livecfg 快照为准（热生效），
+	// 此处供 Live 为 nil 的裸用/测试路径。
+	SystemAsUserFallback bool
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -86,10 +92,11 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
-		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		APIKey:               h.cfg.APIKey,
+		SoftCooldown:         h.cfg.SoftCooldown,
+		RecordClientInfo:     h.cfg.RecordClientInfo,
+		HiddenModels:         livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		SystemAsUserFallback: h.cfg.SystemAsUserFallback,
 	}
 }
 
@@ -123,6 +130,10 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// sysMode system→user 伪装学习表（systemmode.go）：按 system 原文键记住
+	// 「已被证实需要伪装」的提示词，后续同段 system 直接伪装出站，不再先撞 400。
+	// 进程内状态、重启清零、24h 过期。
+	sysMode systemModeGate
 }
 
 // NewHandler 构建 handler。
@@ -803,6 +814,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// system→user 伪装（层 1/2/3）：上游把 system 来源的指纹判成「非官方渠道」
+	// 返回 11-128 时，把 system 指令搬进 user 角色在同一请求内重发一次。同一段
+	// system 原文被证实需要伪装后记入 sysMode，下次直接以伪装形态出站，不再先撞
+	// 一次 400（层 3）。只影响出站 body 的 role 形态：会话头族/粘性键/用量口径
+	// 均已在上方确定，不参与伪装。
+	//   层 1：首次（未学习）原样发，system 仍是 system；
+	//   层 2：撞 11-128 → 同账号、同请求内伪装重发一次（见下）；
+	//   层 3：成功后记住该段 system，后续请求直接走伪装；
+	//   层 4：伪装后仍被拒 → 立即 400 + hint 终止，只试一次不循环。
+	sysText := prompt.SystemText(body)
+	sysKey := systemModeKey(sysText)
+	systemConverted := false
+	var channelRefusedConverted bool
+	if h.systemAsUserEnabled() && sysKey != "" && h.sysMode.Known(sysKey) {
+		body = prompt.SystemAsUser(body, prompt.Degraded)
+		systemConverted = true
+	}
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -902,6 +931,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if errors.As(terr, &uerr) {
 			status = uerr.Status
 		}
+		// system→user 伪装重试（层 2）：11-128 是请求形状/通道指纹问题，换号必然
+		// 同样失败——先把 system 指令搬进 user 角色、用**同一个账号**立刻重发一次。
+		// 不罚号、不退避、不占换号名额（inline 重发，MaxRotate=1 时也能重试）。
+		// 只做一次：systemConverted 置位后，再撞 11-128 走下方终止分支（层 4）。
+		if status >= 400 && !systemConverted && h.systemAsUserEnabled() &&
+			attemptKind(status, respBody, uerr) == upstream.ErrChannelRefused {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			systemConverted = true
+			body = prompt.SystemAsUser(body, prompt.Degraded)
+			log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
+				logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(sysKey))
+			attemptStarted = time.Now()
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+			uerr = nil
+			if errors.As(terr, &uerr) {
+				status = uerr.Status
+			}
+		}
 		if uerr == nil && terr != nil {
 			// 上游超时 / 停滞：**不换号、不罚号**。
 			//
@@ -946,6 +993,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
+			// 学习（层 3）：伪装后通道校验不再被拒（任何非 11-128 的结果都说明
+			// 通道过了）→ 记住这段 system 原文。反向不学：伪装后仍是 11-128 说明
+			// 指纹在 assistant/tool 历史里搬不走，记下来只会让后续请求白走伪装。
+			if systemConverted && kind != upstream.ErrChannelRefused && sysKey != "" {
+				h.sysMode.Remember(sysKey)
+			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
 			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
@@ -955,6 +1008,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
+				// system 已整段换成 Degraded → 学习键必须重算：否则 11-128 分支会拿
+				// 旧 system 的键去判断/记录新形态，学习表与实际出站 body 脱节。
+				sysKey = systemModeKey(prompt.SystemText(body))
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
@@ -1044,6 +1100,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 11-128 通道校验/系统指纹拒绝（层 4）：已在上面尝试过一次 system→user
+			// 伪装（若有可转换内容）。仍被拒说明指纹不在 system 里可搬走的位置，
+			// 换号必然同样失败 → 立即终止轮转，只试一次、不循环，末端 400 透传原文。
+			if kind == upstream.ErrChannelRefused {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				channelRefusedConverted = systemConverted
+				break
+			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
@@ -1060,6 +1126,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				break // ctx 取消：终止轮转（分类错误换号退避）
 			}
 			continue
+		}
+		// 学习（层 3，成功路径）：伪装后这一跳真的成功了 → 同样记住这段 system。
+		// 已学习的键在这里刷新 TTL（滑窗：还在用的提示词不因过期被重新撞一次 400）。
+		if systemConverted && sysKey != "" {
+			h.sysMode.Remember(sysKey)
 		}
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
@@ -1239,6 +1310,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
+		// system→user 伪装已尝试仍被拒：指纹在 assistant/tool 历史里搬不走，
+		// 给可操作指向（不改写上游原文 message，只并列补充 gateway_hint）。
+		if ue.Kind == upstream.ErrChannelRefused && channelRefusedConverted {
+			hint += "; the system prompt was moved into a user message but the request was still rejected — the fingerprint is likely in assistant/tool history; trim those messages or keep fingerprint sanitizing enabled"
+		}
 		switch ue.Kind {
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
@@ -1264,6 +1340,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 客户端据此会不断重试（#81 里就是 503 → 客户端自动重试 5 次），而真正
 			// 该做的是换个模型。用 400 + 明确的 code 把不可重试的性质讲清楚。
 			code = "model_unavailable"
+			status = http.StatusBadRequest
+		case upstream.ErrChannelRefused:
+			// 11128 通道校验失败：全池轮转后仍被拒说明是请求形状/通道指纹问题，
+			// 用 400 + channel_refused 明确透传，避免伪装成 503 no_healthy_account。
+			code = "channel_refused"
 			status = http.StatusBadRequest
 		}
 		if s := strings.TrimSpace(ue.Msg); s != "" {

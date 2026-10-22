@@ -386,6 +386,61 @@ func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 	}
 }
 
+// DSH（DeepSeek Harness）身份句是短语级指纹：上游按逐字匹配拦
+// （400 11-128 Illegal API invocation from an unapproved channel），换一个词即绕过。
+// 钉住三条：命中改写、只含品牌词也进净化（特征预检不得漏）、结果幂等。
+func TestDeepSeekHarnessBrandRewritten(t *testing.T) {
+	in := "You are an AI agent powered by DeepSeek Harness.\n\nCheck the exit code."
+	out := sanitizeText(in)
+	if strings.Contains(out, "DeepSeek Harness") {
+		t.Fatalf("brand word not rewritten: %q", out)
+	}
+	if !strings.HasPrefix(out, "You are an AI agent powered by DeepSeekRuntime.") {
+		t.Errorf("identity sentence not rewritten in place: %q", out)
+	}
+	if !strings.Contains(out, "Check the exit code.") {
+		t.Errorf("surrounding text should be untouched: %q", out)
+	}
+	if again := sanitizeText(out); again != out {
+		t.Errorf("not idempotent: %q -> %q", out, again)
+	}
+}
+
+// 预检快路径：文本只含品牌词、不含任何其它指纹，也必须进入净化。
+func TestDeepSeekHarnessDetected(t *testing.T) {
+	if !hasFingerprint("You are interacting through the DeepSeek Harness Web GUI.") {
+		t.Error("brand word should hit the fast path")
+	}
+	if !hasFingerprint("node_modules/@deepseek-ai/deepseek-harness/index.js") {
+		t.Error("lowercase package path should hit the fast path")
+	}
+}
+
+// 小写包路径形态（npm 包名/URL）同样改写，避免把网关来源暴露给上游。
+func TestDeepSeekHarnessLowercaseRewritten(t *testing.T) {
+	out := sanitizeText("npm i @deepseek-ai/deepseek-harness")
+	if strings.Contains(out, "deepseek-harness") {
+		t.Errorf("lowercase brand not rewritten: %q", out)
+	}
+	if !strings.Contains(out, "deepseek-runtime") {
+		t.Errorf("lowercase brand rewrite missing: %q", out)
+	}
+}
+
+// 走完 prepareBody 全链路：system 与 user 里的品牌词都出站前改掉（覆盖全角色）。
+func TestPrepareBodyRewritesDeepSeekHarness(t *testing.T) {
+	body := []byte(`{"model":"glm-5.2","messages":[` +
+		`{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."},` +
+		`{"role":"user","content":"the DeepSeek Harness checkout is here"}]}`)
+	out := PrepareBodyOpt(body, true)
+	if strings.Contains(string(out), "DeepSeek Harness") {
+		t.Fatalf("brand word survived prepareBody: %s", out)
+	}
+	if got := strings.Count(string(out), "DeepSeekRuntime"); got != 2 {
+		t.Errorf("expected both messages rewritten, got %d: %s", got, out)
+	}
+}
+
 // newTestUpstream 起一个假上游并捕获请求。
 func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
