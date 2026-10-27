@@ -25,6 +25,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -69,6 +70,12 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ModelsIDStyle 模型 ID 分隔符原始值（config models.id_style；Live 为 nil 的
+	// 测试路径经 modelStyle() 解析后使用）。
+	ModelsIDStyle string
+	// ModelsRealmNamePrefix 模型 name 是否带域前缀（Live 为 nil 时的静态回落）。
+	ModelsRealmNamePrefix bool
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -414,15 +421,30 @@ func (p *Panel) nicknames() map[string]string {
 	return nicks
 }
 
+// modelStyle 返回当前生效的模型 ID 写法与名称前缀开关。
+//
+// 运行期以 livecfg 快照为准（面板保存配置后立即热生效）；快照缺失（测试/裸用）
+// 时回落静态字段，缺省 colon + 不前缀，与 /v1/models 的兜底口径一致。
+func (p *Panel) modelStyle() (modelid.Style, bool) {
+	if p.cfg.Live != nil {
+		s := p.cfg.Live.Load()
+		return s.ModelIDStyle, s.RealmNamePrefix
+	}
+	return modelid.StyleOf(p.cfg.ModelsIDStyle), p.cfg.ModelsRealmNamePrefix
+}
+
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
-// （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
+// 与 /v1/models 同口径的双域输出：ID 写法随 models.id_style（默认 cn:model，
+// slash 时 cn/model）——前端显示的 id 就是调用时要填的完整 model 值。
+// 额外下发 realm（cn/global）与 model（裸名）字段，前端判断域的稳定性不再依赖
+// 解析 ID 字符串（换标准写法时不会连带把筛选/可用性标签搞坏）。
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
+	style, namePrefix := p.modelStyle()
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
@@ -433,7 +455,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				fetchErrs = append(fetchErrs, "cn: "+err.Error())
 			} else {
 				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+					out = append(out, panelModelEntry(style, namePrefix, "cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
 				}
 			}
 		}
@@ -450,7 +472,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
 					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
+						out = append(out, panelModelEntry(style, namePrefix, "global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
 					}
 				}
 			}
@@ -468,13 +490,24 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
-// panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
-// context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
-// EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
-func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
+// panelModelEntry 构造单个模型条目（两域共用）：id 按 style 拼 realm 前缀
+//（调用值即显示值），context_length / max_output_tokens 走四级查找链，effort
+// 档位按 realm 域取 EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models
+// 同一口径，两侧不再漂移。
+//
+// 同时下发 realm/model 两个结构化字段：前端（筛选、可用性、探测标注）不再
+// 依赖从 ID 字符串里 split 出域，换冒号/斜杠写法时不会连带失效。
+// realmNamePrefix=true 时 name 前置 "CN · " / "Global · "（仅展示，空 name 不编造）。
+func panelModelEntry(style modelid.Style, realmNamePrefix bool, realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
+	name := mi.Name
+	if realmNamePrefix && name != "" {
+		name = modelid.Label(realm) + " · " + name
+	}
 	entry := map[string]any{
-		"id":                   realm + ":" + mi.ID,
-		"name":                 mi.Name,
+		"id":                   modelid.Format(style, realm, mi.ID),
+		"realm":                realm,
+		"model":                mi.ID,
+		"name":                 name,
 		"default_effort":       mi.DefaultEffort,
 		"supported_efforts":    mi.Efforts,
 		"can_disable_thinking": mi.CanDisableThinking,

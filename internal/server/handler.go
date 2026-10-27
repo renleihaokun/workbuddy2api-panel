@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
@@ -72,6 +73,13 @@ type Config struct {
 	// 裸用/测试路径经 loadLive() 归一化后使用）。
 	ModelsHidden []string
 
+	// ModelsIDStyle 模型列表 ID 分隔符原始值（config models.id_style；Live 为 nil
+	// 的裸用/测试路径经 loadLive() 解析后使用）。
+	ModelsIDStyle string
+	// ModelsRealmNamePrefix 模型 name 是否带 "CN · " / "Global · " 前缀
+	//（config models.realm_name_prefix；Live 为 nil 时的静态回落）。
+	ModelsRealmNamePrefix bool
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -97,6 +105,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		RecordClientInfo:     h.cfg.RecordClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 		SystemAsUserFallback: h.cfg.SystemAsUserFallback,
+		ModelIDStyle:         modelid.StyleOf(h.cfg.ModelsIDStyle),
+		RealmNamePrefix:      h.cfg.ModelsRealmNamePrefix,
 	}
 }
 
@@ -317,10 +327,24 @@ const (
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
+//
+// ID 写法由 models.id_style 决定（colon = cn:model，默认；slash = cn/model）。
+// 查询参数 ?style=colon|slash 只覆盖**本次响应**的写法（调试/验证用，不落盘、不改
+// 配置）；非法值直接 400 —— 静默忽略会让排障时误以为配置没生效。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	snap := h.loadLive()
+	style := snap.ModelIDStyle
+	if q := strings.TrimSpace(r.URL.Query().Get("style")); q != "" {
+		s, err := modelid.ParseStyle(q)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "style: "+err.Error())
+			return
+		}
+		style = s
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   h.modelList(style, snap.RealmNamePrefix),
 	})
 }
 
@@ -395,19 +419,41 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	return entry
 }
 
-// modelList 模型列表：CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel
-// 对称）；global.enabled=true 时追加 global: 前缀的国际版名单。
+// withRealmName 在 realmNamePrefix=true 且 name 非空时给模型展示名加域前缀。
+//
+// 为什么只动 name：id 是路由标识（改它会影响客户端已保存的配置），name 是纯展示
+// 字段，且 Cherry Studio 会把服务端下发的 name 原样保留。两域同 id 的模型
+// （如 deepseek-v4.1-flash）在模型选择器里否则完全同名，无法区分。
+// 默认 false = 现有输出逐字节不变；name 为空时保持省略/空值，不编造。
+func withRealmName(entry map[string]any, realm string, on bool) {
+	if !on {
+		return
+	}
+	name, ok := entry["name"].(string)
+	if !ok || name == "" {
+		return
+	}
+	entry["name"] = modelid.Label(realm) + " · " + name
+}
+
+// modelList 模型列表：CN 模型按 style 输出 "cn:<model>"（默认）或 "cn/<model>"；
+// global.enabled=true 时追加 global 域名单（同风格）。
+//
+// style 只决定展示写法；models.hidden 的内部规范键恒为 "realm:bare"（modelid.Key），
+// 因此换风格不会让黑名单失效（与 resolveModel 的解析/规范键口径对称）。
+// realmNamePrefix 为 true 时在 name 前加 "CN · " / "Global · "，便于两域同 id 的
+// 模型在保留服务端 name 的客户端里区分。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
-func (h *Handler) modelList() []map[string]any {
+func (h *Handler) modelList(style modelid.Style, realmNamePrefix bool) []map[string]any {
 	out := make([]map[string]any, 0)
 	// models.hidden 黑名单：快照外提，避免逐条目重复 Load。
 	hidden := h.loadLive().HiddenModels
 	for _, mi := range h.fetchDynamicModels() {
-		if _, ok := hidden["cn:"+mi.ID]; ok {
+		if _, ok := hidden[modelid.Key(modelid.RealmCN, mi.ID)]; ok {
 			continue
 		}
 		entry := map[string]any{
-			"id":       "cn:" + mi.ID,
+			"id":       modelid.Format(style, modelid.RealmCN, mi.ID),
 			"object":   "model",
 			"created":  1753600000,
 			"owned_by": "workbuddy",
@@ -424,6 +470,7 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
 		entry = applyModelInfoFields(entry, mi)
+		withRealmName(entry, modelid.RealmCN, realmNamePrefix)
 		// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 		// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
 		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
@@ -449,11 +496,11 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
-			if _, ok := hidden["global:"+id]; ok {
+			if _, ok := hidden[modelid.Key(modelid.RealmGlobal, id)]; ok {
 				continue
 			}
 			entry := map[string]any{
-				"id":       "global:" + id,
+				"id":       modelid.Format(style, modelid.RealmGlobal, id),
 				"object":   "model",
 				"created":  1753600000,
 				"owned_by": "workbuddy",
@@ -464,6 +511,7 @@ func (h *Handler) modelList() []map[string]any {
 				entry = applyModelInfoFields(entry, mi)
 				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
 			}
+			withRealmName(entry, modelid.RealmGlobal, realmNamePrefix)
 			entry["context_length"] = upstream.ContextWindowListingV4(id, remoteCtx, h.cfg.Upstream.HTTP)
 			if mo, ok := upstream.MaxOutputTokensListingV4(id, remoteOut, h.cfg.Upstream.HTTP); ok {
 				entry["max_output_tokens"] = mo
@@ -614,7 +662,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
-	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
+	if _, hide := h.loadLive().HiddenModels[modelid.Key(realm, bareModel)]; hide {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
 			"model is hidden by gateway configuration, try another model", "")
 		st.status = http.StatusBadRequest

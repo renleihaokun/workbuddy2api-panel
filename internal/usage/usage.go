@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 )
 
 // hourlyKeep 小时桶的保留时长；超出后折叠为日桶。
@@ -724,13 +726,17 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	return snap
 }
 
+// canonicalUsageModel 把「模型 ID 的各种客户端写法」归并为裸模型名，供快照按
+// 模型维度聚合。
+//
+// 历史数据/旧客户端可能带 realm 前缀，且 models.id_style 允许展示侧用斜杠
+//（cn/xxx）；两者都必须归并到同一个裸名，否则同一模型会在「用量 → 按模型」
+// 里裂成多行。前缀解析统一走 modelid.Split（与请求侧同源，不维护第二套规则）；
+// 空模型名（含只有前缀的情况）统一记 "(unknown)"，与历史口径一致。
 func canonicalUsageModel(model string) string {
 	model = strings.TrimSpace(model)
-	for _, prefix := range []string{"cn:", "global:"} {
-		if strings.HasPrefix(model, prefix) {
-			model = strings.TrimPrefix(model, prefix)
-			break
-		}
+	if _, bare, explicit := modelid.Split(model); explicit {
+		model = bare
 	}
 	if model == "" {
 		return "(unknown)"

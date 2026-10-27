@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 )
 
 // Snapshot 一次读取的不可变配置视图。
@@ -22,6 +24,13 @@ type Snapshot struct {
 	SystemAsUserFallback bool                // 撞 11-128 时把 system 搬进 user 角色重试
 	RecordClientInfo     bool                // 请求日志是否记录调用来源（客户端 IP / UA）
 	HiddenModels         map[string]struct{} // 精确隐藏的模型 id（已归一化为 "cn:x"/"global:x" 全量形式）；nil = 不隐藏
+	// ModelIDStyle 模型列表/面板输出的 ID 分隔符（models.id_style）。
+	// 零值 = colon（cn:model，零回归）；slash = cn/model（registry 驱动的客户端用）。
+	// 只影响展示，不影响请求解析与内部规范键。
+	ModelIDStyle modelid.Style
+	// RealmNamePrefix 为 true 时列表/面板的 name 前置 "CN · " / "Global · "，
+	// 便于两域同 id 的模型在客户端里区分（默认 false，零回归）。
+	RealmNamePrefix bool
 }
 
 // Holder 原子持有当前快照。
@@ -50,11 +59,15 @@ func (h *Holder) Load() Snapshot {
 // Store 整体替换快照。
 func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
 
-// NormalizeHiddenModels 把用户配置的 hidden 条目归一化为精确 id 集合。
+// NormalizeHiddenModels 把用户配置的 hidden 条目归一化为精确 id 集合（规范键 realm:bare）。
 //
-// 条目带合法 "cn:"/"global:" 前缀 → 只隐藏该域；裸名 → 两域都隐藏。
-// 大小写敏感（与 internal/server.resolveModel 的前缀规则对称：取第一个 ":",
-// 前段恰为 "cn"/"global" 才剥离）。返回的 map 只读共享，调用方不得修改。
+// 条目带合法 "cn:"/"global:" 前缀（冒号或斜杠两种分隔符都行）→ 只隐藏该域；
+// 裸名 → 两域都隐藏。大小写敏感（与 internal/server.resolveModel 的前缀规则
+// 对称：只认精确小写枚举；"xx:yy"/"CN/x" 等整体当裸名）。
+//
+// 归一化到规范键的意义：models.hidden 是**内部状态**，不应随 models.id_style
+// 的展示风格变化而失效——客户端用 cn:x 还是 cn/x 打进来，都能命中同一键。
+// 返回的 map 只读共享，调用方不得修改。
 func NormalizeHiddenModels(hidden []string) map[string]struct{} {
 	if len(hidden) == 0 {
 		return nil
@@ -65,11 +78,11 @@ func NormalizeHiddenModels(hidden []string) map[string]struct{} {
 		if m == "" {
 			continue
 		}
-		if prefix, bare, ok := strings.Cut(m, ":"); ok && (prefix == "cn" || prefix == "global") {
-			out[prefix+":"+bare] = struct{}{}
+		if realm, bare, explicit := modelid.Split(m); explicit {
+			out[modelid.Key(realm, bare)] = struct{}{}
 		} else {
-			out["cn:"+m] = struct{}{}
-			out["global:"+m] = struct{}{}
+			out[modelid.Key(modelid.RealmCN, m)] = struct{}{}
+			out[modelid.Key(modelid.RealmGlobal, m)] = struct{}{}
 		}
 	}
 	if len(out) == 0 {

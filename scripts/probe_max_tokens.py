@@ -17,7 +17,7 @@ OpenAI 兼容端点的「真实输出上限」探测工具
   # 测某网关全部以给定前缀开头的模型（默认 cn:）
   python probe_max_tokens.py --base http://211.154.25.123:7863/v1 --key sk-xxx
 
-  # 指定模型 / 多个前缀 / 只看计划
+  # 指定模型 / 多个前缀（cn: 与 cn/ 等价）/ 只看计划
   python probe_max_tokens.py --base ... --key ... --models flash,glm-5.3
   python probe_max_tokens.py --base ... --key ... --prefix cn: --prefix global:
   python probe_max_tokens.py --base ... --key ... --dry-run
@@ -50,6 +50,15 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# 模型 ID 的 realm 前缀有两种等价写法：网关默认输出 cn:model，models.id_style=slash
+# 时输出 cn/model。本工具一律归一化为冒号形式再比对/落盘——探测契约键（面板
+# 「模型与档位」的实测列）因此恒为 realm:bare，不随列表风格变化。
+_REALM_SEP_RE = re.compile(r"^(cn|global)/")
+
+
+def canon_model_id(mid: str) -> str:
+    return _REALM_SEP_RE.sub(r"\1:", mid)
 
 # 强制长输出的提示：目标值需与被测档位"量级相当"。
 # 实测教训：目标写得过大（数到 999999）模型会判断"不可能完成"而提前收尾（只输出 1~3k）；
@@ -267,7 +276,7 @@ def write_panel_out(path: str, results: list) -> None:
             pass  # 旧文件损坏则整体重建，不让坏文件卡住新结果
     for r in results:
         verdict, meas = classify(r)
-        contract["probes"][r["model"]] = {
+        contract["probes"][canon_model_id(r["model"])] = {
             "claimed": r.get("claimed_output"),
             "measured": meas,
             "verdict": verdict,
@@ -288,7 +297,7 @@ def main() -> None:
     ap.add_argument("--base", required=True, help="接口基址，如 http://host:7863/v1")
     ap.add_argument("--key", default=None, help="API Key（也可用环境变量 PROBE_API_KEY）")
     ap.add_argument("--prefix", action="append", default=None,
-                    help="只测以此前缀开头的模型（可多次；默认 cn:）")
+                    help="只测以此前缀开头的模型（可多次；默认 cn:；cn: 与 cn/ 等价）")
     ap.add_argument("--models", default=None, help="按子串匹配模型 id（逗号分隔，优先级高于 --prefix）")
     ap.add_argument("--tiers", default="40000,100000",
                     help="阶梯请求值，逗号分隔（默认 40000,100000；越高越慢越费额度）")
@@ -320,11 +329,11 @@ def main() -> None:
     print(f"目标: {args.base}")
     all_models = fetch_models(args.base, key)
     if args.models:
-        kws = [k.strip().lower() for k in args.models.split(",") if k.strip()]
+        kws = [canon_model_id(k.strip().lower()) for k in args.models.split(",") if k.strip()]
         def _match(mid: str) -> int:
             """返回匹配优先级：0=不匹配，3=带前缀的完整 id，2=后缀精确，1=子串。
             关键词含 ':' 时按完整 id 比对（cn:xxx 只命中 cn:xxx，不含 global:xxx）。"""
-            low = mid.lower()
+            low = canon_model_id(mid.lower())
             for k in kws:
                 if ":" in k and low == k:
                     return 3
@@ -340,7 +349,8 @@ def main() -> None:
         targets = [m for m, s in scored if s == best and s > 0]
     else:
         prefixes = args.prefix or ["cn:"]
-        targets = [m for m in all_models if any(m["id"].startswith(p) for p in prefixes)]
+        targets = [m for m in all_models
+                   if any(canon_model_id(m["id"]).startswith(canon_model_id(p)) for p in prefixes)]
     if args.limit:
         targets = targets[:args.limit]
     if not targets:

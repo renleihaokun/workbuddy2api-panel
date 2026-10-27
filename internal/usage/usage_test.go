@@ -142,17 +142,48 @@ func TestCreditDimensionsRateGrouping(t *testing.T) {
 	r.Add(now, "cn", "u1", "cn:glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1, HasCredit: true, ModelRate: "0.5"}, true)
 	r.Add(now.Add(time.Hour), "cn", "u2", "glm-5.2", Delta{TotalTokens: 200, HasTotal: true, Credit: 2, HasCredit: true, ModelRate: "0.5"}, true)
 	r.Add(now.Add(2*time.Hour), "cn", "u2", "glm-5.2", Delta{TotalTokens: 300, HasTotal: true, Credit: 6, HasCredit: true, ModelRate: "0.8"}, true)
+	// 斜杠写法（models.id_style=slash 时旧数据/客户端写法）必须与冒号/裸名归并到同一行。
+	r.Add(now.Add(3*time.Hour), "cn", "u3", "cn/glm-5.2", Delta{TotalTokens: 400, HasTotal: true, Credit: 4, HasCredit: true, ModelRate: "0.5"}, true)
 
 	s := r.Snapshot(24, nil)
-	if len(s.CreditByAccount) != 2 || len(s.CreditByModel) != 2 {
-		t.Fatalf("dimensions accounts=%+v models=%+v, want 2 accounts and 2 model-rate rows", s.CreditByAccount, s.CreditByModel)
+	if len(s.CreditByAccount) != 3 || len(s.CreditByModel) != 2 {
+		t.Fatalf("dimensions accounts=%+v models=%+v, want 3 accounts and 2 model-rate rows", s.CreditByAccount, s.CreditByModel)
 	}
-	if s.CreditByModel[0].Key != "glm-5.2" || s.CreditByModel[0].Rate != "0.8" ||
-		s.CreditByModel[0].Credits != 6 || s.CreditByModel[0].CreditTokens != 300 {
-		t.Fatalf("first model row = %+v, want rate=0.8 credits=6 tokens=300", s.CreditByModel[0])
+	// 行序按积分降序（0.5 倍率行合并后 credits=7 排在前面），按 Rate 取行更稳。
+	byRate := map[string]CreditAgg{}
+	for _, row := range s.CreditByModel {
+		byRate[row.Rate] = row
 	}
-	if s.CreditByModel[1].Rate != "0.5" || s.CreditByModel[1].Credits != 3 || s.CreditByModel[1].CreditTokens != 300 {
-		t.Fatalf("merged model row = %+v, want rate=0.5 credits=3 tokens=300", s.CreditByModel[1])
+	if row := byRate["0.8"]; row.Key != "glm-5.2" || row.Credits != 6 || row.CreditTokens != 300 {
+		t.Fatalf("rate=0.8 row = %+v, want credits=6 tokens=300", row)
+	}
+	merged := byRate["0.5"]
+	if merged.Key != "glm-5.2" || merged.Credits != 7 || merged.CreditTokens != 700 || merged.Requests != 3 {
+		t.Fatalf("rate=0.5 row = %+v, want credits=7 tokens=700 requests=3（cn:/cn//bare 三种写法合并）", merged)
+	}
+}
+
+// TestCanonicalUsageModelSeparators 归并口径：冒号/斜杠/裸名统一成裸名；
+// 非保留前缀与空模型名保持历史行为。
+func TestCanonicalUsageModelSeparators(t *testing.T) {
+	cases := map[string]string{
+		"glm-5.2":            "glm-5.2",
+		"cn:glm-5.2":         "glm-5.2",
+		"cn/glm-5.2":         "glm-5.2",
+		"global:gpt-5.6-sol": "gpt-5.6-sol",
+		"global/gpt-5.6-sol": "gpt-5.6-sol",
+		"  cn/glm-5.2  ":     "glm-5.2",
+		"cn:":                "(unknown)",
+		"cn/":                "(unknown)",
+		"":                   "(unknown)",
+		"foo:bar":            "foo:bar",
+		"foo/bar":            "foo/bar",
+		"CN/x":               "CN/x",
+	}
+	for in, want := range cases {
+		if got := canonicalUsageModel(in); got != want {
+			t.Errorf("canonicalUsageModel(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

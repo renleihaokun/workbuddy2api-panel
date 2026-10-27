@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
@@ -179,10 +180,22 @@ type Config struct {
 	} `json:"features"`
 
 	Models struct {
-		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
+		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=
+		// 只藏该域；斜杠写法 "cn/xxx"/"global/xxx" 与冒号等价（大小写敏感）。
 		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝。
 		// 面板保存后经 livecfg 热生效，无需重启。
 		Hidden []string `json:"hidden"`
+		// IDStyle 模型列表/面板输出的 ID 分隔符："colon"（默认，cn:model，既有协议，
+		// 零回归）或 "slash"（cn/model）。斜杠写法是为 registry 驱动的客户端
+		// （Cherry Studio 2.x 等）准备的：它们按 "/" 取末段匹配内置模型目录，
+		// 冒号前缀无法命中，只能把模型降级成无元数据的自定义模型。
+		// 只影响展示；请求侧始终同时接受两种写法与裸名（见 internal/modelid）。
+		// 热生效（经 livecfg 快照），无需重启。
+		IDStyle string `json:"id_style"`
+		// RealmNamePrefix 为 true 时模型 name 前置 "CN · " / "Global · "，
+		// 便于两域同 id 的模型在客户端（保留服务端 name 的）里区分。
+		// 默认 false = 现有输出完全不变；热生效。
+		RealmNamePrefix bool `json:"realm_name_prefix"`
 	} `json:"models"`
 
 	Prompt struct {
@@ -318,6 +331,8 @@ func Default() *Config {
 	// 就能继续用的唯一兜底；关闭即完全回到「撞 11-128 就轮转 / 报 400」的旧行为。
 	c.Features.SystemAsUserFallback = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	// 模型 ID 输出风格缺省 colon：与历史输出逐字节一致（slash 需显式开启）。
+	c.Models.IDStyle = string(modelid.StyleColon)
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -649,6 +664,13 @@ func (c *Config) normalize() error {
 			c.Schedule.TaskSweepMinutes = 15
 		}
 		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+	}
+	// 模型列表 ID 风格：空串回落 colon（老配置零影响）；非法值 fail fast，
+	// 不静默回落——拼错的配置静默生效会让用户以为切了风格其实没切。
+	if style, err := modelid.ParseStyle(c.Models.IDStyle); err != nil {
+		return fmt.Errorf("models.id_style: %w", err)
+	} else {
+		c.Models.IDStyle = string(style)
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

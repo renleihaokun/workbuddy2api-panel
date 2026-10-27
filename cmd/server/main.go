@@ -20,6 +20,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -250,6 +251,11 @@ func main() {
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
+	// 模型 ID 展示风格：slash 时为 registry 驱动的客户端（Cherry Studio 等）服务；
+	// 只改列表/面板展示，请求侧两种写法永远都接受，出站仍只发裸名。
+	if cfg.Models.IDStyle == string(modelid.StyleSlash) {
+		log.Printf("[models] 模型列表使用斜杠写法 cn/model（models.id_style=slash；仅影响 /v1/models 与面板显示）")
+	}
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
@@ -261,6 +267,8 @@ func main() {
 		SystemAsUserFallback: cfg.Features.SystemAsUserFallback,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		ModelIDStyle:         modelid.StyleOf(cfg.Models.IDStyle),
+		RealmNamePrefix:      cfg.Models.RealmNamePrefix,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -318,6 +326,10 @@ func main() {
 		},
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
+		// 列表 ID 风格与名称前缀：运行期以 livecfg 快照为准（热生效），此处供
+		// Live 为 nil 的测试路径。
+		ModelsIDStyle:         cfg.Models.IDStyle,
+		ModelsRealmNamePrefix: cfg.Models.RealmNamePrefix,
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
@@ -353,6 +365,10 @@ func main() {
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		// 列表 ID 风格与名称前缀：运行期以 livecfg 快照为准（热生效），此处供
+		// Live 为 nil 的裸用/测试路径。
+		ModelsIDStyle:         cfg.Models.IDStyle,
+		ModelsRealmNamePrefix: cfg.Models.RealmNamePrefix,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -530,6 +546,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SystemAsUserFallback: newCfg.Features.SystemAsUserFallback,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		ModelIDStyle:         modelid.StyleOf(newCfg.Models.IDStyle),
+		RealmNamePrefix:      newCfg.Models.RealmNamePrefix,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

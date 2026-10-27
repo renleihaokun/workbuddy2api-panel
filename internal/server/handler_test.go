@@ -2037,3 +2037,237 @@ func TestModelsHiddenFiltered(t *testing.T) {
 		t.Errorf("hidden model leaked into /v1/models: ids=%v", ids)
 	}
 }
+
+// presetDynamicModels 预置 /v1/models 的动态目录缓存（避免联网拉取），并在用例
+// 结束后恢复，防止污染同包其他测试。
+func presetDynamicModels(t *testing.T, infos []upstream.ModelInfo) {
+	t.Helper()
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = infos
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+	t.Cleanup(func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
+		dynamicModelsCache.lastFail = time.Time{}
+		dynamicModelsCache.Unlock()
+	})
+}
+
+// TestModelsIDStyleSlash models.id_style=slash：列表 ID 用 cn/model 写法，
+// 其余字段与 hidden 过滤口径不变（hidden 内部规范键仍是 realm:bare）。
+func TestModelsIDStyleSlash(t *testing.T) {
+	presetDynamicModels(t, []upstream.ModelInfo{{ID: "glm-5.2"}, {ID: "deepseek-v3"}})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"data":[]}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool:          p,
+		Upstream:      up,
+		ModelsHidden:  []string{"deepseek-v3"},
+		ModelsIDStyle: "slash",
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range resp.Data {
+		ids[m.ID] = true
+	}
+	if !ids["cn/glm-5.2"] {
+		t.Errorf("slash 风格缺少 cn/glm-5.2: %v", ids)
+	}
+	if ids["cn:glm-5.2"] {
+		t.Errorf("slash 风格不应再输出冒号写法: %v", ids)
+	}
+	if ids["cn/deepseek-v3"] {
+		t.Errorf("hidden 模型泄漏: %v", ids)
+	}
+}
+
+// TestModelsIDStyleQueryOverride ?style= 只覆盖本次响应；非法值 400 且带错误码。
+func TestModelsIDStyleQueryOverride(t *testing.T) {
+	presetDynamicModels(t, []upstream.ModelInfo{{ID: "glm-5.2"}})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"data":[]}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	fetchIDs := func(url string) (int, map[string]bool, string) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", url, nil))
+		ids := map[string]bool{}
+		var resp struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if rec.Code == http.StatusOK {
+			_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+			for _, m := range resp.Data {
+				ids[m.ID] = true
+			}
+		}
+		return rec.Code, ids, rec.Body.String()
+	}
+
+	// 默认仍是冒号。
+	if code, ids, body := fetchIDs("/v1/models"); code != http.StatusOK || !ids["cn:glm-5.2"] {
+		t.Fatalf("默认写法 code=%d ids=%v body=%s", code, ids, body)
+	}
+	// 查询参数临时切斜杠，不落盘。
+	if code, ids, body := fetchIDs("/v1/models?style=slash"); code != http.StatusOK || !ids["cn/glm-5.2"] || ids["cn:glm-5.2"] {
+		t.Fatalf("?style=slash code=%d ids=%v body=%s", code, ids, body)
+	}
+	// 非法值 400 invalid_request（不静默忽略）。
+	code, _, body := fetchIDs("/v1/models?style=bogus")
+	if code != http.StatusBadRequest || !strings.Contains(body, "invalid_request") {
+		t.Fatalf("非法 style: code=%d body=%s, want 400 invalid_request", code, body)
+	}
+}
+
+// TestModelsRealmNamePrefix realm_name_prefix=true 时 name 前置 "CN · "；
+// name 为空的模型不编造前缀。
+func TestModelsRealmNamePrefix(t *testing.T) {
+	presetDynamicModels(t, []upstream.ModelInfo{
+		{ID: "glm-5.2", Name: "GLM-5.2"},
+		{ID: "no-name"},
+	})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"data":[]}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, ModelsRealmNamePrefix: true})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byID := map[string]map[string]any{}
+	for _, m := range resp.Data {
+		byID[m["id"].(string)] = m
+	}
+	if got := byID["cn:glm-5.2"]["name"]; got != "CN · GLM-5.2" {
+		t.Errorf("prefixed name=%v want CN · GLM-5.2", got)
+	}
+	if name, ok := byID["cn:no-name"]["name"]; ok && name != "" {
+		t.Errorf("空 name 不应被编造: %v", name)
+	}
+}
+
+// TestChatSlashRealmPrefixRoutes 请求侧斜杠前缀：realm 正确、出站 body 只带裸名。
+func TestChatSlashRealmPrefixRoutes(t *testing.T) {
+	var mu sync.Mutex
+	var bodies, auths []string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var raw []byte
+			if r.Body != nil {
+				raw, _ = io.ReadAll(r.Body)
+			}
+			mu.Lock()
+			bodies = append(bodies, string(raw))
+			auths = append(auths, r.Header.Get("Authorization"))
+			mu.Unlock()
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := newRealmPool(t)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	post := func(model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		body := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}]}`
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		return rec
+	}
+
+	if rec := post("cn/glm-5.2"); rec.Code != http.StatusOK {
+		t.Fatalf("cn/glm-5.2: code=%d body=%s", rec.Code, rec.Body)
+	}
+	mu.Lock()
+	firstBody, firstAuth := bodies[len(bodies)-1], auths[len(auths)-1]
+	mu.Unlock()
+	if !strings.Contains(firstBody, `"model":"glm-5.2"`) {
+		t.Errorf("出站 body 应只带裸名: %s", firstBody)
+	}
+	if strings.Contains(firstBody, "cn/glm-5.2") {
+		t.Errorf("出站 body 不应带 realm 前缀: %s", firstBody)
+	}
+	if firstAuth != "Bearer at-cn" {
+		t.Errorf("cn/ 前缀应选 cn 号，实际 auth=%q", firstAuth)
+	}
+
+	if rec := post("global/gpt-5.6-sol"); rec.Code != http.StatusOK {
+		t.Fatalf("global/gpt-5.6-sol: code=%d body=%s", rec.Code, rec.Body)
+	}
+	mu.Lock()
+	lastBody, lastAuth := bodies[len(bodies)-1], auths[len(auths)-1]
+	mu.Unlock()
+	if !strings.Contains(lastBody, `"model":"gpt-5.6-sol"`) {
+		t.Errorf("global 出站 body 应只带裸名: %s", lastBody)
+	}
+	if lastAuth != "Bearer at-gl" {
+		t.Errorf("global/ 前缀应选 global 号，实际 auth=%q", lastAuth)
+	}
+}
+
+// TestChatHiddenModelSlashForms models.hidden 的两种写法互通：裸名/冒号藏掉的模型，
+// 用斜杠写法点名同样 400；非隐藏域不受影响。
+func TestChatHiddenModelSlashForms(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, ModelsHidden: []string{"glm-5.2", "global:secret-model"}})
+
+	post := func(model string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[]}`)))
+		return rec
+	}
+
+	for _, model := range []string{"cn/glm-5.2", "global/secret-model"} {
+		rec := post(model)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+			t.Errorf("%q: code=%d body=%s, want 400 model_unavailable", model, rec.Code, rec.Body.String())
+		}
+	}
+	if calls != 0 {
+		t.Errorf("hidden 模型不得打上游: calls=%d", calls)
+	}
+	if rec := post("cn/secret-model"); rec.Code != http.StatusOK {
+		t.Fatalf("cn/secret-model 应放行: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+}

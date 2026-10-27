@@ -464,7 +464,8 @@ func TestAppJSModelAvailability(t *testing.T) {
 	script := `const fs = require('fs');
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
-const start = src.indexOf('function mdAvailabilityOf');
+// 切片起点用 mdSplitId：可用性判定依赖它解析 cn:/cn/ 两种写法，必须一起进沙箱。
+const start = src.indexOf('function mdSplitId');
 const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model availability helpers not found');
 const ctx = { esc: s => String(s) };
@@ -1950,5 +1951,50 @@ func TestPanelAssetsCacheNegotiation(t *testing.T) {
 		if rec2.Body.Len() != 0 {
 			t.Fatalf("%s 304 响应不应带 body，实际 %d 字节", path, rec2.Body.Len())
 		}
+	}
+}
+
+// TestAppJSModelIDSeparators 模型 ID 的两种分隔符在筛选、可用性、探测键归一化上等价。
+func TestAppJSModelIDSeparators(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model id separator test skipped")
+	}
+	script := `const fs = require("fs");
+const vm = require("vm");
+const src = fs.readFileSync(process.argv[2], "utf8");
+const start = src.indexOf("function mdSplitId");
+const end = src.indexOf("function mdRowHtml");
+if (start < 0 || end < 0) throw new Error("model id helpers not found");
+const ctx = { String, Number, Array, Object, Date, isFinite, parseFloat };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + ";this.mdSplitId=mdSplitId; this.mdModelRealm=mdModelRealm; this.mdModelBare=mdModelBare; this.mdProbeKey=mdProbeKey; this.mdMatch=mdMatch; this.mdAvailabilityOf=mdAvailabilityOf;", ctx);
+const out = {
+  colon: ctx.mdSplitId("cn:glm-5.2"),
+  slash: ctx.mdSplitId("global/gpt-5.6-sol"),
+  bare: ctx.mdSplitId("glm-5.2"),
+  matchSlashCN: ctx.mdMatch({ id: "cn/glm-5.2" }, { realm: "cn" }),
+  matchSlashGlobal: ctx.mdMatch({ id: "cn/glm-5.2" }, { realm: "global" }),
+  availSlashOK: ctx.mdAvailabilityOf({ id: "global/ok" }, [], [{ model: "global:ok", status: 200, outcome: "success" }]).key,
+  availColonOK: ctx.mdAvailabilityOf({ id: "global:ok" }, [], [{ model: "global/ok", status: 200, outcome: "success" }]).key,
+  probeA: ctx.mdProbeKey({ realm: "cn", model: "glm-5.2" }),
+  probeB: ctx.mdProbeKey({ id: "cn/glm-5.2" })
+};
+process.stdout.write(JSON.stringify(out));`
+	f, err := os.CreateTemp(t.TempDir(), "model-id-sep-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model id separator node test failed: %v %s", err, out)
+	}
+	want := `{"colon":{"realm":"cn","bare":"glm-5.2"},"slash":{"realm":"global","bare":"gpt-5.6-sol"},"bare":{"realm":"","bare":"glm-5.2"},"matchSlashCN":true,"matchSlashGlobal":false,"availSlashOK":"ok","availColonOK":"ok","probeA":"cn:glm-5.2","probeB":"cn:glm-5.2"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("model id separators=%s want %s", out, want)
 	}
 }

@@ -62,8 +62,10 @@
     "system_as_user_fallback": true
   },
   "models": {
-    "_comment": "hidden: 不对外暴露的模型黑名单。裸名=两域都藏；\"cn:xxx\"/\"global:xxx\"=只藏该域。/v1/models 列表过滤 + chat 点名拒绝，面板保存后热生效。",
-    "hidden": []
+    "_comment": "hidden: 不对外暴露的模型黑名单。裸名=两域都藏；\"cn:xxx\"/\"global:xxx\"=只藏该域，斜杠写法 \"cn/xxx\"/\"global/xxx\" 等价；/v1/models 列表过滤 + chat 点名拒绝，面板保存后热生效。id_style: 列表输出分隔符，colon=cn:model（默认，既有客户端），slash=cn/model（Cherry Studio 等按 / 认命名空间的客户端能命中其内置模型目录）；请求侧两种写法永远都接受，热生效。realm_name_prefix: true 时模型 name 前加 \"CN · \"/\"Global · \"，便于两域同 id 区分。",
+    "hidden": [],
+    "id_style": "colon",
+    "realm_name_prefix": false
   },
   "prompt": {
     "mode": "passthrough",

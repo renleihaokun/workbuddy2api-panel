@@ -859,3 +859,79 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestModelsIDStyleConfig 模型列表 ID 风格：缺省 colon（零回归）、接受 slash
+// （忽略空白/大小写）、非法值 fail fast，且不影响 realm_name_prefix 缺省。
+func TestModelsIDStyleConfig(t *testing.T) {
+	c := Default()
+	if c.Models.IDStyle != "colon" {
+		t.Errorf("default id_style=%q want colon", c.Models.IDStyle)
+	}
+	if c.Models.RealmNamePrefix {
+		t.Error("default realm_name_prefix 应为 false")
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize default: %v", err)
+	}
+
+	// 键缺席 / 显式空串都回落 colon（老配置零影响）。
+	for _, raw := range []string{`{}`, `{"models":{}}`, `{"models":{"id_style":""}}`} {
+		cfg, err := ParseConfig([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseConfig(%s): %v", raw, err)
+		}
+		if cfg.Models.IDStyle != "colon" {
+			t.Errorf("ParseConfig(%s).id_style=%q want colon", raw, cfg.Models.IDStyle)
+		}
+	}
+
+	// 合法值与规范化（空白/大小写）。
+	for _, c2 := range []struct {
+		raw  string
+		want string
+	}{
+		{`{"models":{"id_style":"slash"}}`, "slash"},
+		{`{"models":{"id_style":" Slash "}}`, "slash"},
+		{`{"models":{"id_style":"COLON"}}`, "colon"},
+	} {
+		cfg, err := ParseConfig([]byte(c2.raw))
+		if err != nil {
+			t.Fatalf("ParseConfig(%s): %v", c2.raw, err)
+		}
+		if cfg.Models.IDStyle != c2.want {
+			t.Errorf("ParseConfig(%s).id_style=%q want %q", c2.raw, cfg.Models.IDStyle, c2.want)
+		}
+	}
+
+	// 非法值 fail fast，错误信息带字段名（面板会原样展示）。
+	if _, err := ParseConfig([]byte(`{"models":{"id_style":"path"}}`)); err == nil {
+		t.Fatal("invalid id_style 应报错")
+	} else if !strings.Contains(err.Error(), "models.id_style") {
+		t.Errorf("错误信息应包含 models.id_style: %v", err)
+	}
+
+	// realm_name_prefix 显式开启。
+	cfg, err := ParseConfig([]byte(`{"models":{"id_style":"slash","realm_name_prefix":true}}`))
+	if err != nil {
+		t.Fatalf("ParseConfig(slash+prefix): %v", err)
+	}
+	if !cfg.Models.RealmNamePrefix {
+		t.Error("realm_name_prefix 未生效")
+	}
+}
+
+// TestExampleConfigParses 仓库自带示例配置必须始终可解析（面板/文档都引用它）。
+func TestExampleConfigParses(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("read config.example.json: %v", err)
+	}
+	cfg, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("parse config.example.json: %v", err)
+	}
+	if cfg.Models.IDStyle != "colon" || cfg.Models.RealmNamePrefix {
+		t.Errorf("example models config = {%q,%v}, want colon/false",
+			cfg.Models.IDStyle, cfg.Models.RealmNamePrefix)
+	}
+}

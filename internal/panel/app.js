@@ -11,7 +11,7 @@ let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
-let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+let mdAll = [], mdProbes = {}, mdProbeByKey = {}, mdProbeOf = () => undefined;
 let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
@@ -745,10 +745,15 @@ async function loadModels() {
       $('mdNote').textContent = '上游未返回模型';
       return;
     }
-    // 探测键带域前缀（cn:glm-5.2），模型表显示裸名，按「精确命中或 :后缀」关联。
-    const probeKeys = Object.keys(mdProbes);
-    mdProbeOf = id => mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + id))];
-    const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
+    // 探测契约键历史上是 realm:bare（cn:glm-5.2）；models.id_style=slash 后模型
+    // id 变成 cn/glm-5.2，统一归一化，避免实测标注凭空消失。
+    mdProbeByKey = {};
+    for (const [k, v] of Object.entries(mdProbes)) {
+      const s = mdSplitId(k);
+      mdProbeByKey[s.realm + ':' + s.bare] = v;
+    }
+    mdProbeOf = m => mdProbeByKey[mdProbeKey(m)] || mdProbes[mdModelBare(m)] || undefined;
+    const hit = mdAll.filter(m => mdProbeOf(m)).length;
     $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
     renderModels();
   } catch (e) {
@@ -778,6 +783,18 @@ function mdSearchText(m) {
     .filter(Boolean).join(' ').toLowerCase();
 }
 
+// mdSplitId 拆出 {realm, bare}：兼容 cn:x / cn/x / 裸名（裸名 realm 为空串）。
+// 面板 API 现在同时下发 realm/model 字段，但旧 fixture 与历史数据只带 id，
+// 因此这里始终保留按 ID 解析的兜底；两种写法都解析，换 id_style 不受影响。
+function mdSplitId(id) {
+  const s = String(id || '');
+  const m = s.match(/^(cn|global)[:\/]/);
+  return m ? { realm: m[1], bare: s.slice(m[0].length) } : { realm: '', bare: s };
+}
+function mdModelRealm(m) { return (m && m.realm) || mdSplitId(m && m.id).realm; }
+function mdModelBare(m) { return (m && m.model) || mdSplitId(m && m.id).bare; }
+function mdProbeKey(m) { return mdModelRealm(m) + ':' + mdModelBare(m); }
+
 // mdMatch 单个模型是否满足全部筛选条件。
 function mdMatch(m, f) {
   f = f || mdFilter;
@@ -788,7 +805,7 @@ function mdMatch(m, f) {
       if (!text.includes(kw)) return false;
     }
   }
-  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.realm && mdModelRealm(m) !== f.realm) return false;
   if (f.cap === 'tool' && !m.supports_tool_call) return false;
   if (f.cap === 'vision' && !m.supports_images) return false;
   if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
@@ -821,11 +838,10 @@ function mdSortList(list, f) {
 // 只返回有真实本地证据的状态；目录中存在但从未请求过的模型标为“待验证”，
 // 避免把“上游列出了模型”误当成“当前账号有权限”。
 function mdAvailabilityOf(m, locks, recent) {
-  const id = String((m && m.id) || '');
-  if (!id.startsWith('global:')) return null;
+  if (mdModelRealm(m) !== 'global') return null;
+  const bare = mdModelBare(m);
   locks = Array.isArray(locks) ? locks : mdLocks;
   recent = Array.isArray(recent) ? recent : mdRecent;
-  const bare = id.slice('global:'.length);
   const lock = locks.find(r => r && r.realm === 'global' && r.model === bare);
   if (lock) {
     const reason = String(lock.reason || '').trim();
@@ -849,7 +865,10 @@ function mdAvailabilityOf(m, locks, recent) {
     return { key: 'limited', label: '限流/不可用', cls: 'warn',
       tip: '模型级冷却中' + (reason ? '；' + reason : '') };
   }
-  const ev = recent.find(e => e && e.model === id);
+  const ev = recent.find(e => {
+    if (!e || e.model == null) return false;
+    return mdModelRealm({ id: e.model }) === 'global' && mdModelBare({ id: e.model }) === bare;
+  });
   if (ev) {
     const status = Number(ev.status || 0);
     const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
@@ -908,7 +927,7 @@ function renderModels() {
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
-    tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
+    tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m))).join('');
   }
   const filtered = list.length !== mdAll.length;
   $('mdCount').textContent = !mdAll.length ? ''
@@ -1249,6 +1268,7 @@ const CFG_MAP = {
   system_as_user_fallback: ['features', 'system_as_user_fallback'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
+  id_style: ['models', 'id_style'], realm_name_prefix: ['models', 'realm_name_prefix'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *

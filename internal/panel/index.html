@@ -1426,6 +1426,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
 
         <div class="box">
+          <header><h3>模型 ID 与客户端兼容</h3></header>
+          <div class="pad">
+            <div class="grid2">
+              <label class="fld"><span class="lb">模型 ID 分隔符</span>
+                <select name="id_style">
+                  <option value="colon">冒号：cn:glm-5.2（默认，现有客户端）</option>
+                  <option value="slash">斜杠：cn/glm-5.2（Cherry Studio 等按 / 认命名空间）</option>
+                </select>
+                <span class="hint">只影响 /v1/models 与面板显示的 ID；请求两种写法都接受、裸名等价 cn。热生效</span></label>
+            </div>
+            <label class="switch"><span class="lb">模型名带域前缀（CN · / Global ·）</span>
+              <input type="checkbox" name="realm_name_prefix"></label>
+            <div class="hint">Cherry Studio 2.x 用内置 registry 识别模型：它只认 <code>/</code> 后面的最后一段，<code>cn:glm-5.2</code> 会被当成未收录模型（能力/上下文为空、Pi/DSH 智能体里可能选不到）；改成斜杠后 <code>cn/glm-5.2</code> 能直接命中内置元数据。RikkaHub 等不查 registry 的客户端两种都行。切换后需在客户端重新同步模型。</div>
+          </div>
+        </div>
+
+        <div class="box">
           <header><h3>日志</h3></header>
           <div class="pad">
             <label class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>

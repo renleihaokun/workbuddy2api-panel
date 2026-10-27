@@ -81,28 +81,32 @@ func TestBareModelCrossDomainFallbackDisabledByDefault(t *testing.T) {
 	}
 }
 
-// 显式 realm 前缀是确定性语义：开关开启也不回退（写 cn: 就只用 cn 号）。
+// 显式 realm 前缀是确定性语义：开关开启也不回退（写 cn: / cn/ 就只用 cn 号）。
 func TestExplicitRealmNeverFallsBack(t *testing.T) {
-	calls := map[string]int{}
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls[authz]++
-		if authz == "Bearer at-cn" {
-			return 400, `{"code":11102,"msg":"model [deepseek-v4.1-flash-sg] service info not found"}`, false
-		}
-		return 200, sseOK, true
-	})
-	p := newRealmPool(t)
-	p.SetCrossDomainFallback(true)
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	for _, model := range []string{"cn:deepseek-v4.1-flash-sg", "cn/deepseek-v4.1-flash-sg"} {
+		t.Run(model, func(t *testing.T) {
+			calls := map[string]int{}
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				calls[authz]++
+				if authz == "Bearer at-cn" {
+					return 400, `{"code":11102,"msg":"model [deepseek-v4.1-flash-sg] service info not found"}`, false
+				}
+				return 200, sseOK, true
+			})
+			p := newRealmPool(t)
+			p.SetCrossDomainFallback(true)
+			h := NewHandler(Config{Pool: p, Upstream: up})
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"cn:deepseek-v4.1-flash-sg","messages":[{"role":"user","content":"hi"}]}`)))
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
-		t.Fatalf("code=%d body=%s (want 400: 显式 cn: 前缀不得回退)", rec.Code, rec.Body)
-	}
-	if calls["Bearer at-gl"] != 0 {
-		t.Errorf("calls=%v want global 0 次（显式前缀零回退）", calls)
+			rec := httptest.NewRecorder()
+			body := `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}]}`
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+				t.Fatalf("code=%d body=%s (want 400: 显式 %s 前缀不得回退)", rec.Code, rec.Body, model)
+			}
+			if calls["Bearer at-gl"] != 0 {
+				t.Errorf("calls=%v want global 0 次（显式前缀零回退）", calls)
+			}
+		})
 	}
 }
 
