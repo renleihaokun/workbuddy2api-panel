@@ -833,7 +833,7 @@ http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航七个视图：
+界面**默认跟随系统明暗**（`prefers-color-scheme`，系统切主题时实时生效），顶栏主题按钮按「跟随系统 → 浅色 → 深色 → 跟随系统」三态循环并记住选择。左侧导航七个视图：
 
 | 视图 | 功能 |
 |---|---|
@@ -847,6 +847,65 @@ http://127.0.0.1:7863/panel/
 
 顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
+### 视觉与交互
+
+面板是高频操作界面，视觉目标是「密度优先的仪表盘」而不是营销页。实现集中在 `index.html` 的内联 `<style>`（桌面）与 `mobile.css`（手机），全部经 go:embed 打包，**无构建步骤**。
+
+**主题跟随系统（默认）**
+
+| 状态 | `data-theme` | 外观来源 |
+|---|---|---|
+| 跟随系统（默认） | 无该属性 | CSS `@media (prefers-color-scheme: light)` |
+| 手动浅色 | `light` | `[data-theme="light"]` 显式色板 |
+| 手动深色 | `dark` | `:root` 基础深色色板 |
+
+- 「跟随系统」时**不写属性**：系统换主题浏览器自己就跟着变，`app.js` 只额外监听 `matchMedia` 重绘按钮图标。
+- 浅色令牌由媒体查询提供，**JS 尚未执行的第一帧就已经是正确配色**，不会先闪一下深色。
+- 浅色色板在 CSS 里写了两份（媒体查询 + 显式锁定），`TestIndexHTMLLightPaletteConsistent` 保证两份逐字一致。
+- 原生控件（滚动条 / 日期选择器 / 下拉）跟着 `color-scheme` 走；手机端额外用 `color-scheme: only light|dark` 退出安卓的「自动暗化」。
+
+**设计令牌**：`--bg → --surface → --surface-2 → --raise` 四级表面分层，`--line / --line-soft` 两级描边，语义色 `--ok / --warn / --bad` 只用于状态；三档动效时长（`--dur-1/2/3` = 120/180/240ms）与统一缓动 `--ease` 由所有交互态复用。
+
+**对比度是带测试卡的指标**（`TestCSSContrastTargets`，WCAG AA）：
+
+| 指标 | 深色 | 浅色 | 阈值 |
+|---|---|---|---|
+| 次要文字 / 卡片 | 5.81 | 5.19 | ≥ 4.5 |
+| 卡片 / 页面底色 | 1.14 | 1.13 | ≥ 1.12 |
+| 分隔线 / 卡片 | 1.45 | 1.39 | ≥ 1.35 |
+
+**毛玻璃层（glassmorphism）**
+
+只给**覆盖在内容之上**的层用，数据卡片保持不透明——密集表格叠在模糊背景上会明显掉可读性：
+
+| 层 | 令牌 | 模糊 |
+|---|---|---|
+| 侧栏 `.nav` / 顶栏 `.topbar` | `--glass`（半透明表面） | `blur(20px) saturate(150%)` |
+| 弹层 `.dlg` / toast `.tst` | `--glass-strong`（更浓，保证正文可读） | `blur(24px)` / `blur(14px)` |
+| 遮罩 `.veil` | 半透明黑 | `blur(6px)` |
+
+玻璃必须有"东西可折射"，否则只是一块灰膜——所以 `body` 上铺了三团极低透明度的径向光晕（`--glow-1/--glow-2`，随主题切换），并设 `background-attachment: fixed` 让光晕不随滚动漂移。窄屏退回 `scroll`（手机上固定背景会让每次滚动重绘整页，掉帧明显）。
+
+**动效**
+
+- 视图切换：淡入 + 上浮 7px（靠 `hidden` 的 display 变化触发，无需 JS 配合）
+- KPI 卡：六张依次浮起，每张 +35ms
+- Token 时序图：淡入上浮
+- 导航项：加载时依次从左侧滑入（一次性）
+- 主题按钮：悬停转 18°、按下回缩
+- 主按钮：悬停上浮 1px + 阴影加深，按下回沉
+
+全部动效在 `prefers-reduced-motion: reduce` 下压到 0.01ms（`TestCSSReducedMotionOverridesThemeAnim` 守着主题过渡那条最具体的规则）。
+
+**交互反馈**
+
+- 按钮四态：hover（描边 + 提亮）、active（下沉 1px + 内阴影，模拟物理按键）、focus-visible（2px 焦点环）、disabled（降透明度、取消位移）。
+- 异步按钮统一走 `setBusy()`：禁用 + `aria-busy` + 文案替换，CSS 用 `button[aria-busy="true"]::after` 画内联转圈——把「点了没反应」变成「正在跑」。
+- 主题切换、弹层、toast 都有进出场过渡；`prefers-reduced-motion: reduce` 下全部压到 0.01ms。
+- toast 容器带 `role="status" aria-live="polite"`，操作结果读屏软件也能播报。
+
+**空态与加载**：数据未到时不再是一块空白——KPI 网格用微光骨架（`.kpis:empty::after`），列表与表格用统一的「图标 + 标题 + 说明」空态。
+
 ### 手机端（≤760px）
 
 无需配置：窗口宽度 ≤760px 时自动生效，>760px 完全不参与，桌面端逐像素不变。
@@ -854,7 +913,8 @@ http://127.0.0.1:7863/panel/
 - **侧栏 → 抽屉**：顶栏出现汉堡按钮，点遮罩 / 选中导航项 / `Esc` / 窗口拉宽都会自动关闭（拉宽不复位会留一层 fixed 遮罩把页面盖住点不动）
 - **宽表 → 卡片**：表头隐藏，每列字段名由 `mobile.js` 从 `<th>` 的纯文本抄进同列 `td[data-l]`，CSS 用 `content: attr(data-l)` 渲染——写死在 CSS 里会随表头改名漂移
 - **Token 时序图窄屏重画**：上游那张图固定 viewBox `1200×200` 靠 `width:100%` 缩放，360px 宽下缩放比只剩 ~0.28（内部 10px 刻度实际 ~2.8px，看着是一排小点）；窄屏改画 `440×230` 并抽稀刻度，tooltip 同样跟随柱子
-- 顶栏 / 筛选栏 / 弹层 / 统计条 / KPI 卡按同一密度口径收紧；`color-scheme: only light|dark` 退出手机浏览器的「自动暗化」（否则主题按钮显示浅色、页面实际还是黑的）
+- 顶栏 / 筛选栏 / 弹层 / 统计条 / KPI 卡按同一密度口径收紧；`color-scheme: only light|dark` 退出手机浏览器的「自动暗化」（否则主题按钮显示浅色、页面实际还是黑的）；「跟随系统」模式按 `prefers-color-scheme` 把 `color-scheme` 同样钉成单值
+- **触摸反馈**：手机没有 hover，`@media (hover: none)` 下按下改用底色变化（桌面那套 `translateY` 在触摸端会被忽略，反而显得没反应），同时关掉 UA 默认的灰色高亮块
 - 实现全在 `mobile.css` / `mobile.js` 两个独立文件里（`index.html` 只多一行 `<link>`、一行 `<script>`），改手机端不会与上游对 `index.html` / `app.js` 的改动冲突
 
 ### 时间范围查询
@@ -894,7 +954,9 @@ http://127.0.0.1:7863/panel/
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。
+**静态资源缓存协商**：面板的 `index.html` / `app.js` / `mobile.css` / `mobile.js` 都带内容哈希算出的 `ETag` 与 `Cache-Control: no-cache`——它们经 go:embed 随二进制变化，若不带缓存头，浏览器会做启发式缓存，**升级后仍在跑旧的 app.js**（表现为"后端已改、页面按钮还是老行为 / 接口 404"，只能靠清缓存恢复）。内容没变时回 304，开销可忽略。
+
+**安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器（`index.html` 里禁止出现 `on*=`，由 `TestIndexHTMLNoInlineEventHandler` 守着——被 CSP 静默拦掉的内联处理器表现为「点了没反应」，密钥弹窗上那个还会让回车触发整页重载）。
 
 **鉴权实现**：`internal/httpauth` 统一 server 与 panel 的 Bearer 校验，使用 SHA-256 摘要 + `subtle.ConstantTimeCompare` 常量时间比较（避免逐字节比较泄露密钥信息）；上游返回的 `uid` 经白名单校验（`[A-Za-z0-9_-]`，长度 ≤64）后才用于拼凭证文件名，防止路径穿越。
 

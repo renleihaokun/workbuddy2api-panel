@@ -212,6 +212,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function compPending');
 const end = src.indexOf('function renderCachedCompensation');
 if (start < 0 || end < 0 || end < start) throw new Error('render region not found');
+// renderCompensation 用 shortErr 压错误文本，这里把**真实实现**一起切进来（而不是打桩）：
+// 顺带覆盖"上游返回整页 HTML 时界面只显示一句话"这条行为。
+const sStart = src.indexOf('function shortErr');
+const sEnd = src.indexOf('function ago(');
+if (sStart < 0 || sEnd < 0 || sEnd < sStart) throw new Error('shortErr region not found');
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
 const ctx = {
@@ -221,6 +226,7 @@ const ctx = {
   Date, Math, Number, String, isFinite, Array, Object,
 };
 vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + src.slice(sStart, sEnd) + '\nthis.shortErr = shortErr;', ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.render = renderCompensation;', ctx);
 
 const out = {};

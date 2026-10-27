@@ -2,6 +2,9 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
+	"math"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -896,6 +899,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function expBatches');
 const end = src.indexOf('async function loadExpiry');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+// renderExpiry 的错误行走 shortErr，把真实实现一起切进来（不打桩），
+// 顺带覆盖"上游错误体是整页 HTML 时只显示一句话"。
+const sStart = src.indexOf('function shortErr');
+const sEnd = src.indexOf('function ago(');
+if (sStart < 0 || sEnd < 0 || sEnd < sStart) throw new Error('shortErr region not found');
 const sink = { innerHTML: '', textContent: '', hidden: true };
 const ctx = {
   esc: s => String(s == null ? '' : s),
@@ -905,6 +913,7 @@ const ctx = {
   lastPackages: null, lastPackagesAt: 0,
 };
 vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + src.slice(sStart, sEnd) + '\nthis.shortErr = shortErr;', ctx);
 vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
 const iso = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
@@ -1519,3 +1528,427 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+/* ══ 主题 / 视觉护栏 ═══════════════════════════════════════════════════════
+   这一组把「跟随系统」「三态循环」「对比度达标」从主观判断变成可回归的指标：
+   一旦退化，go test 直接红，而不是等用户发现页面又变回深色、按钮又没反馈了。 */
+
+var (
+	// 媒体查询里的浅色色板（:root 未带 data-theme 时生效）
+	lightPaletteMediaRe = regexp.MustCompile(`(?s)@media\s*\(prefers-color-scheme:\s*light\)\s*\{\s*:root:not\(\[data-theme\]\)\s*\{(.*?)\}`)
+	// 手动锁定浅色的显式色板
+	lightPaletteAttrRe = regexp.MustCompile(`(?s)\[data-theme="light"\]\s*\{(.*?)\}`)
+	// 深色色板（:root 基础块）
+	darkPaletteRe = regexp.MustCompile(`(?s)\n:root\s*\{(.*?)\}`)
+	cssTokenRe    = regexp.MustCompile(`(--[a-z0-9-]+)\s*:\s*([^;]+);`)
+)
+
+// cssTokens 把一段 CSS 解析成「自定义属性名 → 值」的映射（值去首尾空白）。
+func cssTokens(block string) map[string]string {
+	out := map[string]string{}
+	for _, m := range cssTokenRe.FindAllStringSubmatch(block, -1) {
+		out[m[1]] = strings.TrimSpace(m[2])
+	}
+	return out
+}
+
+// hexLuminance 按 WCAG 2.1 计算 #rgb / #rrggbb 的相对亮度。
+func hexLuminance(s string) (float64, error) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "#") {
+		return 0, fmt.Errorf("不是 hex 颜色：%q", s)
+	}
+	h := s[1:]
+	if len(h) == 3 {
+		h = string([]byte{h[0], h[0], h[1], h[1], h[2], h[2]})
+	}
+	if len(h) != 6 {
+		return 0, fmt.Errorf("颜色长度不合法：%q", s)
+	}
+	v, err := strconv.ParseUint(h, 16, 32)
+	if err != nil {
+		return 0, fmt.Errorf("颜色解析失败 %q: %w", s, err)
+	}
+	lin := func(c float64) float64 {
+		c /= 255
+		if c <= 0.03928 {
+			return c / 12.92
+		}
+		return math.Pow((c+0.055)/1.055, 2.4)
+	}
+	r := lin(float64(v >> 16 & 0xFF))
+	g := lin(float64(v >> 8 & 0xFF))
+	b := lin(float64(v & 0xFF))
+	return 0.2126*r + 0.7152*g + 0.0722*b, nil
+}
+
+// contrastRatio 两个 hex 颜色的 WCAG 对比度（1.0 ~ 21.0）。
+func contrastRatio(a, b string) (float64, error) {
+	la, err := hexLuminance(a)
+	if err != nil {
+		return 0, err
+	}
+	lb, err := hexLuminance(b)
+	if err != nil {
+		return 0, err
+	}
+	hi, lo := la, lb
+	if lo > hi {
+		hi, lo = lo, hi
+	}
+	return (hi + 0.05) / (lo + 0.05), nil
+}
+
+// TestIndexHTMLThemeFollowsSystem 主题必须「默认跟随系统」：
+//   - <html> 上不能写死 data-theme，否则 JS 没跑时永远是深色，
+//     系统为浅色的用户还会先看到一帧深色（闪一下）；
+//   - 浅色令牌必须由媒体查询提供（不依赖 JS），同时保留手动锁定的显式选择器。
+func TestIndexHTMLThemeFollowsSystem(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	htmlTag := ""
+	if i := strings.Index(body, "<html"); i >= 0 {
+		if j := strings.Index(body[i:], ">"); j >= 0 {
+			htmlTag = body[i : i+j+1]
+		}
+	}
+	if htmlTag == "" {
+		t.Fatal("index.html 找不到 <html> 标签")
+	}
+	if strings.Contains(htmlTag, "data-theme") {
+		t.Fatalf("<html> 写死了 data-theme，会破坏「跟随系统」：%s", htmlTag)
+	}
+	for _, want := range []string{
+		"@media (prefers-color-scheme: light)",
+		`[data-theme="light"]`,
+		`[data-theme="dark"]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("index.html 缺少 %s", want)
+		}
+	}
+}
+
+// TestIndexHTMLLightPaletteConsistent 浅色色板在 index.html 里写了两份
+// （媒体查询一份、[data-theme="light"] 一份），必须逐字一致：
+// 只改一份会让「跟随系统」与「手动浅色」呈现两种不同的浅色，是最容易漏的漂移。
+func TestIndexHTMLLightPaletteConsistent(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	media := lightPaletteMediaRe.FindStringSubmatch(html)
+	attr := lightPaletteAttrRe.FindStringSubmatch(html)
+	if media == nil || attr == nil {
+		t.Fatalf("浅色色板定位失败：media=%v attr=%v", media != nil, attr != nil)
+	}
+	mt, at := cssTokens(media[1]), cssTokens(attr[1])
+	if len(mt) == 0 || len(at) == 0 {
+		t.Fatalf("浅色色板解析为空：media=%d attr=%d", len(mt), len(at))
+	}
+	for k, v := range mt {
+		av, ok := at[k]
+		if !ok {
+			t.Fatalf("显式浅色缺少令牌 %s（媒体查询里有 %q）", k, v)
+		}
+		if av != v {
+			t.Fatalf("令牌 %s 两处不一致：media=%q attr=%q", k, v, av)
+		}
+	}
+	for k := range at {
+		if _, ok := mt[k]; !ok {
+			t.Fatalf("媒体查询浅色缺少令牌 %s", k)
+		}
+	}
+}
+
+// TestIndexHTMLNoInlineEventHandler 内联事件处理器会被严格 CSP（script-src 'self'）
+// 静默拦掉：表现为「点了没反应」或「回车整页重载」。Go 编译与 node --check 都发现不了。
+func TestIndexHTMLNoInlineEventHandler(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(?i)\son(click|change|submit|input|load|error|focus|blur|keydown|keyup|keypress|mouseover|mouseout|mousedown|mouseup|dblclick|contextmenu)\s*=`)
+	if m := re.FindString(string(b)); m != "" {
+		t.Fatalf("index.html 含内联事件处理器（会被 CSP 拦截）：%s", strings.TrimSpace(m))
+	}
+}
+
+// TestCSSContrastTargets 对比度护栏：把「好看」落成可量化的 WCAG AA 指标。
+// 深色下「卡片和背景几乎同色」「次要文字看不清」这类问题肉眼容易放过，这里直接卡阈值。
+func TestCSSContrastTargets(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	dark := darkPaletteRe.FindStringSubmatch(html)
+	light := lightPaletteAttrRe.FindStringSubmatch(html)
+	if dark == nil || light == nil {
+		t.Fatalf("色板定位失败：dark=%v light=%v", dark != nil, light != nil)
+	}
+	cases := []struct {
+		name   string
+		tokens map[string]string
+		fg, bg string
+		min    float64
+	}{
+		{"深色 次要文字/卡片", cssTokens(dark[1]), "ink-3", "surface", 4.5},
+		{"浅色 次要文字/卡片", cssTokens(light[1]), "ink-3", "surface", 4.5},
+		{"深色 卡片/页面", cssTokens(dark[1]), "surface", "bg", 1.12},
+		{"浅色 卡片/页面", cssTokens(light[1]), "surface", "bg", 1.12},
+		{"深色 分隔线/卡片", cssTokens(dark[1]), "line", "surface", 1.35},
+		{"浅色 分隔线/卡片", cssTokens(light[1]), "line", "surface", 1.35},
+	}
+	for _, c := range cases {
+		fg, ok1 := c.tokens["--"+c.fg]
+		bg, ok2 := c.tokens["--"+c.bg]
+		if !ok1 || !ok2 {
+			t.Fatalf("%s：令牌缺失 %s=%v %s=%v", c.name, c.fg, ok1, c.bg, ok2)
+		}
+		r, err := contrastRatio(fg, bg)
+		if err != nil {
+			t.Fatalf("%s：%v", c.name, err)
+		}
+		if r < c.min {
+			t.Fatalf("%s 对比度 %.2f < %.2f（%s on %s）", c.name, r, c.min, fg, bg)
+		}
+	}
+}
+
+// TestAppJSThemeCycle 主题按钮必须是「跟随系统 → 浅色 → 深色 → 跟随系统」三态循环，
+// 且「跟随系统」时不写 data-theme（外观交给 CSS 媒体查询）。
+// 旧实现是两态翻转：点一次就把 auto 永久覆盖，再也回不到跟随系统——本用例专防这个回归。
+func TestAppJSThemeCycle(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; theme cycle test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const THEME_ORDER');
+const end = src.indexOf('async function api(');
+if (start < 0 || end < 0) throw new Error('theme block not found');
+
+const store = {};
+const rootAttrs = {};
+let icoHtml = '', mqHandler = null;
+const root = {
+  removeAttribute(k) { delete rootAttrs[k]; },
+  setAttribute(k, v) { rootAttrs[k] = v; },
+  getAttribute(k) { return k in rootAttrs ? rootAttrs[k] : null; },
+  classList: { add() {}, remove() {} },
+};
+const ico = { set innerHTML(v) { icoHtml = v; }, get innerHTML() { return icoHtml; } };
+const btn = { title: '', setAttribute() {} };
+const ctx = {
+  theme: 'auto',
+  LS_THEME: 'wb2api.theme',
+  localStorage: {
+    getItem: k => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+  },
+  matchMedia: () => ({ matches: false, addEventListener(ev, fn) { mqHandler = fn; } }),
+  document: { documentElement: root },
+  $: id => (id === 'icoTheme' ? ico : id === 'btnTheme' ? btn : null),
+  setTimeout, clearTimeout,
+};
+vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end), ctx);
+
+function snap() {
+  const attr = 'data-theme' in rootAttrs ? rootAttrs['data-theme'] : '-';
+  const icon = icoHtml.indexOf('0 0 1 0 11.2z') >= 0 ? 'auto'
+    : (icoHtml.indexOf('M8 1v2') >= 0 ? 'sun' : 'moon');
+  const stored = store['wb2api.theme'] || '-';
+  return ctx.theme + '|' + attr + '|' + icon + '|' + stored;
+}
+const cycle = [snap()];
+for (let i = 0; i < 3; i++) { btn.onclick(); cycle.push(snap()); }
+ctx.theme = 'auto';
+icoHtml = '';
+if (mqHandler) mqHandler({ matches: true });
+process.stdout.write(JSON.stringify({
+  cycle,
+  sysChange: {
+    iconRecomputed: icoHtml.length > 0,
+    attr: 'data-theme' in rootAttrs ? rootAttrs['data-theme'] : null,
+  },
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "theme-cycle-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("theme cycle node test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		Cycle     []string `json:"cycle"`
+		SysChange struct {
+			IconRecomputed bool    `json:"iconRecomputed"`
+			Attr           *string `json:"attr"`
+		} `json:"sysChange"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("theme cycle 输出无法解析：%v\n%s", err, out)
+	}
+	want := []string{"auto|-|auto|-", "light|light|sun|light", "dark|dark|moon|dark", "auto|-|auto|auto"}
+	if len(got.Cycle) != len(want) {
+		t.Fatalf("theme cycle 长度=%d want %d（%v）", len(got.Cycle), len(want), got.Cycle)
+	}
+	for i := range want {
+		if got.Cycle[i] != want[i] {
+			t.Fatalf("theme cycle 第 %d 步=%q want %q（完整 %v）", i, got.Cycle[i], want[i], got.Cycle)
+		}
+	}
+	if !got.SysChange.IconRecomputed {
+		t.Fatal("系统主题变化时未重绘主题图标（auto 模式下应当跟随）")
+	}
+	if got.SysChange.Attr != nil {
+		t.Fatalf("auto 模式不应写 data-theme，实际=%q", *got.SysChange.Attr)
+	}
+}
+
+// TestCSSReducedMotionOverridesThemeAnim 「减少动效」必须压得住主题切换过渡。
+// html.theme-anim * 带 !important 且选择器更具体，reduced-motion 块里若只写 *，
+// 两者 !important 相同时更具体的那条胜出——用户开了「减少动效」切主题仍会看到过渡。
+// 这个回归肉眼几乎发现不了，只能靠断言选择器清单守住。
+func TestCSSReducedMotionOverridesThemeAnim(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	start := strings.Index(html, "@media (prefers-reduced-motion: reduce)")
+	if start < 0 {
+		t.Fatal("index.html 缺少 prefers-reduced-motion 媒体查询")
+	}
+	end := strings.Index(html[start:], "\n}")
+	if end < 0 {
+		t.Fatalf("prefers-reduced-motion 块未闭合：%s", html[start:start+120])
+	}
+	block := html[start : start+end]
+	if !strings.Contains(block, "html.theme-anim *") {
+		t.Fatalf("reduced-motion 块没有覆盖 html.theme-anim *，主题过渡会压过「减少动效」：\n%s", block)
+	}
+}
+
+// TestAppJSErrorTextSanitized shortErr 把外部错误文本压成一行：
+// 上游出错时响应体常是整页 HTML，原样铺进界面既占地方又像页面自己坏了。
+// 这里同时守住「去标签 / 折叠空白 / 截断 / 空值兜底」四件事。
+func TestAppJSErrorTextSanitized(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; shortErr test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function shortErr');
+const end = src.indexOf('function ago(');
+if (start < 0 || end < 0) throw new Error('shortErr not found');
+const ctx = { String };
+vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.shortErr=shortErr;', ctx);
+process.stdout.write(JSON.stringify({
+  html: ctx.shortErr('<html><head><title>401 Authorization Required</title></head>'),
+  ws: ctx.shortErr('  a\n\n b\t\tc  '),
+  cut: ctx.shortErr('x'.repeat(200), 20),
+  cutLen: ctx.shortErr('x'.repeat(200), 20).length,
+  nil: ctx.shortErr(null),
+  plain: ctx.shortErr('upstream client (http 401): boom'),
+  dangling: ctx.shortErr('openresty Powered by <a href="https://apisix.'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "shorterr-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("shortErr node test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		HTML     string `json:"html"`
+		WS       string `json:"ws"`
+		Cut      string `json:"cut"`
+		CutLen   int    `json:"cutLen"`
+		Nil      string `json:"nil"`
+		Plain    string `json:"plain"`
+		Dangling string `json:"dangling"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("shortErr 输出无法解析：%v\n%s", err, out)
+	}
+	if got.HTML != "401 Authorization Required" {
+		t.Fatalf("HTML 未被剥掉：%q", got.HTML)
+	}
+	if got.WS != "a b c" {
+		t.Fatalf("空白未折叠：%q", got.WS)
+	}
+	if got.CutLen != 20 || !strings.HasSuffix(got.Cut, "…") {
+		t.Fatalf("截断不符合预期：len=%d %q", got.CutLen, got.Cut)
+	}
+	if got.Nil != "" {
+		t.Fatalf("null 应返回空串：%q", got.Nil)
+	}
+	if got.Plain != "upstream client (http 401): boom" {
+		t.Fatalf("正常文本被改动：%q", got.Plain)
+	}
+	// 后端也会截断错误文本，可能停在半个标签中间：必须一并清掉，
+	// 否则界面上会露出 "<a href=" 这种残片。
+	if strings.Contains(got.Dangling, "<") {
+		t.Fatalf("残留半个标签：%q", got.Dangling)
+	}
+	if got.Dangling != "openresty Powered by" {
+		t.Fatalf("半个标签清理结果不符：%q", got.Dangling)
+	}
+}
+
+// TestPanelAssetsCacheNegotiation 内嵌静态资源必须带 ETag + no-cache 协商：
+// 没有缓存头时浏览器会做启发式缓存，升级二进制后仍可能跑旧 app.js——
+// 表现为「后端已更新，页面按钮还是老行为 / 接口 404」，且清缓存才好。
+func TestPanelAssetsCacheNegotiation(t *testing.T) {
+	p := newTestPanel()
+	for _, path := range []string{"/panel/", "/panel/app.js", "/panel/mobile.css", "/panel/mobile.js"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != 200 {
+			t.Fatalf("%s 首次请求状态=%d want 200", path, rec.Code)
+		}
+		etag := rec.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s 缺少 ETag", path)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+			t.Fatalf("%s Cache-Control=%q want no-cache", path, cc)
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("%s 响应体为空", path)
+		}
+		// 带 If-None-Match 再来一次：应 304 且不带响应体。
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("If-None-Match", etag)
+		rec2 := httptest.NewRecorder()
+		p.ServeHTTP(rec2, req)
+		if rec2.Code != 304 {
+			t.Fatalf("%s 协商缓存状态=%d want 304", path, rec2.Code)
+		}
+		if rec2.Body.Len() != 0 {
+			t.Fatalf("%s 304 响应不应带 body，实际 %d 字节", path, rec2.Body.Len())
+		}
+	}
+}

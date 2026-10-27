@@ -22,23 +22,60 @@ let reqRangeState = null; // 请求记录的时间范围（用量页的见 trang
 const $ = id => document.getElementById(id);
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
-/* 两态翻转（浅/深），首次访问跟随系统偏好；点击总是切换可见外观，符合直觉。 */
+/* 三态循环：跟随系统 → 浅色 → 深色 → 跟随系统（与按钮 title 的承诺一致）。
+   「跟随系统」时**不写 data-theme 属性**——外观交给 CSS 的
+   @media (prefers-color-scheme: light) 决定。这样做有两个好处：
+     1. 系统换主题时浏览器自己就跟着变，连 JS 都不需要参与；
+     2. app.js 尚未执行的第一帧就已经是正确配色，不会闪一下深色。
+   手动锁定后才写 [data-theme]，由显式选择器覆盖媒体查询。 */
+const THEME_ORDER = ['auto', 'light', 'dark'];
+const THEME_LABEL = { auto: '跟随系统', light: '浅色', dark: '深色' };
+const ICON_SUN = '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>';
+const ICON_MOON = '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
+/* 「自动」用半填充的圆：右半实心表示"随系统明暗走"，与太阳/月亮可区分 */
+const ICON_AUTO = '<circle cx="8" cy="8" r="5.6"/><path d="M8 2.4a5.6 5.6 0 0 1 0 11.2z" fill="currentColor" stroke="none"/>';
+const SYS_LIGHT_MQ = matchMedia('(prefers-color-scheme: light)');
+/* 存档里的值可能是历史脏数据（旧版本只有两态），不合法就退回 auto。 */
+if (THEME_ORDER.indexOf(theme) < 0) theme = 'auto';
+
 function effTheme() {
-  return theme === 'auto' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : theme;
+  return theme === 'auto' ? (SYS_LIGHT_MQ.matches ? 'light' : 'dark') : theme;
 }
+/* applyTheme 只负责「把当前状态同步到 DOM」，不读也不写 localStorage：
+   系统偏好变化时可以直接复用，不会把 auto 意外固化成某个具体主题。 */
 function applyTheme() {
+  const root = document.documentElement;
+  if (theme === 'auto') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', theme);
   const eff = effTheme();
-  document.documentElement.dataset.theme = eff;
-  $('icoTheme').innerHTML = eff === 'light'
-    ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
-    : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
-  $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
+  const ico = $('icoTheme'), btn = $('btnTheme');
+  if (ico) ico.innerHTML = eff === 'light' ? ICON_SUN : (theme === 'auto' ? ICON_AUTO : ICON_MOON);
+  if (btn) {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+    const tip = '主题：' + THEME_LABEL[theme] + '（点击切到「' + THEME_LABEL[next] + '」）';
+    btn.title = tip;
+    btn.setAttribute('aria-label', tip);
+  }
 }
-addEventListener('change', applyTheme);
+/* 系统主题变化：只有「跟随系统」时需要重绘图标（外观本身由 CSS 自动跟随）。 */
+function onSystemThemeChange() { if (theme === 'auto') applyTheme(); }
+if (SYS_LIGHT_MQ.addEventListener) SYS_LIGHT_MQ.addEventListener('change', onSystemThemeChange);
+else if (SYS_LIGHT_MQ.addListener) SYS_LIGHT_MQ.addListener(onSystemThemeChange); // 老内核兜底
+
+/* 切主题时给 <html> 挂一个短暂的过渡窗口类，让颜色平滑过渡而不是硬切；
+   过渡结束就摘掉——不给全站元素常驻 transition，避免无谓的合成开销。 */
+let themeAnimTimer = null;
+function withThemeTransition(fn) {
+  const root = document.documentElement;
+  root.classList.add('theme-anim');
+  fn();
+  if (themeAnimTimer) clearTimeout(themeAnimTimer);
+  themeAnimTimer = setTimeout(() => { root.classList.remove('theme-anim'); themeAnimTimer = null; }, 320);
+}
 $('btnTheme').onclick = () => {
-  theme = effTheme() === 'light' ? 'dark' : 'light';
-  localStorage.setItem(LS_THEME, theme);
-  applyTheme();
+  theme = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+  try { localStorage.setItem(LS_THEME, theme); } catch (e) { /* 隐私模式禁写：忽略 */ }
+  withThemeTransition(applyTheme);
 };
 applyTheme();
 
@@ -57,9 +94,27 @@ async function api(path, opts = {}) {
 function toast(msg, cls) {
   const el = document.createElement('div');
   el.className = 'tst ' + (cls || '');
-  el.textContent = msg;
+  el.textContent = shortErr(msg, 200);
   $('toasts').appendChild(el);
   setTimeout(() => el.remove(), 3600);
+}
+/* setBusy 统一异步按钮的「进行中」外观：禁用 + aria-busy + 可选文案替换。
+   转圈由 CSS 的 button[aria-busy="true"]::after 负责，这里只管状态与文案。
+   返回恢复函数，配合 try/finally 使用：
+     const done = setBusy(btn, '保存中…');
+     try { ... } finally { done('保存配置'); }
+   返回函数的参数为空时，恢复成进入时的原始文案。 */
+function setBusy(btn, label) {
+  if (!btn) return () => {};
+  const prevText = btn.textContent;
+  btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
+  if (label) btn.textContent = label;
+  return function done(nextLabel) {
+    btn.disabled = false;
+    btn.removeAttribute('aria-busy');
+    btn.textContent = nextLabel == null ? prevText : nextLabel;
+  };
 }
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
@@ -71,6 +126,18 @@ function esc(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+/* shortErr 把外部来的错误文本压成一行可读短句。
+   上游出错时响应体常常是整页 HTML（"<html><head><title>401 Authorization Required…"），
+   原样铺进界面或弹条既占地方、又像页面自己坏了。这里去标签 + 折叠空白 + 截断。 */
+function shortErr(msg, max) {
+  const s = String(msg == null ? '' : msg)
+    .replace(/<[^>]*>/g, ' ')   // 完整标签
+    .replace(/<[^>]*$/, ' ')    // 被截断的半个标签（后端也会截断错误文本，可能停在 "<a href=" 中间）
+    .replace(/\s+/g, ' ')
+    .trim();
+  const n = max || 140;
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
 }
 function ago(iso) {
   if (!iso || iso.startsWith('0001-')) return '—';
@@ -157,14 +224,14 @@ function trangeRender(id) {
   const st = trangeState(id);
   const custom = st.preset === 'custom';
   host.innerHTML =
-    '<select class="tr-preset" aria-label="时间范围">' +
+    '<select class="tr-preset" name="tr-preset" aria-label="时间范围">' +
     TRANGE_PRESETS.map(([v, label]) =>
       '<option value="' + v + '"' + (v === st.preset ? ' selected' : '') + '>' + esc(label) + '</option>').join('') +
     '</select>' +
     '<span class="tr-custom"' + (custom ? '' : ' hidden') + '>' +
-    '<input type="datetime-local" class="tr-from" value="' + esc(st.from ? dtLocalValue(st.from) : '') + '" aria-label="起始时间">' +
+    '<input type="datetime-local" class="tr-from" name="tr-from" value="' + esc(st.from ? dtLocalValue(st.from) : '') + '" aria-label="起始时间">' +
     '<span class="tr-sep">→</span>' +
-    '<input type="datetime-local" class="tr-to" value="' + esc(st.to ? dtLocalValue(st.to) : '') + '" aria-label="结束时间">' +
+    '<input type="datetime-local" class="tr-to" name="tr-to" value="' + esc(st.to ? dtLocalValue(st.to) : '') + '" aria-label="结束时间">' +
     '</span>';
   const preset = host.querySelector('.tr-preset');
   if (preset) preset.onchange = () => {
@@ -340,7 +407,11 @@ $('btnKey').onclick = async () => {
     start();
   } catch (e) { $('keyErr').hidden = false; }
 };
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+/* 回车提交走表单的 submit，而不是 keydown：
+   index.html 里原本是 onsubmit="return false"，但内联事件处理器被 CSP
+   (script-src 'self') 静默拦掉，于是回车会触发浏览器默认提交、整页重载。
+   现在改成同源脚本里 preventDefault，回车=点「进入」，且不会刷新页面。 */
+$('keyForm').addEventListener('submit', e => { e.preventDefault(); $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -502,20 +573,32 @@ function renderModelLocks(rows) {
   }
 }
 
+/* setStat 写入统计条数值。值为 0 时加 .zero 把颜色退成中性灰：
+   一排彩色的 0（绿 0 / 红 0 / 黄 0）会把真正需要关注的数字淹没，
+   而"0 个已禁用"本来就不是需要警觉的信息。 */
+function setStat(id, v) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = v;
+  const head = String(v == null ? '' : v).split('/')[0].trim();
+  const n = Number(head);
+  el.classList.toggle('zero', head !== '-' && head !== '' && Number.isFinite(n) && n === 0);
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
-    $('sTotal').textContent = d.total;
-    $('sHealthy').textContent = d.healthy;
-    $('sCooling').textContent = d.cooling;
-    $('sDisabled').textContent = d.disabled;
+    setStat('sTotal', d.total);
+    setStat('sHealthy', d.healthy);
+    setStat('sCooling', d.cooling);
+    setStat('sDisabled', d.disabled);
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
-    if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
+    if ($('sPaused')) setStat('sPaused', d.paused == null ? '-' : d.paused);
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
-    $('sSticky').textContent = d.sticky_sessions;
+    const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
+    setStat('sCredits', totSum > 0 ? remSum + ' / ' + totSum : remSum);
+    setStat('sSticky', d.sticky_sessions);
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
@@ -541,7 +624,7 @@ $('accBody').addEventListener('click', async ev => {
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
-  b.disabled = true;
+  const done = setBusy(b);
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
@@ -568,7 +651,7 @@ $('accBody').addEventListener('click', async ev => {
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; loadOverview(true); }
+  finally { done(); loadOverview(true); }
 });
 
 $('btnCheckinAll').onclick = async () => {
@@ -647,7 +730,9 @@ async function loadModels() {
     const [d, pr, st, rm] = await Promise.all([
       api('models'),
       api('model_probes').catch(() => ({})),
-      api('status').catch(() => ({})),
+      // 模型锁取自 overview（/panel/api/status 并不存在，早前这里 404 被 catch 吞掉，
+      // 结果"模型与档位"页的限流可用性标签永远是空——账号池页的模型锁池却是好的）。
+      api('overview').catch(() => ({})),
       api('request_metrics').catch(() => ({})),
     ]);
     mdAll = d.models || [];
@@ -668,8 +753,10 @@ async function loadModels() {
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(shortErr(e.message)) + '</div></td></tr>';
     $('mdCount').textContent = '';
+    // 头部说明也要改：否则表格里写着失败，标题还挂着"实时查询上游"，读起来像在查。
+    $('mdNote').textContent = '查询失败';
   }
 }
 
@@ -795,13 +882,15 @@ function mdAvailabilityTag(m) {
 function mdRowHtml(m, pr) {
   const eff = (m.supported_efforts || []).slice();
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
-  const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
+  // 档位胶囊用中性色：50 行 × 每行 2-4 个 amber 会把整张表染成一片黄，
+  // 反而看不出重点。真正需要跳出来的是"默认档"（绿）与"思考常开"（琥珀）。
+  const effs = eff.length ? eff.map(e => '<span class="tag mute">' + esc(e) + '</span>').join(' ')
     : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
   // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');
-  if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
-  if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+  if (m.supports_tool_call) caps.push('<span class="tag mute">工具</span>');
+  if (m.supports_images) caps.push('<span class="tag mute">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
@@ -901,8 +990,11 @@ async function loadLogs() {
 function renderRequestMetrics(m, entries) {
   m = m || {};
   const a = m.archive || {};
+  // 指标是**本次进程启动以来**的内存计数，而下面的请求记录读自 JSONL 归档
+  // （含重启前的历史）。不写清楚的话，"已完成 0" 与几十行记录并排出现，
+  // 看起来像统计坏了。
   $('reqSummary').textContent =
-    '已完成 ' + fmtTok(m.completed) +
+    '本次启动以来 · 已完成 ' + fmtTok(m.completed) +
     ' · 成功 ' + (m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%') +
     ' · HTTP ' + (m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%') +
     ' · 平均 ' + fmtMs(m.avg_duration_ms) +
@@ -1196,6 +1288,21 @@ async function loadConfig() {
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
+/* cfgChangedPaths 对比「表单将要提交的值」与「上次从服务端读到的值」，
+   返回真正发生变化的字段路径（"listen" / "upstream.timeout_seconds" 这类）。
+   用途：保存后只对**确实改过**的装配期字段提示"需重启"。 */
+function cfgChangedPaths(submitted) {
+  const prev = cfgLoaded || {};
+  // 数组按逗号拼平、其余一律转字符串：表单里 "9, 21" 与 JSON 的 [9,21] 是同一个值。
+  const norm = v => Array.isArray(v) ? v.join(',') : (v == null ? '' : String(v));
+  const out = [];
+  for (const path of Object.values(CFG_MAP)) {
+    const after = dig(submitted, path);
+    if (after === undefined) continue;   // 空值不下发 = 视为未改动（见 CLEARABLE_CFG 注释）
+    if (norm(dig(prev, path)) !== norm(after)) out.push(path.join('.'));
+  }
+  return out;
+}
 function collectConfig() {
   const f = $('cfgForm'), out = {};
   for (const [name, path] of Object.entries(CFG_MAP)) {
@@ -1261,18 +1368,26 @@ $('cfgForm').onsubmit = async ev => {
     return;
   }
   const btn = $('btnCfgSave');
-  btn.disabled = true; btn.textContent = '保存中…';
+  // 先算出"这次真正改了哪些字段"：后端返回的 restart_required 是**恒定的完整清单**
+  // （它只说明哪些字段属于装配期依赖），拿它的长度当"本次改了几项"会误导——
+  // 什么都没改点一下保存也会显示"14 项需重启"。
+  const submitted = collectConfig();
+  const changed = cfgChangedPaths(submitted);
+  const done = setBusy(btn, '保存中…');
   try {
-    const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
-    const n = (r.restart_required || []).length;
-    toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
+    const r = await api('config', { method: 'POST', body: JSON.stringify(submitted) });
+    const restart = r.restart_required || [];
+    const needRestart = changed.filter(p => restart.some(k => k === p || p.startsWith(k + '.')));
+    if (!changed.length) toast('配置没有改动', '');
+    else if (!needRestart.length) toast('配置已保存并立即生效', 'ok');
+    else toast('配置已保存，其中 ' + needRestart.length + ' 项需重启进程生效：' + needRestart.join('、'), 'ok');
     // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
     const k = $('cfgKey').value.trim();
     if (k) localStorage.setItem(LS_KEY, k);
     loadConfig();
     loadOverview(true);
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '保存配置'; }
+  finally { done('保存配置'); }
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
@@ -1312,7 +1427,7 @@ function startAddLogin() {
     $('addLoad').hidden = true;
     $('btnStartLogin').disabled = false;
     $('addErr').hidden = false;
-    $('addErr').textContent = e.message;
+    $('addErr').textContent = shortErr(e.message);
   });
 }
 function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
@@ -1361,7 +1476,7 @@ $('importFile').onchange = async () => {
     loadOverview(true);
   } catch (e) {
     $('importErr').hidden = false;
-    $('importErr').textContent = '导入失败：' + e.message;
+    $('importErr').textContent = '导入失败：' + shortErr(e.message);
   }
   $('importFile').value = '';
 };
@@ -1370,13 +1485,13 @@ $('importFile').onchange = async () => {
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
-  b.disabled = true; b.textContent = '刷新中…';
+  const done = setBusy(b, '刷新中…');
   try {
     await api('balance_all', { method: 'POST' });
     await loadOverview(true);
     toast('余额已从上游刷新', 'ok');
   } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
-  finally { b.disabled = false; b.textContent = '刷新'; }
+  finally { done('刷新'); }
   if (view === 'logs') loadLogs();
 };
 
@@ -1465,7 +1580,7 @@ function renderCompensation(d) {
   const errRows = failed.map(r =>
     '<div class="comp-row"><span>' + esc(r.nickname || String(r.uid).slice(0, 8)) + '</span>' +
     '<span class="tag bad">查询失败</span>' +
-    '<span class="tag mute">' + esc(String(r.error).slice(0, 120)) + '</span></div>'
+    '<span class="tag mute">' + esc(shortErr(r.error, 120)) + '</span></div>'
   ).join('');
 
   $('compList').innerHTML = okRows + errRows;
@@ -1496,7 +1611,7 @@ async function loadCompensation() {
       const box = $('compBox');
       if (box) box.hidden = false;
       if ($('compList')) $('compList').innerHTML =
-        '<div class="empty">查询失败：' + esc(e.message) + '</div>';
+        '<div class="empty">查询失败：' + esc(shortErr(e.message)) + '</div>';
       if ($('compNote')) $('compNote').textContent = '';
     }
   })();
@@ -1511,7 +1626,7 @@ async function loadCompensation() {
 if ($('compList')) $('compList').addEventListener('click', async e => {
   const b = e.target.closest('[data-comp-uid]');
   if (!b) return;
-  b.disabled = true;
+  const done = setBusy(b);
   try {
     const r = await api('accounts/' + encodeURIComponent(b.dataset.compUid) + '/compensation', { method: 'POST' });
     const res = r.result || {};
@@ -1523,6 +1638,8 @@ if ($('compList')) $('compList').addEventListener('click', async e => {
     loadOverview(true);
   } catch (err) {
     toast('领取失败：' + err.message, 'err');
+  } finally {
+    done();   // 原先没有 finally：请求失败时按钮会一直灰着，直到列表重渲染
   }
 });
 
@@ -1530,7 +1647,7 @@ if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
 
 if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
   const b = $('btnCompClaimAll');
-  b.disabled = true;
+  const done = setBusy(b);
   try {
     const r = await api('compensation_all', { method: 'POST' });
     const s = r.summary || {};
@@ -1549,7 +1666,7 @@ if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
   } catch (e) {
     toast('领取失败：' + e.message, 'err');
   } finally {
-    b.disabled = false;
+    done();
   }
 };
 
@@ -1621,7 +1738,7 @@ $('btnTaskReload').onclick = loadTasks;
 $('btnTaskAcceptAll').onclick = async () => {
   if (!taskUID) return;
   const btn = $('btnTaskAcceptAll');
-  btn.disabled = true; btn.textContent = '接受中…';
+  const done = setBusy(btn, '接受中…');
   try {
     const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/accept_all', { method: 'POST' });
     const n = r.accepted || 0;
@@ -1631,7 +1748,7 @@ $('btnTaskAcceptAll').onclick = async () => {
       toast(n ? `已接受 ${n} 个任务` : (r.message || '所有任务均已接受'), 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '全部接受'; loadTasks(); }
+  finally { done('全部接受'); loadTasks(); }
 };
 
 // 一键完成全部可自动任务（耗时较长：含真实对话，逐项回读验证）。
@@ -1639,7 +1756,7 @@ $('btnTaskAutoAll').onclick = async () => {
   if (!taskUID) return;
   const btn = $('btnTaskAutoAll');
   if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
-  btn.disabled = true; btn.textContent = '执行中…';
+  const done = setBusy(btn, '执行中…');
   try {
     const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all', { method: 'POST' });
     const okN = (r.results || []).filter(x => x.status === 'done').length;
@@ -1648,7 +1765,7 @@ $('btnTaskAutoAll').onclick = async () => {
     toast(`执行完成：成功 ${okN} 项，跳过 ${skipN} 项${errN ? '，失败 ' + errN + ' 项' : ''}`, errN ? 'err' : 'ok');
     console.log('auto_all results:', r.results);
   } catch (e) { toast(e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '一键完成可自动任务'; loadTasks(); }
+  finally { done('一键完成可自动任务'); loadTasks(); }
 };
 
 async function loadTasks() {
@@ -1708,7 +1825,7 @@ $('taskBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-t]');
   if (!b || !taskUID) return;
   const kind = b.dataset.t, code = b.dataset.c;
-  b.disabled = true;
+  const done = setBusy(b);
   try {
     if (kind === 'auto') {
       // 一键完成：后端执行动作 → 回读进度 → 汇报（耗时可到分钟级，含真实对话）
@@ -1736,7 +1853,7 @@ $('taskBody').addEventListener('click', async ev => {
       if (kind === 'claim') loadOverview(true);
     }
   } catch (e) { toast(e.message, 'err'); }
-  finally { loadTasks(); }
+  finally { done(); loadTasks(); }
 });
 
 /* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
@@ -1967,7 +2084,7 @@ async function loadSchoolVouchers() {
     const errs = arr.filter(a => a.error);
     if (errs.length) {
       body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
-        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
+        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(shortErr(a.error)) + '）').join('、') + '</div>');
     }
     body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
       try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
@@ -1981,11 +2098,11 @@ async function loadSchoolVouchers() {
       const box = document.createElement('div');
       box.className = 'vc-qr';
       try { box.innerHTML = qrSVG(qrMatrix(b.dataset.qr), 148); }
-      catch (e) { box.innerHTML = '<span class="note">二维码生成失败：' + esc(e.message) + '</span>'; }
+      catch (e) { box.innerHTML = '<span class="note">二维码生成失败：' + esc(shortErr(e.message)) + '</span>'; }
       card.appendChild(box);
     });
   } catch (e) {
-    body.innerHTML = '<div class="state err">' + esc(e.message) + '</div>';
+    body.innerHTML = '<div class="state err">' + esc(shortErr(e.message)) + '</div>';
   }
 }
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
@@ -2002,18 +2119,24 @@ $('btnScanAll').onclick = async () => {
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
   // 结果冲掉重渲染回队列视图（服务端执行不受影响，只是不再实时回写本视图）。
   if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
-  b.disabled = true; b.textContent = '扫描中…';
+  const done = setBusy(b, '扫描中…');
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
-    renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    const items = groupItems(d);
+    if (!items.length && !(d.accounts || []).length) {
+      // 账号池是空的：不能沿用"全部任务都已完成"的说法，那会让人以为扫过了。
+      renderQueue([], null, '账号池是空的', '先去「账号池」用浏览器登录一个账号，再回来扫描成长任务。');
+    } else {
+      renderQueue(items, null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    }
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; b.textContent = '扫描待办'; }
+  finally { done('扫描待办'); }
 };
 $('btnRunQueue').onclick = async () => {
   const conc = Number($('qcConc').value) || 1;
   if (!confirm('扫描全部账号待办并排队执行（账号并发 ' + conc + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？')) return;
   const b = $('btnRunQueue');
-  b.disabled = true; b.textContent = '启动中…';
+  const done = setBusy(b, '启动中…');
   try {
     const r = await api('tasks/run_queue', { method: 'POST', body: JSON.stringify({ concurrency: conc }) });
     if (!r.started) { toast(r.message || '没有待办任务', 'ok'); return; }
@@ -2021,7 +2144,7 @@ $('btnRunQueue').onclick = async () => {
     toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
     startQueuePolling();
   } catch (e) { toast(e.message, 'err'); }
-  finally { b.disabled = false; b.textContent = '执行全部待办'; }
+  finally { done('执行全部待办'); }
 };
 // 扫描结果 → 分组条目（无执行状态）
 function groupItems(d) {
@@ -2060,7 +2183,6 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
     $('qProg').hidden = true; $('qcSummary').textContent = '';
     return;
   }
-  empty.style.display = 'none';
   empty.style.display = 'none';
   let total = 0;
   list.innerHTML = groups.map(g => {
@@ -2278,13 +2400,18 @@ function renderUsageDim() {
   $('usDimHead').innerHTML = usDimHead(usDim);
   $('usDimBody').innerHTML = rows.map(x => {
     const isAcct = usDim === 'account';
-    const key = isAcct ? String(x.key || '').slice(0, 8) : x.key;
-    return usRow(key,
-      isAcct ? (x.extra || '') : '',
+    // 账号行以「昵称」为主标识、uid8 为副标识——与账号池那张表保持一致。
+    // 旧实现反过来（把 uid 截 8 位当主标识、昵称塞进副行），uid 前缀相同的账号
+    // 在表里会全部显示成同一个 "u_demo_0"，根本分不出谁是谁。
+    const uidFull = isAcct ? String(x.key || '') : '';
+    const nick = isAcct ? String(x.extra || '').trim() : '';
+    const primary = isAcct ? (nick || uidFull) : x.key;
+    return usRow(primary,
+      isAcct && nick ? uidFull : '',
       x,
       isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
       m.withPerf,
-      isAcct ? remarkName(x.key, esc(key)) : '');
+      isAcct ? remarkName(x.key, esc(primary)) : '');
   }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
@@ -2644,7 +2771,7 @@ async function loadUsage() {
   } catch (e) {
     // 失败时三块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
     usageData = null;
-    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(shortErr(e.message)) + '</div>';
     $('usChartNote').textContent = '—';
     $('usStats').innerHTML = '';
     $('usCreditStats').innerHTML = '';
@@ -2936,7 +3063,7 @@ function renderPackages(d, detailLimit) {
       return '<div class="pk-card"><div class="who"><span class="nm">' +
         esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
         '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
-        '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
+        '<div class="err">查询失败：' + esc(shortErr(a.error)) + '</div></div>';
     }
     const srcs = pkBySource(a.packages || []);
     const total = Math.max(1, Number(a.size || 0));
@@ -3104,8 +3231,8 @@ async function loadPackages(force) {
     lastDetailLimit = pkDetailLimit(c && c.config);
     renderPackages(d, lastDetailLimit);
   } catch (e) {
-    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
-    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
+    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
+    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
   }
 }
 
@@ -3175,7 +3302,7 @@ function expiryRowsHtml(list) {
     if (a.error) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
         '<span class="exp-nm">' + esc(name) + '</span>' +
-        '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
+        '<span class="exp-main err">查询失败：' + esc(shortErr(a.error)) + '</span></div>';
     }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
     if (!bs.length) {
@@ -3340,7 +3467,8 @@ async function loadExpiry(force) {
     lastPackagesAt = Date.now();
     renderExpiry(d);
   } catch (e) {
-    $('expNote').textContent = '查询失败：' + esc(e.message);
+    // textContent 赋值不能再 esc：那样会把 &lt;html&gt; 原样显示出来（双重转义）。
+    $('expNote').textContent = '查询失败：' + shortErr(e.message);
   }
   expFetching = false;
 }

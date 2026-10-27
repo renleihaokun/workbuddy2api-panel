@@ -27,8 +27,35 @@
      同时让原生控件（下拉/勾选/滚动条/日期选择器）跟随面板主题而不是系统偏好。 */
   html[data-theme="dark"], html[data-theme="dark"] body { color-scheme: only dark; }
   html[data-theme="light"], html[data-theme="light"] body { color-scheme: only light; }
+  /* 「跟随系统」模式没有 data-theme 属性，上面两条都不匹配——若不补，安卓的
+     自动暗化会把浅色页面重新压暗（主题按钮显示太阳、像素却是黑的）。
+     这里按系统偏好把 color-scheme 钉成单值，效果与手动锁定一致。 */
+  @media (prefers-color-scheme: light) {
+    html:not([data-theme]), html:not([data-theme]) body { color-scheme: only light; }
+  }
+  @media (prefers-color-scheme: dark) {
+    html:not([data-theme]), html:not([data-theme]) body { color-scheme: only dark; }
+  }
   /* 基础两行：视口高度链路 + 禁止手机浏览器自动放大字号（避免横向溢出） */
   html, body { height: 100%; -webkit-text-size-adjust: 100%; }
+  /* 窄屏退回 scroll：background-attachment: fixed 会让手机浏览器每次滚动都重绘
+     整页背景（毛玻璃已经够吃 GPU 了，再叠加固定背景会明显掉帧）。
+     光晕跟着内容滚，玻璃照样有东西可折射。 */
+  body { background-attachment: scroll; }
+  /* 触摸反馈：手机没有 hover，按下时改用底色变化（桌面那套 translateY 在
+     触摸端会被浏览器忽略，反而显得"点了没反应"）。同时关掉 UA 默认的灰色
+     高亮块——我们自己的 :active 反馈更贴合主题色。 */
+  * { -webkit-tap-highlight-color: transparent; }
+  @media (hover: none) {
+    button:active:not(:disabled) { transform: none; background: var(--raise); }
+    button.primary:active:not(:disabled) {
+      background: var(--accent-solid-hover); border-color: var(--accent-solid-hover);
+      box-shadow: inset 0 2px 5px rgba(0,0,0,.28);
+    }
+    .nav a:active { background: var(--raise); }
+    /* 表格行不加 :active：行本身不可点，按行变色会造成"整行可点"的错误暗示 */
+    .vtabs button:active:not(:disabled) { background: var(--raise); color: var(--ink); }
+  }
 
   /* ── 1. 侧栏 → 抽屉 ────────────────────────────────────────────────
      position:fixed + transform（走合成层，不触发重排）；开合由 app.js 切 .open。
@@ -295,6 +322,14 @@
   .exp-row { flex-wrap: wrap; gap: 4px 8px; padding: 7px 0; }
   .exp-nm { min-width: 0; flex: 0 1 auto; overflow-wrap: anywhere; }
   .exp-main { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
+
+  /* ── 官方补偿行（.comp-row）─────────────────────────────────────────
+     桌面端是 [账号名][状态标][额度][领取] 的单行 flex。窄屏上失败原因标签很长，
+     会把账号名压到只剩一个字宽（"演示 / 账 / 号·甲" 竖着排）。这里钉住名字宽度，
+     其余部分整行换行；长错误文本允许折行，避免撑破容器。 */
+  .comp-row { flex-wrap: wrap; gap: 4px 8px; padding: 7px 0; }
+  .comp-row > span:first-child { flex: 0 0 auto; white-space: nowrap; }
+  .comp-row .tag { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 
   /* ── 6. 长不可断字符串兜底 ────────────────────────────────────────
      长昵称 / 长模型名 / 长券码这类"没有一个断点"的串会撑破 flex 行：flex 子项默认

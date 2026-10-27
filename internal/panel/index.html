@@ -1,63 +1,214 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy2API · 控制台</title>
+<!-- 内联 SVG 图标：不请求 /favicon.ico（那个 404 会在控制台留一条红色报错）。
+     CSP 的 img-src 允许 data:，故无需额外路由。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%234664e8'/%3E%3Cpath d='M3.6 5.4 8 3.2l4.4 2.2v5.2L8 12.8 3.6 10.6z' fill='none' stroke='%23fff' stroke-width='1.3' stroke-linejoin='round'/%3E%3Cpath d='M3.6 5.4 8 7.6l4.4-2.2M8 7.6v5.2' fill='none' stroke='%23fff' stroke-width='1.3' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
-/* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
-   冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
-   语义色只给状态。等宽数字承载所有观测值，tabular-nums 对齐。 */
+/* ── 设计令牌 ────────────────────────────────────────────────────────────
+   三层结构，让「跟随系统」不依赖 JS：
+     1. :root                      深色兜底（无 data-theme 且系统为深色）
+     2. @media (prefers-color-scheme: light) + :root:not([data-theme])
+                                   系统浅色时的令牌——app.js 没跑也生效
+     3. [data-theme="light"]       用户手动锁定浅色（覆盖系统偏好）
+
+   注意：浅色色板写了两份（媒体查询里一份、[data-theme="light"] 一份），
+   这是 CSS 自定义属性无法跨选择器复用的必然代价；两份必须逐字一致，
+   由 TestIndexHTMLLightPaletteConsistent 守着一一对应，改一处必须改另一处。
+
+   调色板：冷石墨分层 + 单一靛蓝强调（仅交互），语义色只给状态。
+   对比度按 WCAG AA 校准：次要文字 ≥4.5:1、大号数字 ≥3:1。 */
 :root {
-  --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
-  --line: #262c3a; --line-soft: #1e232e;
-  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
-  --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
-  --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
-  --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
-  --bad: #f0655f; --bad-soft: rgba(240,101,95,.12);
-  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.5);
+  color-scheme: dark;
+  /* 表面分层：bg(页面) → surface(卡片) → surface-2(内嵌) → raise(浮起) */
+  --bg: #0b0d12; --surface: #171c25; --surface-2: #1e242f; --raise: #262d3a;
+  --line: #303849; --line-soft: #232935;
+  --ink: #eef1f7; --ink-2: #b6bdcc; --ink-3: #8d97ab;
+  /* accent 给文字/描边/指示（对深色底高对比）；accent-solid 给实心按钮
+     （白字压上去仍需 ≥4.5:1，故比 accent 深一档）。 */
+  --accent: #7d9bff; --accent-solid: #4664e8; --accent-solid-hover: #5876f2;
+  --accent-ink: #ffffff; --accent-soft: rgba(125,155,255,.14);
+  --accent-ring: rgba(125,155,255,.38);
+  --ok: #34d399; --ok-soft: rgba(52,211,153,.13);
+  --warn: #f0b429; --warn-soft: rgba(240,180,41,.13);
+  --bad: #f87171; --bad-soft: rgba(248,113,113,.13);
+  --shadow-1: 0 1px 2px rgba(0,0,0,.5);
+  --shadow-2: 0 4px 14px -6px rgba(0,0,0,.55);
+  --shadow-3: 0 24px 64px -24px rgba(0,0,0,.72);
+  --shadow: var(--shadow-1), var(--shadow-2);
+  --sheen: inset 0 1px 0 rgba(255,255,255,.045);
+  /* 毛玻璃：半透明表面 + 背景模糊。玻璃必须有"东西可折射"，否则只是一块灰膜，
+     所以 body 上还铺了两团极低透明度的径向光晕（--glow-1/--glow-2）。
+     只给**覆盖在内容之上**的层用（侧栏/顶栏/弹层/toast）；数据卡片保持不透明，
+     否则密集表格叠在模糊背景上会明显掉可读性。 */
+  --glass: rgba(23,28,37,.62);
+  --glass-strong: rgba(23,28,37,.84);
+  --glass-brd: rgba(255,255,255,.085);
+  --glass-blur: 20px;
+  --glow-1: rgba(78,110,255,.34);
+  --glow-2: rgba(52,211,153,.16);
+  /* 动效：三档时长 + 统一缓动，所有交互态复用同一套 */
+  --dur-1: 120ms; --dur-2: 180ms; --dur-3: 240ms;
+  --ease: cubic-bezier(.2,.8,.2,1);
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
-[data-theme="light"] {
-  --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
-  --line: #e2e5ec; --line-soft: #eceef3;
-  --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
-  --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
-  --ok: #0f9d63; --ok-soft: rgba(15,157,99,.1);
-  --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
-  --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
-  --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
+/* 系统浅色 + 用户没手动锁过 → 浅色（JS 未运行时也生效，故无首帧闪烁） */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --bg: #eef1f6; --surface: #ffffff; --surface-2: #f4f6fa; --raise: #ffffff;
+    --line: #d5dbe6; --line-soft: #e8ecf3;
+    --ink: #12151c; --ink-2: #4b5464; --ink-3: #646d80;
+    --accent: #3b5bdb; --accent-solid: #3b5bdb; --accent-solid-hover: #3452c8;
+    --accent-ink: #ffffff; --accent-soft: rgba(59,91,219,.10);
+    --accent-ring: rgba(59,91,219,.25);
+    --ok: #0a7d4f; --ok-soft: rgba(10,125,79,.10);
+    --warn: #a2620a; --warn-soft: rgba(162,98,10,.10);
+    --bad: #c0392b; --bad-soft: rgba(192,57,43,.09);
+    --shadow-1: 0 1px 2px rgba(16,20,32,.07);
+    --shadow-2: 0 4px 14px -6px rgba(16,20,32,.12);
+    --shadow-3: 0 24px 56px -20px rgba(16,20,32,.24);
+    --shadow: var(--shadow-1), var(--shadow-2);
+    --sheen: inset 0 1px 0 rgba(255,255,255,.9);
+    --glass: rgba(255,255,255,.62);
+    --glass-strong: rgba(255,255,255,.86);
+    --glass-brd: rgba(16,20,32,.08);
+    --glass-blur: 20px;
+    --glow-1: rgba(59,91,219,.22);
+    --glow-2: rgba(10,125,79,.13);
+  }
 }
+/* 用户手动锁定浅色（无视系统偏好）。与上面媒体查询里的浅色色板必须一致。 */
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #eef1f6; --surface: #ffffff; --surface-2: #f4f6fa; --raise: #ffffff;
+  --line: #d5dbe6; --line-soft: #e8ecf3;
+  --ink: #12151c; --ink-2: #4b5464; --ink-3: #646d80;
+  --accent: #3b5bdb; --accent-solid: #3b5bdb; --accent-solid-hover: #3452c8;
+  --accent-ink: #ffffff; --accent-soft: rgba(59,91,219,.10);
+  --accent-ring: rgba(59,91,219,.25);
+  --ok: #0a7d4f; --ok-soft: rgba(10,125,79,.10);
+  --warn: #a2620a; --warn-soft: rgba(162,98,10,.10);
+  --bad: #c0392b; --bad-soft: rgba(192,57,43,.09);
+  --shadow-1: 0 1px 2px rgba(16,20,32,.07);
+  --shadow-2: 0 4px 14px -6px rgba(16,20,32,.12);
+  --shadow-3: 0 24px 56px -20px rgba(16,20,32,.24);
+  --shadow: var(--shadow-1), var(--shadow-2);
+  --sheen: inset 0 1px 0 rgba(255,255,255,.9);
+  --glass: rgba(255,255,255,.62);
+  --glass-strong: rgba(255,255,255,.86);
+  --glass-brd: rgba(16,20,32,.08);
+  --glass-blur: 20px;
+  --glow-1: rgba(59,91,219,.22);
+  --glow-2: rgba(10,125,79,.13);
+}
+/* 显式锁定深色：色板继承 :root，只需钉住原生控件的配色 */
+[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 [hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
-  background: var(--bg); color: var(--ink); font: 14px/1.55 var(--sans);
-  -webkit-font-smoothing: antialiased;
+  /* 两团固定环境光 + 底色：给毛玻璃提供"可折射的东西"。fixed 让光晕不随页面
+     滚动移动，否则顶栏/侧栏的模糊结果会跟着内容漂移，看起来像在抖。 */
+  background:
+    radial-gradient(1100px 620px at 6% -14%, var(--glow-1), transparent 60%),
+    radial-gradient(900px 520px at 96% -6%, var(--glow-2), transparent 55%),
+    radial-gradient(700px 700px at 50% 120%, var(--glow-1), transparent 70%),
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--ink); font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
 }
-::selection { background: var(--accent-soft); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+/* 主题切换的过渡窗口：app.js 在切换前后各加/摘 .theme-anim，只在这段时间内
+   让颜色变化走过渡，避免平时给全站元素挂 transition 带来的无谓开销。 */
+html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
+  transition: background-color var(--dur-3) var(--ease), border-color var(--dur-3) var(--ease),
+              color var(--dur-3) var(--ease), fill var(--dur-3) var(--ease),
+              box-shadow var(--dur-3) var(--ease) !important;
+}
+::selection { background: var(--accent-soft); color: var(--ink); }
+/* 统一的键盘焦点环：只在键盘导航时出现（:focus-visible），鼠标点击不闪框。 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+/* 主题化滚动条（Firefox 走标准属性，WebKit 走伪元素） */
+* { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 999px; border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--ink-3); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+@media (prefers-reduced-motion: reduce) {
+  /* 必须把 html.theme-anim * 一起列上：那条规则带 !important 且选择器更具体，
+     只写 * 压不住它，会导致「减少动效」用户切主题时仍然看到过渡。 */
+  *, *::before, *::after,
+  html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
+    transition-duration: .01ms !important; animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important; scroll-behavior: auto !important;
+  }
+}
 
 /* ── 壳层：左侧导航 + 主区 ─────────────────────────────────────────── */
 .shell { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
 .nav {
-  background: var(--surface); border-right: 1px solid var(--line);
+  /* 毛玻璃：半透明底 + 背景模糊 + 饱和度提升。saturate 很关键——只模糊不饱和
+     会让背后的光晕变成灰雾，看起来像没加载完。 */
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(150%);
+  border-right: 1px solid var(--glass-brd);
   display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
 }
-.brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft); }
+.brand { padding: 18px 16px 14px; border-bottom: 1px solid var(--line-soft); }
+.brand .row1 { display: flex; align-items: center; gap: 9px; }
+/* 品牌标记：唯一的渐变实心块，作为整页的视觉锚点 */
+.brand .logo {
+  width: 26px; height: 26px; border-radius: 8px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: linear-gradient(145deg, var(--accent), var(--accent-solid));
+  box-shadow: var(--shadow-1), inset 0 1px 0 rgba(255,255,255,.28);
+  color: #fff;
+}
+.brand .logo svg { width: 15px; height: 15px; display: block; }
 .brand .name { font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
-.brand .sub { color: var(--ink-3); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
+.brand .sub { color: var(--ink-3); font-size: 11.5px; font-family: var(--mono); margin-top: 4px; }
 .nav ul { list-style: none; padding: 10px 8px; flex: 1; }
+/* 导航项加载时依次滑入（一次性，之后切视图不再重放） */
+.nav ul li { animation: navIn 260ms var(--ease) both; }
+.nav ul li:nth-child(1) { animation-delay: 20ms; }
+.nav ul li:nth-child(2) { animation-delay: 45ms; }
+.nav ul li:nth-child(3) { animation-delay: 70ms; }
+.nav ul li:nth-child(4) { animation-delay: 95ms; }
+.nav ul li:nth-child(5) { animation-delay: 120ms; }
+.nav ul li:nth-child(6) { animation-delay: 145ms; }
+.nav ul li:nth-child(7) { animation-delay: 170ms; }
+@keyframes navIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
 .nav a {
+  position: relative;
   display: flex; align-items: center; gap: 10px; padding: 8px 11px; margin-bottom: 2px;
   color: var(--ink-2); text-decoration: none; border-radius: 7px; font-size: 13.5px;
+  transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
 }
 .nav a:hover { background: var(--surface-2); color: var(--ink); }
+.nav a:active { background: var(--raise); }
 .nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
-.nav a svg { width: 15px; height: 15px; flex: none; opacity: .85; }
+/* 选中项左侧指示条：用伪元素而不是 border-left，避免改变内边距导致文字位移 */
+.nav a::before {
+  content: ''; position: absolute; left: 2px; top: 50%; width: 3px; height: 0;
+  border-radius: 2px; background: var(--accent); transform: translateY(-50%);
+  transition: height var(--dur-2) var(--ease);
+}
+.nav a.on::before { height: 16px; }
+.nav a svg {
+  width: 15px; height: 15px; flex: none; opacity: .85;
+  transition: opacity var(--dur-1) var(--ease);
+}
+.nav a:hover svg, .nav a.on svg { opacity: 1; }
 .nav .sig { padding: 12px 16px; border-top: 1px solid var(--line-soft); font-size: 11.5px; color: var(--ink-3); }
 .nav .sig .row { display: flex; align-items: center; gap: 7px; }
 /* 日志频道筛选 chips */
@@ -138,29 +289,78 @@ body {
 .main { min-width: 0; display: flex; flex-direction: column; }
 .topbar {
   display: flex; align-items: center; gap: 14px; padding: 14px 24px;
-  border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 20;
+  border-bottom: 1px solid var(--glass-brd);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  backdrop-filter: blur(var(--glass-blur)) saturate(160%);
+  position: sticky; top: 0; z-index: 20;
 }
 .topbar h2 { font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1560px; margin: 0 auto; width: 100%; }
+.view {
+  padding: 22px 24px 60px; max-width: 1560px; margin: 0 auto; width: 100%;
+  /* 视图切换：淡入 + 轻微上浮。切换靠 hidden 的 display 变化，浏览器会重新触发
+     一次 CSS 动画，因此不需要 JS 配合，也不会影响已有的渲染逻辑。 */
+  animation: viewIn var(--dur-3) var(--ease) both;
+}
 .view[hidden] { display: none; }
+@keyframes viewIn { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
+/* 交互四态统一在 button 上定义，.primary / .ghost / .danger / .xs 只改配色与尺寸，
+   保证「按下去有反馈」在所有按钮上行为一致，而不是各写各的。 */
 button {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 13px; cursor: pointer;
-  transition: border-color .12s, background .12s;
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+              box-shadow var(--dur-1) var(--ease), transform var(--dur-1) var(--ease),
+              color var(--dur-1) var(--ease);
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
-button:disabled { opacity: .5; cursor: default; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 550; }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+button:hover:not(:disabled) { border-color: var(--accent); background: var(--raise); }
+/* 按下：整体下沉 1px + 内阴影，模拟物理按键——比单纯变色明确得多 */
+button:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 4px rgba(0,0,0,.18);
+}
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .45; cursor: not-allowed; transform: none; box-shadow: none; }
+button.primary {
+  background: var(--accent-solid); border-color: var(--accent-solid);
+  color: var(--accent-ink); font-weight: 550;
+  box-shadow: var(--shadow-1), inset 0 1px 0 rgba(255,255,255,.16);
+}
+button.primary:hover:not(:disabled) {
+  background: var(--accent-solid-hover); border-color: var(--accent-solid-hover);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-2), inset 0 1px 0 rgba(255,255,255,.18);
+}
+/* 必须显式写回按下态：:hover 的选择器比 :active 更具体，不写就会被上浮压掉 */
+button.primary:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 5px rgba(0,0,0,.28);
+}
 button.ghost { background: transparent; }
+button.ghost:hover:not(:disabled) { background: var(--surface-2); }
 button.danger { color: var(--bad); }
-button.danger:hover:not(:disabled) { border-color: var(--bad); }
+button.danger:hover:not(:disabled) { border-color: var(--bad); background: var(--bad-soft); color: var(--bad); }
 button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; white-space: nowrap; }
+/* 加载中：app.js 的 setBusy() 打上 aria-busy，这里补一个内联转圈，
+   把「点了没反应」变成「正在跑」。按钮文案仍由 setBusy 负责。 */
+button[aria-busy="true"] { cursor: progress; }
+button[aria-busy="true"]::after {
+  content: ''; display: inline-block; vertical-align: -1px;
+  width: 11px; height: 11px; margin-left: 7px; border-radius: 50%;
+  border: 1.6px solid currentColor; border-right-color: transparent;
+  opacity: .8; animation: spin .7s linear infinite;
+}
+button.xs[aria-busy="true"]::after { width: 9px; height: 9px; border-width: 1.4px; margin-left: 5px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+/* 主题按钮的图标：悬停轻转、按下回缩，给这个高频小按钮一点手感 */
+#icoTheme { transition: transform var(--dur-3) var(--ease); }
+#btnTheme:hover #icoTheme { transform: rotate(18deg); }
+#btnTheme:active #icoTheme { transform: rotate(-14deg) scale(.86); }
 /* select.xs：header 里的紧凑选择框。通用 input/select 规则是 width:100%（表单页用），
    header 里若不收窄会把同行 note 挤到换行——收成内容宽并压小外观，与 button.xs 同款。 */
 select.xs { width: auto; padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
@@ -168,8 +368,14 @@ button.icon { padding: 7px 9px; }
 input, select {
   font: inherit; color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
+  transition: border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease),
+              background-color var(--dur-1) var(--ease);
 }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+input:hover:not(:disabled), select:hover:not(:disabled) { border-color: var(--ink-3); }
+input:focus, select:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring); background: var(--surface);
+}
 input.invalid { border-color: var(--bad); background: var(--bad-soft); }
 input.invalid:focus { border-color: var(--bad); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
@@ -186,13 +392,27 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 }
 @media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
-.stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
-.stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
-.stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
+.stat {
+  padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+  transition: background-color var(--dur-1) var(--ease);
+}
+.stat:hover { background: var(--surface-2); }
+.stat .v {
+  font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums;
+  letter-spacing: -.03em; white-space: nowrap;
+}
+.stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; letter-spacing: .01em; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+/* 零值退成中性灰：一排彩色的 0 会盖住真正需要看的数字（"0 个已禁用"不是警报）。 */
+.stat .v.zero { color: var(--ink-3); }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
-.box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
+/* 卡片是页面唯一的"浮起层"：靠 surface 提亮 + 两道阴影 + 顶部 1px 高光，
+   在深色下也能与 bg 拉开层级（实测 surface/bg ≈ 1.12）。 */
+.box {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 11px;
+  box-shadow: var(--shadow), var(--sheen); margin-bottom: 20px; overflow: hidden;
+}
 .box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
 .box > header h3 { font-size: 13.5px; font-weight: 600; }
 .box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
@@ -217,7 +437,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 }
 .acc td { padding: 11px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
 .acc tr:last-child td { border-bottom: none; }
+.acc tbody tr { transition: background-color var(--dur-1) var(--ease); }
 .acc tbody tr:hover { background: var(--surface-2); }
+/* 行不加 :active：表格行本身不可点，按行变色会造成"整行可点"的错误暗示；
+   行内按钮自己有按下反馈，足够。 */
 /* 健康色条用真实单元格（td.mark）实现，而不是 tr::before 伪元素：
    伪元素在表格行内会被浏览器当作匿名单元格插入行首，整行内容右移一列、
    与表头错位——窗口越宽列越宽越明显。 */
@@ -244,7 +467,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
-.realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+/* nowrap：弹层变窄时「国内版 (CN)」会被折成两行，视觉上像排版坏了 */
+.realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; white-space: nowrap; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-cell { min-width: 268px; }
@@ -294,8 +518,10 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
 
+/* 空态：图标 + 标题 + 说明的三段式。缺数据时页面不再是一片空白。 */
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
-.empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
+.empty svg { width: 34px; height: 34px; opacity: .5; margin-bottom: 10px; display: block; margin-inline: auto; }
+.empty .big { font-size: 14px; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
 
 /* ── 日志（终端质感）────────────────────────────────────────────── */
 #logBox {
@@ -319,6 +545,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
 .switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
 .switch .lb { font-size: 13.5px; }
+/* 当开关行与 .fld 并排成 grid2 的一行时（如「后台刷新余额 | 刷新间隔」），
+   去掉开关的上内边距，让两边标签顶边齐平——否则开关比右侧标签低 9px，
+   看起来像整行排版错位。 */
+.grid2 > .switch { align-self: start; padding-top: 0; }
 .savebar {
   display: flex; align-items: center; gap: 12px; padding: 13px 17px;
   border-top: 1px solid var(--line-soft); background: var(--surface-2);
@@ -328,12 +558,26 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .restart-note { color: var(--warn); font-size: 12.5px; }
 
 /* ── 弹层 ─────────────────────────────────────────────────────────── */
-.veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
-.veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
+.veil {
+  position: fixed; inset: 0; background: rgba(6,8,13,.55);
+  -webkit-backdrop-filter: blur(6px) saturate(120%);
+  backdrop-filter: blur(6px) saturate(120%);
+  display: none; z-index: 60;
+}
+.veil.on {
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+  animation: veilIn var(--dur-2) var(--ease);
+}
+.veil.on .dlg { animation: dlgIn var(--dur-2) var(--ease); }
+@keyframes veilIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes dlgIn { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: none; } }
 .dlg {
-  background: var(--surface); border: 1px solid var(--line); border-radius: 13px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  backdrop-filter: blur(24px) saturate(150%);
+  border: 1px solid var(--glass-brd); border-radius: 13px;
   width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
-  box-shadow: 0 24px 64px -24px rgba(0,0,0,.6);
+  box-shadow: var(--shadow-3), var(--sheen);
 }
 .dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); }
 .dlg header h3 { font-size: 15px; font-weight: 620; }
@@ -382,11 +626,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 /* ── Toast ───────────────────────────────────────────────────────── */
 #toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+/* toast：滑入 → 停留 → 在 app.js 的 3.6s 移除前自行淡出（两段动画，无需 JS 配合） */
 .tst {
-  background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
-  border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow); max-width: 380px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
+  backdrop-filter: blur(14px) saturate(150%);
+  border: 1px solid var(--glass-brd); border-left: 3px solid var(--ink-3);
+  border-radius: 8px; padding: 10px 15px; font-size: 13px;
+  box-shadow: var(--shadow-2), var(--sheen); max-width: 380px;
+  animation: tstIn var(--dur-2) var(--ease), tstOut var(--dur-3) var(--ease) 3.3s forwards;
 }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
+@keyframes tstIn { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: none; } }
+@keyframes tstOut { to { opacity: 0; transform: translateY(6px) scale(.98); } }
 
 @media (max-width: 760px) {
   .shell { grid-template-columns: 1fr; }
@@ -401,12 +653,33 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 10px; padding: 14px 17px 2px; }
   .kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  /* 首屏骨架：KPI 网格在数据到达前是空的，给一条微光占位条，
+     比"整块空白"更像"正在加载"。数据一到就自然消失（:empty 不再匹配）。 */
+  .kpis:empty::after {
+    content: ''; grid-column: 1 / -1; height: 74px; border-radius: 10px;
+    background: linear-gradient(90deg, var(--surface-2) 25%, var(--raise) 37%, var(--surface-2) 63%);
+    background-size: 400% 100%; animation: sk 1.5s ease-in-out infinite;
+  }
+  @keyframes sk { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
   @media (max-width: 1180px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 700px) { .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .kpi {
     position: relative; min-width: 0; overflow: hidden;
     background: var(--surface-2); border: 1px solid var(--line-soft);
     border-radius: 10px; padding: 11px 14px 12px 16px;
+    /* 六张卡依次浮起（每张 +35ms）：比整块一起出现更有"数据在落位"的感觉，
+       又不会慢到让人等。 */
+    animation: riseIn var(--dur-3) var(--ease) both;
+  }
+  .kpi:nth-child(1) { animation-delay: 0ms; }
+  .kpi:nth-child(2) { animation-delay: 35ms; }
+  .kpi:nth-child(3) { animation-delay: 70ms; }
+  .kpi:nth-child(4) { animation-delay: 105ms; }
+  .kpi:nth-child(5) { animation-delay: 140ms; }
+  .kpi:nth-child(6) { animation-delay: 175ms; }
+  @keyframes riseIn {
+    from { opacity: 0; transform: translateY(9px) scale(.985); }
+    to { opacity: 1; transform: none; }
   }
   .kpi::before {
     content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
@@ -443,7 +716,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .uschart-hd .sw-c { background: var(--ok); }
   .uschart-hd .sw-t { background: var(--warn); }
   .uschart-body { padding: 8px 10px 4px; }
-  .uschart-body svg { display: block; width: 100%; height: auto; }
+  .uschart-body svg {
+    display: block; width: 100%; height: auto;
+    animation: chartIn var(--dur-3) var(--ease) both;
+  }
+  @keyframes chartIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
   .uschart-body .ax { stroke: var(--line); stroke-width: 1; }
   .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .75; }
   .uschart-body .avg { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 4 4; opacity: .55; }
@@ -550,9 +827,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .trange .tr-sep { color: var(--ink-3); font-size: 12px; }
   .trange select, .trange input { width: auto; padding: 5px 9px; font-size: 12.5px; border-radius: 6px; }
   .trange input[type=datetime-local] { font-family: var(--mono); font-size: 12px; }
-  /* 原生日期选择器的弹出面板要跟随明暗主题，否则深色下是一块刺眼的白。 */
-  .trange input[type=datetime-local] { color-scheme: light; }
-  [data-theme="dark"] .trange input[type=datetime-local] { color-scheme: dark; }
+  /* 原生日期选择器跟随明暗：不再单独写死 light/dark，统一继承 :root 或
+     [data-theme] 上的 color-scheme——否则"跟随系统"模式下会与页面主题打架。 */
   .trange .tr-bad { border-color: var(--bad); background: var(--bad-soft); }
 
   /* ── 视图内维度切换（用量「按账号/按模型/按域」等）────────────────── */
@@ -560,8 +836,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .vtabs button {
     padding: 3.5px 13px; border: none; background: transparent; border-radius: 6px;
     color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer;
+    transition: background-color var(--dur-1) var(--ease), color var(--dur-1) var(--ease),
+                box-shadow var(--dur-1) var(--ease);
   }
   .vtabs button:hover:not(:disabled) { border: none; color: var(--ink); }
+  .vtabs button:active:not(:disabled) { transform: none; box-shadow: none; }
   .vtabs button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.22); }
   .vtabs .cnt { color: var(--ink-3); font-weight: 400; margin-left: 4px; font-variant-numeric: tabular-nums; }
   .vtabs button.on .cnt { color: var(--ink-2); }
@@ -611,7 +890,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="shell">
   <nav class="nav" id="navDrawer">
     <div class="brand">
-      <div class="name">WorkBuddy2API</div>
+      <div class="row1">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5 8 2.8l5.5 2.7v5L8 13.2 2.5 10.5z"/><path d="M2.5 5.5 8 8.2l5.5-2.7M8 8.2v5"/></svg>
+        </span>
+        <div class="name">WorkBuddy2API</div>
+      </div>
       <div class="sub" id="navSub">控制台</div>
     </div>
     <ul>
@@ -643,7 +927,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </div>
   </nav>
 
-  <div class="main">
+  <!-- role="main"：给读屏软件一个主内容地标（不改标签名，避免动到闭合结构） -->
+  <div class="main" role="main">
     <div class="topbar">
       <!-- 汉堡按钮：桌面端由 .nav-btn{display:none} 隐藏，手机端才出现 -->
       <button class="icon ghost nav-btn" id="navBtn" aria-label="打开导航" aria-controls="navDrawer" aria-expanded="false">
@@ -653,7 +938,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
-      <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
+      <button class="icon ghost" id="btnTheme" title="主题：跟随系统（点击切换：跟随系统 → 浅色 → 深色）" aria-label="切换主题" aria-live="polite">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
       <button id="btnRefresh">刷新</button>
@@ -824,7 +1109,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs ghost" id="mdReset" title="清空全部筛选条件">重置</button>
         </div>
         <div class="tbl-wrap">
-        <table class="acc md">
+        <table class="acc md zebra">
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
@@ -944,7 +1229,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="listen" placeholder=":7863">
                 <span class="hint">改动需重启进程</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
-                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
+                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权" autocomplete="off" spellcheck="false">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>
@@ -959,14 +1244,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="pad">
             <div class="grid2">
               <div>
-                <div class="switch"><span class="lb">自动签到</span>
-                  <input type="checkbox" name="checkin_enabled"></div>
+                <label class="switch"><span class="lb">自动签到</span>
+                  <input type="checkbox" name="checkin_enabled"></label>
                 <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
                   <input name="checkin_hours" placeholder="9, 21"></label>
               </div>
               <div>
-                <div class="switch"><span class="lb">Token 保活</span>
-                  <input type="checkbox" name="keepalive_enabled"></div>
+                <label class="switch"><span class="lb">Token 保活</span>
+                  <input type="checkbox" name="keepalive_enabled"></label>
                 <label class="fld"><span class="lb">保活时点（小时，逗号分隔）</span>
                   <input name="keepalive_hours" placeholder="22"></label>
               </div>
@@ -974,15 +1259,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="grid2">
               <div>
-                <div class="switch"><span class="lb">猫猫旅行</span>
-                  <input type="checkbox" name="travel_enabled"></div>
+                <label class="switch"><span class="lb">猫猫旅行</span>
+                  <input type="checkbox" name="travel_enabled"></label>
                 <label class="fld"><span class="lb">旅行时点（小时，逗号分隔）</span>
                   <input name="travel_hours" placeholder="9, 21">
                   <span class="hint">一趟派出 + 一趟领奖闭环</span></label>
               </div>
               <div>
-                <div class="switch"><span class="lb">活跃上报</span>
-                  <input type="checkbox" name="activity_enabled"></div>
+                <label class="switch"><span class="lb">活跃上报</span>
+                  <input type="checkbox" name="activity_enabled"></label>
                 <label class="fld"><span class="lb">上报时点（小时，逗号分隔）</span>
                   <input name="activity_hours" placeholder="10">
                   <span class="hint">点亮连登 + 解锁领养前置</span></label>
@@ -990,30 +1275,30 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
-              <div class="switch"><span class="lb">后台刷新余额</span>
-                <input type="checkbox" name="balance_refresh_enabled"></div>
+              <label class="switch"><span class="lb">后台刷新余额</span>
+                <input type="checkbox" name="balance_refresh_enabled"></label>
               <label class="fld"><span class="lb">刷新间隔（分钟）</span>
                 <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
-              <div class="switch"><span class="lb">成长任务自动执行</span>
-                <input type="checkbox" name="growth_enabled" checked></div>
+              <label class="switch"><span class="lb">成长任务自动执行</span>
+                <input type="checkbox" name="growth_enabled" checked></label>
               <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
                 <input name="growth_hours" placeholder="1">
                 <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
-              <div class="switch"><span class="lb">任务补领清扫</span>
-                <input type="checkbox" name="task_sweep_enabled" checked></div>
+              <label class="switch"><span class="lb">任务补领清扫</span>
+                <input type="checkbox" name="task_sweep_enabled" checked></label>
               <label class="fld"><span class="lb">清扫间隔（分钟）</span>
                 <input name="task_sweep_minutes" type="number" min="1" placeholder="15"></label>
             </div>
             <div class="hint">周期扫描全部账号，把「进度已达标但尚未领奖」的成长任务补领掉（不含自动动作的口令任务也能领），并顺带接受未接受的任务。只发 accept / claim 两条<b>幂等</b>请求，不跑任何对话或上报行为，开销可忽略。<br>用途：真实对话点亮的任务不在自动动作白名单里，成长队列与「一键完成」都不会去领它——积分因此卡在半路上不去（#174）。</div>
             <div class="hr"></div>
-            <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
-              <input type="checkbox" name="include_disabled_in_tasks"></div>
+            <label class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
+              <input type="checkbox" name="include_disabled_in_tasks"></label>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
           </div>
         </div>
@@ -1091,8 +1376,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
             </div>
-            <div class="switch"><span class="lb">快过期积分优先</span>
-              <input type="checkbox" name="prefer_expiring"></div>
+            <label class="switch"><span class="lb">快过期积分优先</span>
+              <input type="checkbox" name="prefer_expiring"></label>
           </div>
         </div>
 
@@ -1130,12 +1415,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">需重启</span></label>
             </div>
             <div class="hr"></div>
-            <div class="switch"><span class="lb">出站请求指纹脱敏</span>
-              <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
-            <div class="switch"><span class="lb">system 被拦时改用 user 角色重试</span>
-              <input type="checkbox" name="system_as_user_fallback"></div>
-            <div class="switch"><span class="lb">会话粘性路由</span>
-              <input type="checkbox" name="session_sticky_enabled"></div>
+            <label class="switch"><span class="lb">出站请求指纹脱敏</span>
+              <input type="checkbox" name="sanitize_blacklist_fingerprints"></label>
+            <label class="switch"><span class="lb">system 被拦时改用 user 角色重试</span>
+              <input type="checkbox" name="system_as_user_fallback"></label>
+            <label class="switch"><span class="lb">会话粘性路由</span>
+              <input type="checkbox" name="session_sticky_enabled"></label>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>
@@ -1143,8 +1428,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="box">
           <header><h3>日志</h3></header>
           <div class="pad">
-            <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
-              <input type="checkbox" name="request_client_info"></div>
+            <label class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
+              <input type="checkbox" name="request_client_info"></label>
             <div class="hint">开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；
               关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。</div>
             <div class="hint" style="margin-top:8px">归档开关、保留天数与容量上限（<code>logging.request_archive_*</code>）需手工编辑配置文件。</div>
@@ -1346,7 +1631,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
+      <form style="display:contents" id="keyForm"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>
@@ -1375,7 +1660,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<div id="toasts"></div>
+<!-- aria-live：操作结果用读屏软件也能听到，而不只是视觉上的右下角弹条 -->
+<div id="toasts" role="status" aria-live="polite"></div>
 
 <script src="app.js"></script>
 <script src="mobile.js"></script>

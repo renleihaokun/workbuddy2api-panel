@@ -11,8 +11,11 @@
 package panel
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html
@@ -52,35 +55,59 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
+// assetETag 预计算内嵌资源的强 ETag（取内容 SHA-256 前 8 字节）。
+//
+// 为什么必须给静态资源加缓存协商：这些资源经 go:embed 随二进制变化，而浏览器
+// 对没有 Cache-Control 的响应会做启发式缓存——升级二进制后仍可能继续跑旧的
+// app.js，表现为「后端已经改了，页面上的按钮还是老行为 / 接口 404」。
+// 用 no-cache（每次回源校验）+ ETag（命中 304）兼顾正确性与开销。
+var (
+	indexETag  = assetETag(indexHTML)
+	appETag    = assetETag(appJS)
+	cssETag    = assetETag(mobileCSS)
+	mobileETag = assetETag(mobileJS)
+)
+
+func assetETag(b []byte) string {
+	sum := sha256.Sum256(b)
+	return `"` + hex.EncodeToString(sum[:8]) + `"`
+}
+
+// serveAsset 输出一个内嵌静态资源，并处理 If-None-Match 协商缓存。
+func serveAsset(w http.ResponseWriter, r *http.Request, contentType string, data []byte, etag string) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("ETag", etag)
+	// If-None-Match 可能是逗号分隔的列表，也可能带 W/ 前缀；逐个比对即可。
+	for _, tag := range strings.Split(r.Header.Get("If-None-Match"), ",") {
+		tag = strings.TrimSpace(tag)
+		if tag == etag || tag == "W/"+etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	serveAsset(w, r, "text/html; charset=utf-8", indexHTML, indexETag)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(appJS)
+	serveAsset(w, r, "text/javascript; charset=utf-8", appJS, appETag)
 }
 
 // mobileStyle 输出手机端适配样式（同源样式表，CSP style-src 'self' 加载）。
 // 单独成文而非写进 index.html：上游频繁改 index.html，独立文件可避免同步上游时反复冲突。
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileCSS)
+	serveAsset(w, r, "text/css; charset=utf-8", mobileCSS, cssETag)
 }
 
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
-	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(mobileJS)
+	serveAsset(w, r, "text/javascript; charset=utf-8", mobileJS, mobileETag)
 }
