@@ -150,6 +150,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
+| 🧭 **Responses API** | 原生 `POST /v1/responses`（Codex CLI 直连）：入站改写成 chat 请求、出站翻译成语义事件/Response 对象，复用全部选号与处置管线；无服务端会话存储（`store` 恒 false） |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 🔍 **联网搜索** | `POST /v1/search/messages` 把上游 `/agenttool/v1/search` 包成 Anthropic Messages 兼容形态（DSH 等客户端的搜索 provider 零改动接入）；复用账号池选号 / 在途租约 / token 刷新 / 错误冷却，出站请求头对齐官方客户端 |
 | 💬 **系统提示词体系** | 默认 `passthrough` 透传客户端 system（保留 DSH / Claude Code 原生指令）；可选 `custom` 替换、`append` 追加；撞 11-128 通道校验时把 system 搬进 user 角色单次重试，`passthrough` / `append` 遇内容策略拦截自动降级 |
@@ -988,6 +989,7 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；无网关侧请求体上限（超限由上游返回） |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API（Codex CLI 直连）；流式语义事件/非流式 Response 对象；无服务端会话存储（见下节） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；ID 写法随 `models.id_style`（默认 `cn:`，`slash` 时 `cn/`），可用 `?style=colon\|slash` 仅覆盖本次响应（调试/验证用）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -1010,6 +1012,43 @@ http://127.0.0.1:7863/panel/
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`
 - 非流式请求由本地聚合完整 SSE 流为单 `chat.completion` 响应（含 `reasoning_content` / `tool_calls`）
 - 正文里的原生工具调用标记在透传前还原为 `delta.tool_calls`（见「原生工具调用标记还原」）：命中时一帧会拆成「正文帧 + N 个调用帧 + 收尾帧」，上游的 `finish_reason: stop` 改写为 `tool_calls` 且排在调用帧之后；未命中时逐字节透传
+
+### Responses API（Codex 直连）
+
+Codex CLI 自 2026-02 起移除了 `wire_api = "chat"`，`responses` 是唯一受支持值。本网关提供原生 `POST /v1/responses`：**入站把 Responses 请求改写成 chat 请求 + 出站用翻译垫片把 chat 的 JSON/SSE 翻回 Responses**，因此选号、轮转、冷却、提示词改写、指纹脱敏、原生工具调用标记修复、用量账本全部复用 `/v1/chat/completions` 的既有管线，且 chat 端点的行为逐字节不变。
+
+支持范围：
+
+| 能力 | 状态 |
+|---|---|
+| `input`（字符串 / item 数组）、`instructions` | ✅ |
+| `tools`：`function` / `custom`（freeform，如 `apply_patch`） | ✅ |
+| `tool_choice` / `parallel_tool_calls` | ✅（`tool_choice` 归一化为上游可接受的形态） |
+| `max_output_tokens` / `temperature` / `top_p` / `reasoning.effort` | ✅（`minimal` 映射为 `low`，其余按模型档位降级） |
+| 流式语义事件（`response.created` / `output_item.added` / `content_part.added` / `output_text.delta` / `function_call_arguments.delta` / `response.completed` 等） | ✅ |
+| 图片输入（`input_image`，data URL / http） | ✅ |
+| `store` | 恒返回 `false`（网关不落盘） |
+| `previous_response_id` / `background` / `conversation` / `prompt` | ❌ 400 `unsupported_parameter`（不静默假装支持） |
+| 内置工具（`web_search` / `file_search` / `local_shell` / `mcp` 等） | 丢弃该工具声明并记日志，请求继续 |
+| `input_file` / `file_id` | 丢弃并记 WARN（上游无文件输入能力） |
+| `text.format`（`json_schema`） | 尽力映射到 `response_format`；上游是否支持未验证 |
+
+> **语义差异（有意为之）**：网关没有服务端会话存储，**每一轮必须回传完整 `input`**（Codex 默认 `store:false` + 全量历史）。响应里的 `store` 恒为 `false`（请求里的 `store:true` 会被忽略，不落盘），`previous_response_id` 明确 400。另外不产出 `reasoning` item / 推理摘要事件（上游只有 `reasoning_content` 文本，无 encrypted_content 可回传）；custom 工具的 `input` 增量在收尾时一次性下发（partial JSON 无法安全解包）。上游以 `200 + error 帧` 报内容拦截/通道拒绝时只做分类透传，不执行 HTTP 400 路径的 degrade / SystemAsUser 同号重试。
+
+Codex 配置示例（`~/.codex/config.toml`，`base_url` 指向网关 `/v1`）：
+
+```toml
+model = "deepseek-v4-pro"
+model_provider = "wb2api"
+
+[model_providers.wb2api]
+name = "WorkBuddy2API"
+base_url = "http://127.0.0.1:7863/v1"
+env_key = "WB2API_KEY"
+wire_api = "responses"
+```
+
+`env_key` 是**环境变量名**，其值填网关的 `api_key`。若网关 `prompt.mode = "custom"`，客户端的 `instructions` 会被网关自有提示词整段替换；跑 Codex 建议改用 `append` 或 `passthrough`，否则 Codex 的工具使用约定会被覆盖。
 
 ### 上游端点
 

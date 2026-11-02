@@ -24,6 +24,160 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// ErrorPayloadPresent 判断 error 字段是否是「真的错误」：nil / 空串 / 空对象 /
+// code=0 / 空 message 都视为占位（部分上游每帧带 "error": null/{} 之类的占位字段，
+// 不能据此判失败）。支持嵌套 error.data、error.msg、非空数组与 type-only 信封。
+func ErrorPayloadPresent(v any) bool {
+	switch e := v.(type) {
+	case nil:
+		return false
+	case string:
+		s := strings.TrimSpace(e)
+		return s != "" && s != "null" && s != "{}" && s != "0"
+	case map[string]any:
+		if nonEmptyString(e["message"]) || nonEmptyString(e["msg"]) {
+			return true
+		}
+		if businessCodePresent(e["code"]) {
+			return true
+		}
+		if data, ok := e["data"]; ok && ErrorPayloadPresent(data) {
+			return true
+		}
+		// type-only 错误信封（如 {"type":"invalid_request_error"}）。
+		if typ, ok := e["type"].(string); ok && strings.TrimSpace(typ) != "" {
+			return true
+		}
+		return false
+	case []any:
+		// 非空 error 数组一律视为错误信封（部分上游把多条错误放进数组）。
+		return len(e) > 0
+	default:
+		// bool / 数字等非错误对象形态：忽略。
+		return false
+	}
+}
+
+// ChunkErrorPresent 判断一整个 data 帧是否是错误帧：既支持 {"error":...} 包装，
+// 也支持 {"code":6004,"msg":"..."} 顶层业务信封。StreamHint、Aggregate、
+// Translator 三处共用，避免同一上游形态在三条路径上行为分叉。
+func ChunkErrorPresent(obj map[string]any) bool {
+	if e, ok := obj["error"]; ok && ErrorPayloadPresent(e) {
+		return true
+	}
+	if _, hasChoices := obj["choices"]; hasChoices {
+		return false
+	}
+	if _, hasUsage := obj["usage"]; hasUsage {
+		return false
+	}
+	if _, hasFilter := obj["prompt_filter_results"]; hasFilter {
+		return false
+	}
+	if businessCodePresent(obj["code"]) {
+		return true
+	}
+	// 顶层只有 msg 时必须是带 data 的业务错误信封；{"code":0,"msg":"success"}
+	// 这类成功 prelude/尾帧不能判失败。
+	if nonEmptyString(obj["msg"]) {
+		if data, ok := obj["data"]; ok && ErrorPayloadPresent(data) {
+			return true
+		}
+	}
+	return false
+}
+
+func nonEmptyString(v any) bool {
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) != ""
+}
+
+// chatFrameShape 判断 JSON 帧是否属于 chat.completion.chunk 家族（含空 choices
+// 元数据帧、usage-only 帧、Azure prompt_filter_results）。StreamHint 只转发这类
+// 帧，避免把代理错误页 normalize 成 object=chat.completion.chunk。
+func chatFrameShape(obj map[string]any) bool {
+	if _, ok := obj["choices"]; ok {
+		return true
+	}
+	if _, ok := obj["usage"]; ok {
+		return true
+	}
+	if _, ok := obj["prompt_filter_results"]; ok {
+		return true
+	}
+	return false
+}
+
+func businessCodePresent(v any) bool {
+	switch code := v.(type) {
+	case string:
+		c := strings.TrimSpace(code)
+		return c != "" && c != "0"
+	case float64:
+		return code != 0
+	case int:
+		return code != 0
+	case int64:
+		return code != 0
+	case json.Number:
+		f, err := code.Float64()
+		return err == nil && f != 0
+	}
+	return false
+}
+
+// errorMessageOf 从 error 帧里取可读的 message；缺失时回落整段 payload
+// （宁多勿丢：客户端至少能看到 code/requestId）。支持顶层/error/data 多层。
+func errorMessageOf(payload string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(payload), &m) == nil {
+		if e, ok := m["error"]; ok {
+			if s, ok := e.(string); ok && strings.TrimSpace(s) != "" {
+				return s
+			}
+			if s := messageOf(e); s != "" {
+				return s
+			}
+		}
+		if s := messageOf(m); s != "" {
+			return s
+		}
+	}
+	return payload
+}
+
+func messageOf(v any) string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"message", "msg"} {
+		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	if data, ok := m["data"]; ok {
+		return messageOf(data)
+	}
+	return ""
+}
+
+// errUpstreamRead 上游读取错误（区别于客户端写失败）：StreamHint 在读取上游
+// SSE 时遇到非 EOF 错误会用它包装返回，handler 据此记 502/StreamError 而不是
+// 把「客户端断连」的 Interrupted 口径套上去（否则面板成功、客户端失败）。
+var errUpstreamRead = errors.New("upstream read error")
+
+// upstreamReadError 包装真实读错误，Error() 只保留原始信息（避免日志出现
+// "upstream read error: upstream read error: xxx" 的双前缀）。
+type upstreamReadError struct{ err error }
+
+func (e *upstreamReadError) Error() string        { return e.err.Error() }
+func (e *upstreamReadError) Unwrap() error        { return e.err }
+func (e *upstreamReadError) Is(target error) bool { return target == errUpstreamRead }
+
+// IsUpstreamReadError 报告错误是否为「读上游」失败（而非写客户端失败）。
+func IsUpstreamReadError(err error) bool { return errors.Is(err, errUpstreamRead) }
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
@@ -142,7 +296,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
-			return nil, err
+			return nil, &upstreamReadError{err: err}
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "data: ") {
@@ -154,7 +308,21 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			} else {
 				var chunk map[string]any
 				if json.Unmarshal([]byte(payload), &chunk) == nil {
-					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
+					// 上游的 error 帧（200 + {"error":{...}}）不能当普通数据帧：
+					// 之前它只被计入 validEvents，聚合结果变成「空 content 的成功
+					// 响应」，非流式请求于是静默返回假成功。这里直接上抛分类错误。
+					if ChunkErrorPresent(chunk) {
+						// error.message 给客户端看；原始 payload 仍用于分类/hint。
+						// 中途 error 帧：已聚合的部分正文一并丢弃（非流式不能把
+						// 半截响应当成功返回）。
+						return nil, &Error{Kind: FrameKind(payload), Status: http.StatusOK, Raw: payload, Msg: errorMessageOf(payload)}
+					}
+					// 有效事件计数：只认 chat.completion.chunk 家族（含空 choices /
+					// usage / prompt_filter_results）；占位 error 帧与代理错误页不计入，
+					// 避免「只有占位帧」被聚合为空成功响应。
+					if !chatFrameShape(chunk) {
+						continue
+					}
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
@@ -689,7 +857,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
 		// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 		// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
-		if _, hasErr := obj["error"]; hasErr {
+		if ChunkErrorPresent(obj) {
 			// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
 			if o.onErrorFrame != nil {
 				o.onErrorFrame(payload)
@@ -698,6 +866,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 				return 0, werr
 			}
 			return 1, nil
+		}
+		// 非 chat JSON（代理错误页 {"message":"bad gateway"}）：不放大成
+		// object=chat.completion.chunk，也不计入有效帧；整条流只有这种帧时
+		// 由末端空流兜底 error，避免 Responses 翻译成空 completed。
+		if !chatFrameShape(obj) {
+			return 0, nil
 		}
 		for _, ch := range repairFrame(obj) {
 			if werr := writeChunk(ch, payload); werr != nil {
@@ -738,7 +912,17 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			// 读上游失败（不是写客户端失败）：用哨兵包装，handler 据此记 502。
+			// 首字节前就失败时 chat 端没有 Responses 的 finish 兜底，补一帧
+			// error + [DONE] 才能让客户端看到可解析的失败而不是 200 空 body。
+			if validFrames == 0 {
+				_ = writeRaw(`{"error":{"message":"upstream read error","type":"upstream_error","code":"upstream_read"}}`)
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+			return &upstreamReadError{err: err}
 		}
 	}
 	// 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，未闭合
@@ -766,8 +950,7 @@ readLoop:
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
-	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
+	// 网关本地空流兜底帧不附 hint（该形态未覆盖，不编造 hint）。
 	if validFrames == 0 {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
@@ -794,19 +977,23 @@ func frameGatewayHint(hintFn func(string) string, payload string) string {
 	return strings.TrimSpace(hintFn(payload))
 }
 
-// attachHintToErrorFrame 在 error 帧的 error 对象上附加 gateway_hint 字段。
-// message/code/requestId 等既有键原样保留（只加不改）；非 JSON / 无 error 对象 →
-// payload 原样返回（宁可不加 hint 也不破坏原文透传）。
+// attachHintToErrorFrame 在 error 帧上附加 gateway_hint 字段：error 对象帧挂到
+// error 内，顶层 {code,msg} 业务信封挂到顶层。message/code/requestId 等既有键
+// 原样保留（只加不改）；非 JSON / 两种形态都不是 → payload 原样返回。
 func attachHintToErrorFrame(payload, hint string) string {
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil {
 		return payload
 	}
 	e, ok := obj["error"].(map[string]any)
-	if !ok {
+	if ok {
+		e["gateway_hint"] = hint
+	} else if _, topLevel := obj["code"]; topLevel {
+		// 顶层业务信封 {"code":...,"msg":...}：hint 挂在顶层，保留原键。
+		obj["gateway_hint"] = hint
+	} else {
 		return payload
 	}
-	e["gateway_hint"] = hint
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return payload

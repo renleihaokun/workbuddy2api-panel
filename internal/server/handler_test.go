@@ -973,6 +973,13 @@ func TestChatModelForbiddenByAccountTypeReturns400(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
+	// 动态目录缓存是进程级全局状态：shuffle 下前面的用例可能留下 lastFail/ids，
+	// 这里显式清空，保证本用例仍走真实拉取路径而不是命中负缓存。
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()

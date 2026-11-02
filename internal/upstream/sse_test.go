@@ -673,6 +673,267 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 	}
 }
 
+// TestAggregateErrorFrame 上游 200 + error 帧必须上抛分类错误，不能聚合出
+// 「空 content 的成功响应」（否则非流式请求会静默返假成功）。
+func TestAggregateErrorFrame(t *testing.T) {
+	raw := "data: {\"error\":{\"code\":6004,\"message\":\"rate limited\"}}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err == nil {
+		t.Fatalf("expected error, got resp=%v", resp)
+	}
+	var ue *Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("error type=%T want *Error: %v", err, err)
+	}
+	if ue.Kind != ErrSoftRate {
+		t.Errorf("kind=%v want ErrSoftRate", ue.Kind)
+	}
+	if !strings.Contains(ue.Msg, "rate limited") {
+		t.Errorf("msg=%q", ue.Msg)
+	}
+}
+
+// TestAggregateNullErrorIgnored "error": null / {} 是占位，不得判失败。
+func TestAggregateNullErrorIgnored(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"error\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"error\":{},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("null/empty error must be ignored: %v", err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "hi!" {
+		t.Errorf("content=%v", msg["content"])
+	}
+}
+
+// TestAggregatePlaceholderCodeZero code=0 的 error 占位不能判失败。
+func TestAggregatePlaceholderCodeZero(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"error\":{\"code\":0},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("code=0 placeholder must be ignored: %v", err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "hi" {
+		t.Errorf("content=%v", msg["content"])
+	}
+}
+
+// TestFrameKindStructuredCode 200 帧里的结构化 code（11-128）必须能被识别，
+// 不能因为只传 error.message 而退化成 ErrNone/502。
+func TestFrameKindStructuredCode(t *testing.T) {
+	cases := []struct {
+		payload string
+		want    ErrKind
+	}{
+		{`{"error":{"code":"11-128","message":"request illegal"}}`, ErrChannelRefused},
+		{`{"error":{"code":"11-128"}}`, ErrClient},
+		{`{"error":{"code":"11-128","message":"blocked by security policy"}}`, ErrContentBlocked},
+		{`{"error":{"code":14018}}`, ErrHardCredit},
+		{`{"error":{"data":{"code":14018,"msg":"credits exhausted"}}}`, ErrHardCredit},
+		{`{"error":{"code":6021}}`, ErrUpstreamBusy},
+		{`{"error":{"code":14017}}`, ErrAccountFault},
+		{`{"error":{"code":11140}}`, ErrClient},
+		{`{"error":{"code":11140,"message":"request illegal","displayTips":{"en":"failed channel verification"}}}`, ErrAccountFault},
+		{`{"error":{"code":11140,"message":"The model provider is rate-limiting requests. Please wait."}}`, ErrSoftRate},
+		{`{"code":6004,"msg":"rate limited"}`, ErrSoftRate},
+		{`{"error":"rate limited"}`, ErrSoftRate},
+		{`{"error":"boom"}`, ErrClient},
+	}
+	for _, c := range cases {
+		if got := FrameKind(c.payload); got != c.want {
+			t.Errorf("FrameKind(%s)=%v want %v", c.payload, got, c.want)
+		}
+	}
+}
+
+// readErrReader 首次返回一帧，第二次返回传输错误。
+type readErrReader struct {
+	frame []byte
+	read  bool
+}
+
+func (r *readErrReader) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		return copy(p, r.frame), nil
+	}
+	return 0, errors.New("connection reset")
+}
+
+// TestChunkErrorPresentSuccessEnvelope 成功业务信封（code=0/msg=success）不能
+// 被当成错误帧。
+func TestChunkErrorPresentSuccessEnvelope(t *testing.T) {
+	for _, obj := range []map[string]any{
+		{"code": float64(0), "msg": "success"},
+		{"id": "c1", "code": float64(0), "msg": "success"},
+		{"msg": "success"},
+	} {
+		if ChunkErrorPresent(obj) {
+			t.Errorf("success envelope judged as error: %v", obj)
+		}
+	}
+	if !ChunkErrorPresent(map[string]any{"code": float64(6004), "msg": "rate limited"}) {
+		t.Error("business error envelope missed")
+	}
+}
+
+// TestErrorPayloadPresent 统一判定的表驱动回归：占位形态不得判真错误。
+func TestErrorPayloadPresent(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty string", "", false},
+		{"blank string", "   ", false},
+		{"literal null", "null", false},
+		{"literal object", "{}", false},
+		{"literal zero", "0", false},
+		{"empty object", map[string]any{}, false},
+		{"empty message", map[string]any{"message": ""}, false},
+		{"code zero number", map[string]any{"code": float64(0)}, false},
+		{"code zero string", map[string]any{"code": "0"}, false},
+		{"bool", true, false},
+		{"number", float64(1), false},
+		{"message", map[string]any{"message": "rate limited"}, true},
+		{"msg", map[string]any{"msg": "request illegal"}, true},
+		{"code", map[string]any{"code": "11-128"}, true},
+		{"nested data", map[string]any{"data": map[string]any{"code": "11140", "msg": "request illegal"}}, true},
+		{"type only", map[string]any{"type": "invalid_request_error"}, true},
+		{"array", []any{map[string]any{"code": float64(6004)}}, true},
+		{"empty array", []any{}, false},
+		{"string", "boom", true},
+	}
+	for _, c := range cases {
+		if got := ErrorPayloadPresent(c.in); got != c.want {
+			t.Errorf("%s: got=%v want=%v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestStreamReadErrorSentinel 读上游失败必须用哨兵包装，供 handler 与
+// 客户端写失败（Interrupted）区分。
+func TestStreamReadErrorSentinel(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, &readErrReader{frame: []byte(raw)})
+	if err == nil {
+		t.Fatal("expected read error")
+	}
+	if !IsUpstreamReadError(err) {
+		t.Fatalf("error=%v not wrapped by errUpstreamRead", err)
+	}
+}
+
+// errReader 首次 Read 即返回传输错误。
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+// TestStreamImmediateReadErrorWritesErrorFrame 首字节前读失败也要补 error 帧 +
+// [DONE]，否则 chat 客户端拿到 200 空 body。
+func TestStreamImmediateReadErrorWritesErrorFrame(t *testing.T) {
+	rec := httptest.NewRecorder()
+	err := Stream(rec, errReader{})
+	if err == nil || !IsUpstreamReadError(err) {
+		t.Fatalf("err=%v want upstream read error", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "upstream_read") {
+		t.Errorf("missing error frame: %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing [DONE]: %q", body)
+	}
+}
+
+// TestStreamNestedErrorEnvelope 嵌套 error.data / 顶层 code,msg 业务信封必须
+// 触发 observer 并原样透传，不能进入 normalize 变成空成功。
+func TestStreamNestedErrorEnvelope(t *testing.T) {
+	cases := []string{
+		`{"error":{"data":{"code":11140,"msg":"request illegal"}}}`,
+		`{"error":{"msg":"request illegal"}}`,
+		`{"code":6004,"msg":"rate limited"}`,
+	}
+	for _, payload := range cases {
+		t.Run(payload, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			var got string
+			raw := "data: " + payload + "\n\n" + "data: [DONE]\n\n"
+			if err := StreamHint(rec, strings.NewReader(raw), nil,
+				WithErrorFrameObserver(func(p string) { got = p })); err != nil {
+				t.Fatalf("stream: %v", err)
+			}
+			if got != payload {
+				t.Fatalf("observer=%q want %q", got, payload)
+			}
+			if !strings.Contains(rec.Body.String(), `"error"`) && !strings.Contains(rec.Body.String(), `"code"`) {
+				t.Fatalf("error frame lost: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestStreamPlaceholderErrorPassthrough 占位 error 字段（null/{} / ""）不能被
+// 当成 error frame：正常正文照常透传、不触发 onErrorFrame。
+func TestStreamPlaceholderErrorPassthrough(t *testing.T) {
+	for _, placeholder := range []string{"null", "{}", `""`} {
+		t.Run(placeholder, func(t *testing.T) {
+			raw := `data: {"error":` + placeholder + `,"id":"c1","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n"
+			rec := httptest.NewRecorder()
+			var errFrame string
+			err := StreamHint(rec, strings.NewReader(raw), nil,
+				WithErrorFrameObserver(func(payload string) { errFrame = payload }))
+			if err != nil {
+				t.Fatalf("stream: %v", err)
+			}
+			if errFrame != "" {
+				t.Fatalf("placeholder error must not trigger observer: %s", errFrame)
+			}
+			if !strings.Contains(rec.Body.String(), "hello") {
+				t.Fatalf("content lost: %s", rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), `"error":{"message":"empty upstream stream"}`) {
+				t.Fatalf("placeholder treated as empty stream: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestAggregateEnvelopeVariants 嵌套 error.data、error.msg、顶层 code/msg 与
+// 字符串 error 都必须上抛错误，不能聚合成空成功。
+func TestAggregateEnvelopeVariants(t *testing.T) {
+	payloads := []string{
+		`{"error":{"data":{"code":11140,"msg":"request illegal"}}}`,
+		`{"error":{"msg":"request illegal"}}`,
+		`{"error":"boom"}`,
+		`{"code":6004,"msg":"rate limited"}`,
+	}
+	for _, payload := range payloads {
+		raw := "data: " + payload + "\n\n" + "data: [DONE]\n\n"
+		if _, err := Aggregate(strings.NewReader(raw)); err == nil {
+			t.Errorf("payload %s: expected error, got success", payload)
+		}
+	}
+}
+
+// TestAggregatePlaceholderOnlyIsEmptyStream 只有占位 error 帧的流不能聚合出
+// 空成功响应，必须按空流报错。
+func TestAggregatePlaceholderOnlyIsEmptyStream(t *testing.T) {
+	raw := "data: {\"error\":{}}\n\n" + "data: [DONE]\n\n"
+	_, err := Aggregate(strings.NewReader(raw))
+	if err == nil || !IsEmptyStreamError(err) {
+		t.Fatalf("err=%v want IsEmptyStreamError", err)
+	}
+}
+
 // TestAggregateEmptyStreamError 校验空流错误信息形如约定文案。
 func TestAggregateEmptyStreamError(t *testing.T) {
 	_, err := Aggregate(strings.NewReader(""))

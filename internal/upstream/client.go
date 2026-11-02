@@ -89,6 +89,9 @@ type Error struct {
 	Kind   ErrKind
 	Status int
 	Msg    string
+	// Raw 上游原始错误体（200+error 帧等场景），供分类/hint 使用；Msg 是给
+	// 客户端看的可读 message。两者可能不同（Msg 抽取自 error.message）。
+	Raw string
 	// RetryAfter 上游明示的等待时长（Retry-After 秒 / retry-after-ms /
 	// x-ratelimit-reset 头解析，见 ParseRetryAfter）。零值 = 上游未明示，
 	// 冷却时长回落调用方计算值。挂载点选在 Error 信封：Kind 决定「罚不罚」，
@@ -176,6 +179,7 @@ func IsAccountRestricted(body string) bool {
 //   - "request illegal"
 //   - "conversation id missing"
 //   - "first message is not system prompt"
+//
 // 且 displayTips 含 "failed channel verification" / "渠道校验" / "通路驗證"。
 var channelRefusedMarkers = []string{
 	accountRestrictedMsg,

@@ -12,6 +12,7 @@ package upstream
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -107,21 +108,140 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 }
 
 // FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
-// （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
-// Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+// （IsModelRateLimit 对帧 JSON 直接命中）优先；随后用显式业务码表覆盖
+// 14018/6021/14017/11140/12153/11133/11135/11115/11102 等 200 帧形态；
+// 11-128 走 isChannelRefused 的 code+文案双条件；最后用完整 payload 走
+// Classify 兜底。判不出 → ErrNone（无 hint）。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
-	var f struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
+	code, msg := frameBusinessFields(payload)
+	switch code {
+	case "6004":
+		return ErrSoftRate
+	case "14018":
+		return ErrHardCredit
+	case "6021":
+		return ErrUpstreamBusy
+	case "14017":
+		return ErrAccountFault
+	case "11140":
+		// 11140 同时承载「账号级 request illegal」与「模型级 rate-limiting」两种
+		// 文案；只有 code + request illegal 双条件才归账号故障，其余回落文案分类。
+		if IsAccountRestricted(payload) {
+			return ErrAccountFault
+		}
+	case "12153":
+		return ErrSessionDead
+	case "11133", "11101":
+		return ErrBadParams
+	case "11135":
+		return ErrImageInvalid
+	case "11115":
+		return ErrPromptTooLong
+	case "11102":
+		return ErrModelBlocked
 	}
-	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
-		return ErrNone
+	// 11-128 通道校验必须走 Classify 的双条件（code + request illegal，且排除
+	// content-blocked 文案），不能凭裸码直接判通道失败。
+	if isChannelRefused(payload) {
+		return ErrChannelRefused
 	}
-	return Classify(http.StatusBadRequest, f.Error.Message)
+	// 无结构化 code 时退回文案分类；字符串 error 也在这里兜底。
+	if kind := Classify(http.StatusBadRequest, payload); kind != ErrNone && kind != ErrClient {
+		return kind
+	}
+	if msg != "" {
+		if kind := Classify(http.StatusBadRequest, msg); kind != ErrNone && kind != ErrClient {
+			return kind
+		}
+	}
+	if code != "" || msg != "" {
+		return ErrClient
+	}
+	return ErrNone
+}
+
+// frameBusinessFields 从 200+error 帧里提取业务码与可读 message，兼容
+// 顶层 {code,msg}、{error:{code,msg/message}}、{error:{data:{code,msg}}} 与
+// 字符串 error。
+func frameBusinessFields(payload string) (code, msg string) {
+	var m map[string]any
+	if json.Unmarshal([]byte(payload), &m) != nil {
+		return "", ""
+	}
+	code = businessCodeString(m["code"])
+	msg = firstNonEmptyString(m["msg"], m["message"])
+	if e, ok := m["error"]; ok {
+		switch v := e.(type) {
+		case string:
+			if msg == "" {
+				msg = strings.TrimSpace(v)
+			}
+		case map[string]any:
+			if code == "" {
+				code = businessCodeString(v["code"])
+			}
+			if msg == "" {
+				msg = firstNonEmptyString(v["msg"], v["message"])
+			}
+			if data, ok := v["data"].(map[string]any); ok {
+				if code == "" {
+					code = businessCodeString(data["code"])
+				}
+				if msg == "" {
+					msg = firstNonEmptyString(data["msg"], data["message"])
+				}
+			}
+		}
+	}
+	return code, msg
+}
+
+func businessCodeString(v any) string {
+	switch code := v.(type) {
+	case nil:
+		return ""
+	case string:
+		c := strings.TrimSpace(code)
+		if c == "0" {
+			return ""
+		}
+		return c
+	case float64:
+		if code == 0 {
+			return ""
+		}
+		return strconv.FormatInt(int64(code), 10)
+	case int:
+		if code == 0 {
+			return ""
+		}
+		return strconv.Itoa(code)
+	case int64:
+		if code == 0 {
+			return ""
+		}
+		return strconv.FormatInt(code, 10)
+	case json.Number:
+		c := code.String()
+		if c == "0" {
+			return ""
+		}
+		return c
+	default:
+		return ""
+	}
+}
+
+func firstNonEmptyString(values ...any) string {
+	for _, v := range values {
+		if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=

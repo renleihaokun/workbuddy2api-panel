@@ -162,6 +162,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// OpenAI Responses API（Codex CLI 唯一支持的 wire_api）。实现是「入站改写成
+	// chat 请求 + 出站翻译垫片」，见 responses.go——补全管线不复制一份。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
@@ -204,14 +207,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // tracedRequest 判断该请求是否需要请求日志记账（指标 + JSONL 归档）。
 //
-// 搜索与 chat 共用同一份账本：搜索同样消耗账号额度、同样会因上游/账号问题失败，
-// 不记账等于在面板「请求记录」里完全看不见搜索流量（此前正是如此——只挂
-// /v1/chat/completions 一个硬编码路径）。
+// chat / responses / 搜索共用同一份账本：三者同样消耗账号额度、同样会因上游/账号
+// 问题失败，不记账等于在面板「请求记录」里完全看不见对应流量。
 func (h *Handler) tracedRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	return r.URL.Path == "/v1/chat/completions" || isSearchPath(r.URL.Path)
+	return r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" || isSearchPath(r.URL.Path)
 }
 
 // isSearchPath 判断是否为搜索端点。
@@ -1231,6 +1233,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case sErr != nil:
+				if upstream.IsUpstreamReadError(sErr) {
+					// 读上游失败（不是客户端断连）：客户端拿到的是失败流，账本
+					// 也必须记失败——否则面板显示成功、账号还绑了粘性。
+					st.status = http.StatusBadGateway
+					st.outcome = reqlog.OutcomeStreamError
+					log.Printf("WARN: [server] stream acct=%s model=%s: upstream read error: %v",
+						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
+					break
+				}
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
 				st.outcome = reqlog.OutcomeInterrupted
@@ -1295,6 +1306,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rc.Close()
 		if err != nil {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			var ue *upstream.Error
+			if errors.As(err, &ue) {
+				// 上游 200 + error 帧（Aggregate 已识别并上抛）：按分类处置账号。
+				// 可重试类（6004/账号故障/5xx/硬额度）继续换号；请求级错误立即回。
+				h.applyErrorPolicy(acct.UID, ue.Kind, upstreamBody(ue), bareModel, ue)
+				fail(acct.UID)
+				if terminalUpstreamError(ue.Kind) {
+					status, code := upstreamErrorStatus(ue.Kind)
+					writeOpenAIErrorHint(w, status, code, ue.Msg,
+						h.hintOf(ue.Kind, upstreamBody(ue), bareModel, reqHasImage, ue))
+					st.status = status
+					st.outcome = reqlog.OutcomeHTTPError
+					return
+				}
+				lastErr = &upstream.Error{Kind: ue.Kind, Status: http.StatusOK, Msg: ue.Msg, Raw: ue.Raw, RetryAfter: ue.RetryAfter}
+				if !rotateBackoff(i, r.Context()) {
+					break
+				}
+				continue
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
@@ -1363,7 +1394,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	upstreamMsgPassed := false
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
-		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
+		hint = h.hintOf(ue.Kind, upstreamBody(ue), bareModel, reqHasImage, ue)
 		// system→user 伪装已尝试仍被拒：指纹在 assistant/tool 历史里搬不走，
 		// 给可操作指向（不改写上游原文 message，只并列补充 gateway_hint）。
 		if ue.Kind == upstream.ErrChannelRefused && channelRefusedConverted {
@@ -1688,6 +1719,55 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // helpers
 // ---------------------------------------------------------------------------
 
+// upstreamBody 返回用于分类/hint 的上游原始错误体；HTTP 状态错误没有 Raw 时
+// 回落 Msg。
+func upstreamBody(ue *upstream.Error) string {
+	if ue == nil {
+		return ""
+	}
+	if strings.TrimSpace(ue.Raw) != "" {
+		return ue.Raw
+	}
+	return ue.Msg
+}
+
+// upstreamErrorStatus 把「请求级终态」上游错误映射成 (HTTP 状态, 客户端可识别
+// 的 code)；仅用于 200+error 帧的 terminal 分支（轮转耗尽仍沿用既有 503 契约）。
+func upstreamErrorStatus(kind upstream.ErrKind) (int, string) {
+	switch kind {
+	case upstream.ErrContentBlocked:
+		return http.StatusBadRequest, "content_blocked"
+	case upstream.ErrPromptTooLong:
+		return http.StatusBadRequest, "prompt_too_long"
+	case upstream.ErrImageInvalid:
+		return http.StatusBadRequest, "image_invalid"
+	case upstream.ErrBadParams:
+		return http.StatusBadRequest, "bad_params"
+	case upstream.ErrChannelRefused:
+		return http.StatusBadRequest, "channel_refused"
+	case upstream.ErrUpstreamBusy:
+		return http.StatusServiceUnavailable, "upstream_busy"
+	default:
+		return http.StatusBadGateway, "upstream_error"
+	}
+}
+
+// terminalUpstreamError 报告该错误是否「请求级、换号也无意义」——立即回客户端；
+// 其余分类（限流/账号故障/余额/服务端）继续轮转换号。
+//
+// 已知限制：200+error 帧路径不做 HTTP 400 路径的内容拦截 degrade 重试与 11-128
+// SystemAsUser 同号重试——那两条路径依赖原始请求体重写与同号重放，Aggregate 之后
+// 已没有可复用的请求上下文；这里只做分类透传。见 README「Responses API」限制说明。
+func terminalUpstreamError(kind upstream.ErrKind) bool {
+	switch kind {
+	case upstream.ErrContentBlocked, upstream.ErrPromptTooLong, upstream.ErrImageInvalid,
+		upstream.ErrBadParams, upstream.ErrChannelRefused, upstream.ErrUpstreamBusy:
+		return true
+	default:
+		return false
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
@@ -1783,8 +1863,14 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 // 上游没回 body）→ 无 hint（不编造）。
 func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage bool, uerr *upstream.Error) string {
 	msg := body
-	if uerr != nil && uerr.Msg != "" {
-		msg = uerr.Msg
+	if uerr != nil {
+		// hint 需要完整 body（code/requestId 才能命中 11133/11135 等判定）；
+		// Msg 只是给客户端看的可读 message，不能替代 Raw。
+		if strings.TrimSpace(uerr.Raw) != "" {
+			msg = uerr.Raw
+		} else if uerr.Msg != "" {
+			msg = uerr.Msg
+		}
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
 }
