@@ -144,10 +144,57 @@ func TestClassify(t *testing.T) {
 		// 非 403 的无信封错误体不进 WAF 分类（WAF 判定绑定 403 形态）。
 		{400, `bad request`, ErrClient},
 		{429, ``, ErrSoftRate},
+		// ---- 2026-11-03 上游事故回归 ----
+		// 14003「too many requests」+ displayMsg「Model busy」是**模型级**拥塞
+		// （上游明说换模型或稍后再试），不是账号级限流。当日 7 个账号在 3 分钟内
+		// 全部命中，旧分类把它落到 status==429 兜底 → 逐号软冷却 600s → 11 分钟
+		// 关停全池、窗口可用率 21%。必须归 ErrModelBusy：不罚号、不轮转、429+Retry-After。
+		{429, `{"code":14003,"msg":"too many requests","requestId":"22381d3d11fac8c832c16a37a0a1c479","retry_policy":{"retry":true,"retry_after":30},"displayMsg":{"en":"Model busy. Please switch models or retry late","zh":"模型繁忙"}}`, ErrModelBusy},
+		{429, `{"error":{"data":{"code":14003,"msg":"too many requests"}}}`, ErrModelBusy},
+		{429, `{"code":"14003","msg":"too many requests"}`, ErrModelBusy},
+		// 防过宽：不带 14003 的普通 429 仍是软限流（区分点就是业务码，不是文案）。
+		{429, `{"code":1,"msg":"too many requests","displayMsg":{"en":"Model busy"}}`, ErrSoftRate},
+		// 10000「invoke model error」+ extError 502001「Upstream authentication failed」
+		// 是上游自己到模型后端的鉴权失败（HTTP 500），与本地凭证无关。必须归
+		// ErrUpstreamInfra：落 ErrServer 会喂账号熔断器（3 连 → 30 分钟），把上游
+		// 故障放大成整池宕机。
+		{500, `{"code":10000,"msg":"invoke model error","requestId":"1061d1fc660b168c8e2edd65d16a992b","retry_policy":{"retry":true,"retry_after":10},"extError":{"code":"502001","message":"Upstream authentication failed"}}`, ErrUpstreamInfra},
+		// 防过宽：普通 500（无 502001）必须仍是 ErrServer（继续喂熔断，账号级真故障靠它）。
+		{500, `{"code":10000,"msg":"invoke model error","requestId":"ff1c5ce08752d0e16e4eb9f452fbc48d"}`, ErrServer},
+		{500, `internal server error`, ErrServer},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestParseRetryAfterBody 从错误 body 解析上游明示等待时长。
+// 背景：上游把 retry_after 放在 retry_policy 里而不是响应头，只读头的
+// ParseRetryAfter 永远解析不到，冷却回落 soft_rate=600s —— 把「30 秒后重试」
+// 放大成「冻结 10 分钟」（2026-11-03 实案净放大 28 倍）。
+func TestParseRetryAfterBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Duration
+		ok   bool
+	}{
+		{"14003 retry_policy 数字",
+			`{"code":14003,"msg":"too many requests","retry_policy":{"retry":true,"retry_after":30}}`, 30 * time.Second, true},
+		{"字符串形态", `{"retry_after":"45"}`, 45 * time.Second, true},
+		{"空白容差", `{"retry_after" :  7 }`, 7 * time.Second, true},
+		{"无该字段", `{"code":6004,"msg":"将在 2026-11-04 02:30:30 重置"}`, 0, false},
+		{"零值丢弃", `{"retry_after":0}`, 0, false},
+		{"超上限丢弃(>2h)", `{"retry_after":99999}`, 0, false},
+		{"空体", ``, 0, false},
+		{"非 JSON 纯文本", `too many requests`, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := ParseRetryAfterBody(c.body)
+		if ok != c.ok || got != c.want {
+			t.Errorf("%s: ParseRetryAfterBody(%q)=(%v,%v) want (%v,%v)", c.name, c.body, got, ok, c.want, c.ok)
 		}
 	}
 }

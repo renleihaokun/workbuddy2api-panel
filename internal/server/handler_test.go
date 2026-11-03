@@ -210,6 +210,83 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
+// TestChatModelBusy14003FailsFastWithRetryAfter 上游 429 + code 14003「too many
+// requests」/displayMsg「Model busy」是**模型级拥塞**（2026-11-03 实案：7 个账号
+// 3 分钟内全部命中）。旧行为把它当账号级软限流逐号冷却 soft_rate=600s，11 分钟
+// 关停全池、窗口可用率 21%，而上游自述「30 秒后重试」——净放大 28 倍。
+// 端到端断言：零轮转、429 + Retry-After:30（取自 body 的 retry_policy）、
+// 账号零惩罚（这是放大器的核心回归点：只要这里不冷却，池子就不会被拖垮）。
+func TestChatModelBusy14003FailsFastWithRetryAfter(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 429, `{"code":14003,"msg":"too many requests","requestId":"22381d3d11fac8c832c16a37a0a1c479","retry_policy":{"retry":true,"retry_after":30},"displayMsg":{"en":"Model busy. Please switch models or retry late"}}`, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "mb1", AccessToken: "at-mb1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "mb2", AccessToken: "at-mb2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("mb1", 2000, 0) // 确定性源 r=0 → 先选 mb1
+	p.SetCredits("mb2", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429: model-busy is rate-limit semantics, client should retry)", rec.Code, rec.Body)
+	}
+	// Retry-After 必须来自上游 body 的 retry_after=30（不是本地 soft_rate 600）。
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After=%q want \"30\"（取自 body retry_policy.retry_after，不是本地 soft_rate）", got)
+	}
+	// 零轮转：模型级拥塞换号必然再撞同一堵墙（当日 139 次重试 100% 复现）。
+	if calls["Bearer at-mb1"] != 1 || calls["Bearer at-mb2"] != 0 {
+		t.Errorf("calls=%v want mb1 1 次、mb2 0 次（零轮转）", calls)
+	}
+	// 账号零惩罚：不冷却（尤其不是 600s）、不熔断、不计错、不连败。
+	st, _ := p.Status("mb1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrModelBusy must not penalize account: %+v", st)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "14003") {
+		t.Errorf("429 body should carry upstream 14003 info (含 requestId): %s", body)
+	}
+	if !strings.Contains(body, "model_busy") {
+		t.Errorf("429 body should carry model_busy code: %s", body)
+	}
+	if strings.Contains(body, "no_healthy_account") {
+		t.Errorf("model-busy failure must not be reported as account exhaustion: %s", body)
+	}
+}
+
+// TestChatUpstreamInfraDoesNotFeedBreaker 10000 + extError 502001「Upstream
+// authentication failed」（HTTP 500）是上游内部到模型后端的鉴权失败，与本地凭证
+// 无关。若按 ErrServer 记账，连续 3 次就会熔断 30 分钟（breaker_threshold=3）——
+// 一次上游基础设施抖动就变成整池宕机，比 2026-11-03 那次的 14 分钟更重。
+// 断言：三次连续 502001 之后，账号无冷却、无熔断、无错误计数。
+func TestChatUpstreamInfraDoesNotFeedBreaker(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 500, `{"code":10000,"msg":"invoke model error","requestId":"1061d1fc660b168c8e2edd65d16a992b","retry_policy":{"retry":true,"retry_after":10},"extError":{"code":"502001","message":"Upstream authentication failed"}}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "infra1", AccessToken: "at-infra1", ExpiresAt: 9999999999})
+	p.SetCredits("infra1", 2000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	for i := 0; i < 3; i++ { // 3 = pool.breaker_threshold 默认值：按 ErrServer 记账必熔断
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("call %d: code=%d body=%s (want 502 upstream_infra_error)", i+1, rec.Code, rec.Body)
+		}
+		if !strings.Contains(rec.Body.String(), "upstream_infra_error") {
+			t.Errorf("call %d: body should carry upstream_infra_error: %s", i+1, rec.Body)
+		}
+	}
+	st, _ := p.Status("infra1")
+	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+		t.Errorf("ErrUpstreamInfra must not penalize account (尤其不能熔断): %+v", st)
+	}
+}
+
 // TestChatBadParams400CarriesUpstreamBody 11101 的 400 响应必须包含上游原始
 // 11101 信息（含 requestId，客户端据此排查），且不再出现空洞的 no_healthy_account。
 func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {

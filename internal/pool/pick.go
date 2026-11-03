@@ -344,7 +344,11 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	// INFO 而非 WARN：全池冷却期间每一次选号都会走到这里（冷却号兜底探测是设计
+	// 内的最后一道路径），一次上游模型抖动就能刷出上百行 WARN，把真正的错误
+	// 淹掉（2026-11-03 实案：314 行 WARN 里 139 行是它、139 行是与之配对的
+	// soft_rate 回显）。这是选号路径的正常分支，不是异常。
+	log.Printf("INFO: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的

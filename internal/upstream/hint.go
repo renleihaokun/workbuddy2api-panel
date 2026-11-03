@@ -67,6 +67,13 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
 		// 指引客户端等待后重试（SDK 指数退避天然适配）。
 		return "upstream capacity is full (queue.full); this is a channel-level issue, not an account problem; retry after a short wait"
+	case ErrModelBusy:
+		// 14003：模型级拥塞。要点是「换账号没用、账号没被罚」，可操作动作只有
+		// 换模型或等 Retry-After——否则用户会去面板反复启停账号、重新登录。
+		return "upstream model is busy (14003); this is a model-level congestion, not an account problem — switch to another model or retry after the Retry-After delay"
+	case ErrUpstreamInfra:
+		// 502001：上游自己到模型后端的鉴权失败。不是本地凭证问题，别让用户去重登。
+		return "upstream infrastructure error (502001: upstream authentication failed); the gateway's own credentials are fine — retry after a short wait"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrContentBlocked:
@@ -124,6 +131,13 @@ func FrameKind(payload string) ErrKind {
 		return ErrHardCredit
 	case "6021":
 		return ErrUpstreamBusy
+	case "14003":
+		// 模型级拥塞（too many requests / Model busy）的 200+error 帧形态：
+		// 归 ErrModelBusy 而非 ErrSoftRate，否则流式路径会把它当账号级限流冷却整池。
+		return ErrModelBusy
+	case "502001":
+		// 上游内部鉴权失败：不罚号、不喂熔断。
+		return ErrUpstreamInfra
 	case "14017":
 		return ErrAccountFault
 	case "11140":

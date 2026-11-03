@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -1138,6 +1139,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
+			// 14003「Model busy」模型级拥塞：**不罚号不轮转**，立即回 429 + Retry-After。
+			// 与 6021 同哲学、不同语义：6021 是渠道队列满载（503 语义），14003 是
+			// 「这个模型忙，换模型或稍后再试」——属于限流，客户端应读 Retry-After 重试。
+			// 为什么不能按账号级软限流处置：换号对模型级拥塞完全无效（2026-11-03 实案
+			// 139 次换号重试 100% 复现同一 429），而逐号冷却 soft_rate=600s 会在 11 分钟
+			// 内关停 7/7 账号、把窗口可用率打到 21%；上游自述只需等 30 秒。
+			if kind == upstream.ErrModelBusy {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				fail(acct.UID)
+				msg := string(respBody)
+				if strings.TrimSpace(msg) == "" {
+					msg = "upstream model is busy (14003); switch models or retry after the indicated delay"
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(int(modelBusyRetryAfter(uerr)/time.Second)))
+				writeOpenAIErrorHint(w, http.StatusTooManyRequests, "model_busy", msg,
+					h.hintOf(upstream.ErrModelBusy, string(respBody), bareModel, reqHasImage, uerr))
+				st.status = http.StatusTooManyRequests
+				st.outcome = reqlog.OutcomeHTTPError
+				return
+			}
 			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
 			// 上游原文回客户端（503 + upstream_busy）。上游集群排队打满时换任何
 			// 账号都撞同一堵墙——按限流处置会逐号软冷却，实测 2 秒绞杀整池健康号
@@ -1419,6 +1440,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 含 requestId，客户端按 SDK 退避重试即可。
 			code = "upstream_busy"
 			msg = "upstream capacity is full (queue.full); retry after a short wait"
+		case upstream.ErrModelBusy:
+			// 14003 模型级拥塞（防御路径：正常已在轮转循环内 fail-fast 拦截）。
+			// 429 + 可重试语义：客户端读 Retry-After 后重试，或直接换模型。
+			// 上游原文（下方统一透传）含 requestId 与 retry_policy，优先保留。
+			status = http.StatusTooManyRequests
+			code = "model_busy"
+			msg = "upstream model is busy (14003); switch models or retry after the indicated delay"
+		case upstream.ErrUpstreamInfra:
+			// 502001 上游内部鉴权失败：502 Bad Gateway + 可重试语义。不罚号、不熔断，
+			// 由客户端按 SDK 退避重试（上游恢复即自愈）。
+			status = http.StatusBadGateway
+			code = "upstream_infra_error"
+			msg = "upstream infrastructure error (502001); retry after a short wait"
 		case upstream.ErrModelBlocked:
 			// 11102「该后端无此模型」：上游原文（下方统一透传）已经写清了原因，但
 			// code 此前停在默认的 no_healthy_account —— 那是"服务端过载"的语义，
@@ -1698,6 +1732,17 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 换号也撞同一堵墙。零动作（不冷却/不熔断/不 NoteError/不喂连败，同
 		// ErrContentBlocked 待遇）；chatCompletions 已 fail-fast 503 透传原文、
 		// 终止轮转——该分支只为文档完备。
+	case upstream.ErrModelBusy:
+		// 14003「Model busy」模型级拥塞：账号余额、凭证、其它模型全部正常，只是这个
+		// 模型此刻排队。零动作（不冷却/不熔断/不 NoteError/不 NoteFailures）——
+		// 账号本身没有任何问题，罚它就是 2026-11-03 那次「11 分钟关停全池」的根因。
+		// chatCompletions 已 fail-fast 429 + Retry-After 终止轮转，该分支只为文档完备。
+	case upstream.ErrUpstreamInfra:
+		// 10000 + extError 502001「Upstream authentication failed」：上游内部到模型
+		// 后端的鉴权失败（HTTP 500），与本地账号凭证无关（本地失效是 401 + 12153）。
+		// **不喂熔断器**是这里唯一且关键的处置：ErrServer 路径连续 3 次就熔断 30 分钟，
+		// 而这类失败对所有账号同时成立，按账号记账等于把上游故障放大成整池宕机。
+		// 仍照常换号（个别连接抖动可能自愈），但不记账、不冷却。
 	case upstream.ErrModelBlocked:
 		// 11102「该后端无此模型」/11158「该账号类型无此模型权限」：
 		// (账号, 模型) 负缓存避让。复用 modelCooldowns 机制（与 6004 同域），
@@ -1761,7 +1806,8 @@ func upstreamErrorStatus(kind upstream.ErrKind) (int, string) {
 func terminalUpstreamError(kind upstream.ErrKind) bool {
 	switch kind {
 	case upstream.ErrContentBlocked, upstream.ErrPromptTooLong, upstream.ErrImageInvalid,
-		upstream.ErrBadParams, upstream.ErrChannelRefused, upstream.ErrUpstreamBusy:
+		upstream.ErrBadParams, upstream.ErrChannelRefused, upstream.ErrUpstreamBusy,
+		upstream.ErrModelBusy:
 		return true
 	default:
 		return false
@@ -1783,6 +1829,17 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// modelBusyRetryAfter 返回回给客户端的 Retry-After 时长：优先采信上游明示值
+// （14003 把 retry_after 写在 body 的 retry_policy 里，由 ParseRetryAfterBody
+// 解析进 uerr.RetryAfter），缺失时回落上游在此码上惯用的 30s。
+// 绝不回落到本地 soft_rate：那正是「30 秒变 600 秒」20 倍放大的来源。
+func modelBusyRetryAfter(uerr *upstream.Error) time.Duration {
+	if uerr != nil && uerr.RetryAfter > 0 {
+		return uerr.RetryAfter
+	}
+	return 30 * time.Second
 }
 
 // wafCooldownBase WAF 403 软冷却基数（建议 60s 起；抖动 ±25% 后落 [45s,75s]，

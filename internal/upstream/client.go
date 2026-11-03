@@ -44,6 +44,8 @@ const (
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
+	ErrModelBusy                     // 14003「too many requests / Model busy」模型级拥塞（非账号问题）→ 不罚号、不轮转，末端 429 + Retry-After
+	ErrUpstreamInfra                 // 10000 + extError 502001「Upstream authentication failed」上游内部基础设施故障（非账号问题）→ 不罚号、不喂熔断，仍换号
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -73,6 +75,10 @@ func (k ErrKind) String() string {
 		return "image_invalid"
 	case ErrUpstreamBusy:
 		return "upstream_busy"
+	case ErrModelBusy:
+		return "model_busy"
+	case ErrUpstreamInfra:
+		return "upstream_infra"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrChannelRefused:
@@ -518,6 +524,35 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// reBodyRetryAfter 匹配上游把等待时长写在 **body** 里的形态：
+// `"retry_after":30` / `"retry_after": "30"`。14003 的
+// `{"retry_policy":{"retry":true,"retry_after":30}}` 即为此形。
+var reBodyRetryAfter = regexp.MustCompile(`"retry_after"\s*:\s*"?(\d+)"?`)
+
+// ParseRetryAfterBody 从错误响应 **body** 解析上游明示的等待秒数。
+//
+// 为什么必须有：上游把 retry_after 放在 JSON body 的 retry_policy 里，而不是
+// Retry-After 响应头（实测 14003 响应不带任何限流头）。只读头的 ParseRetryAfter
+// 因此永远解析不到，冷却回落本地基数 soft_rate=600s——把上游说的「30 秒后重试」
+// 放大 20 倍成「冻结 10 分钟」。2026-11-03 实案净放大 28 倍（849s / 30s）。
+//
+// 口径与头解析一致：非正 / 超 retryAfterSanity(2h) 一律丢弃，宁缺毋滥。
+func ParseRetryAfterBody(body string) (time.Duration, bool) {
+	m := reBodyRetryAfter.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	d := time.Duration(n) * time.Second
+	if d > retryAfterSanity {
+		return 0, false
+	}
+	return d, true
+}
+
 // isAllDigits 报告 s 是否为纯数字（前置快筛，免 strconv 之后再判语义）。
 func isAllDigits(s string) bool {
 	if s == "" {
@@ -686,6 +721,17 @@ func Classify(status int, body string) ErrKind {
 	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
 		return ErrUpstreamBusy
 	}
+	// 14003「too many requests」是上游的**模型级**拥塞，不是账号级限流：
+	// displayMsg 原文「Model busy. Please switch models or retry late」，语义与
+	// 6004 同族（这个模型此刻忙），与账号余额、凭证、积分全都无关。
+	// 必须判在 status==429 兜底**之前**，否则会被当账号级软限流逐号冷却
+	// soft_rate（默认 600s）：2026-11-03 实案里 7 个账号在 3 分钟内被同一模型
+	// 的 14003 全部点名，网关把每个号各罚 600s，11 分钟内整池关停、窗口内
+	// 可用率掉到 21%，而上游自述「30 秒后重试」。换号重试对模型级拥塞同样
+	// 无效（139 次重试 100% 复现同一 429），轮转只会放大上游调用量。
+	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14003") {
+		return ErrModelBusy
+	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
 	// ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词更权威的
@@ -717,6 +763,17 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
+	}
+	// 10000「invoke model error」+ extError 502001「Upstream authentication failed」
+	// 是上游**自己**到模型后端的鉴权失败（以 HTTP 500 送达），与本地账号凭证
+	// 无关（本地凭证失效的形态是 401 + 12153 session dead）。
+	// 必须判在通用 5xx 之前：ErrServer 会喂账号熔断器（breaker_threshold=3 →
+	// breaker_cooldown=30m，指数封顶 6h），而这类失败对每个账号同时成立——
+	// 按账号熔断等于把一次上游基础设施抖动放大成整池宕机 30 分钟。
+	// 2026-11-03 实案：22 次分散命中、中间夹着成功（NoteSuccess 清零 fails），
+	// 侥幸未连击；再密集一点就是比当日 14 分钟更重的故障。
+	if status >= 500 && hasBusinessCode(body, "502001") {
+		return ErrUpstreamInfra
 	}
 	if status >= 500 {
 		return ErrServer
@@ -1332,6 +1389,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			}
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
+				ue.RetryAfter = d
+			} else if d, ok := ParseRetryAfterBody(string(raw)); ok {
+				// 头缺失时回落到 body：14003 把 retry_after 写在 retry_policy 里，
+				// 只读头会让「30 秒后重试」退化成 soft_rate 600s 本地基数。
 				ue.RetryAfter = d
 			}
 			return nil, resp.StatusCode, raw, ue
