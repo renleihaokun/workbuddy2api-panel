@@ -871,6 +871,61 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	}
 }
 
+// TestChat6000ModelResetCoolsToParsedTime 回归 2026-11-04：上游 429 + code 6000
+// （msg 带「将在 … 重置」且明确提示可切换其他模型）必须与 6004 同口径——只锁该
+// 模型、不锁整号。此前 6000 落账号级软冷却：一个模型撞限会把整号（含其他模型）
+// 冻结最长 soft_rate_max，池子被抽干后客户端只能拿到 429；上游指引恰好相反。
+func TestChat6000ModelResetCoolsToParsedTime(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var calls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":6000,"msg":"您的使用量已超出频率限制，将在 ` + ts + ` UTC+8 重置，您也可以切换其他模型继续使用。"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	}
+	// bad 已进入 6000 模型级独立冷却：账号级不 cooling，台账单行 until ≈ reset。
+	st, _ := p.Status("bad")
+	if st.Cooling {
+		t.Fatalf("6000-with-reset should NOT set account-level cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want single model ledger row glm-5.3: %+v", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
+	}
+	if !strings.HasPrefix(st.RateLimitedModels[0].Reason, "6000") {
+		t.Errorf("reason=%q want 6000 prefix (面板需区分 6004/6000)", st.RateLimitedModels[0].Reason)
+	}
+	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；不同模型 hy3-x 应豁免选中 bad。
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	same := p.PickExcludingForModel(nil, "glm-5.3")
+	if same == nil || same.UID != "good" {
+		t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
+	}
+	diff := p.PickExcludingForModel(nil, "hy3-x")
+	if diff == nil || diff.UID != "bad" {
+		t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
+	}
+}
+
 // TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
 // （现状不变）。
 func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {

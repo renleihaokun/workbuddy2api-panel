@@ -272,7 +272,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 出站头族 | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（默认 5.5.4/2.137.1，可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
 | 并发修复 | 客户端 IP 改按请求参数传递（消除共享字段竞态）；billing 单段 UA 形态 |
 | 签到幂等 | `IsAlreadyCheckin` 识别"今天已签到"（code=10001/14001），调度日志不再把重复签到当失败 |
-| 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
+| 粘性按模型判活 | 会话绑定的账号被 6004/6000 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
 **第三轮（`ea8b1e5` → `b5077d5`，2026-09-15，基础设施优先）**：
@@ -624,7 +624,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 分类 | 触发条件 | 账号处置 | 恢复 |
 |---|---|---|---|
 | 余额不足 | HTTP 402 / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
-| 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004`（模型级）带「将在 … 重置」时**冷却到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
+| 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004`/`6000`（模型级）带「将在 … 重置」时**只冷却该模型到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
@@ -1199,11 +1199,11 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 429 code=6004（模型级限流）的冷却语义？
 
-上游 `429` + `code 6004` 是**该模型的使用量超限**（msg 通常带「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」），**不是账号整体被限流**。网关的处理：
+上游 `429` + `code 6004` 是**该模型的使用量超限**（msg 通常带「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」），**不是账号整体被限流**。`code 6000`（msg 常带「您也可以切换其他模型继续使用」）是同一族的**模型级频率限制**——2026-11-04 实案：同一账号在 `glm-5.3` 上连续 6000，同一时段切到 `deepseek-v4.1-flash` 仍正常 200。两者按同一口径处置：
 
-- **冷却到上游重置时间**：msg 带「将在 … 重置」时，账号冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
-- **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
-- **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
+- **冷却到上游重置时间**：msg 带「将在 … 重置」时，该模型冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
+- **切模型立即可用**：冷却由 6004/6000 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
+- **退回指数退避**：6004/6000 无「将在 … 重置」文案，或其余 code 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
 
 ### 多图会话请求体超限怎么办？
 
@@ -1263,7 +1263,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | system 搬移学习表（24h / 上限 512）与 11-128 单次重试接线 | `internal/server/systemmode.go`（`systemModeGate`）、`internal/server/handler.go` chatCompletions 轮转内 |
 | 指纹脱敏角色范围（仅 system / developer / assistant）与 DSH 整句改写 | `internal/upstream/sanitize.go`（`sanitizeMessages` / `sanitizeFeatures` / `sanitizeRewrites`） |
 | 降级触发与次日 00:00 CST 重置 | `internal/server/degrade.go:30`（Trigger）、`:46`（nextMidnightCST） |
-| 6004 模型级限流 code 与重置时间解析 | `internal/upstream/client.go:127`、`internal/upstream/client.go:147` |
+| 6004/6000 模型级限流 code 与重置时间解析 | `internal/upstream/client.go`（`IsModelRateLimit` / `ModelRateLimitReason` / `ParseRateReset`） |
 | `11101` / Unmarshal 失败不罚号 | `internal/upstream/client.go:114-115`；处理分支 `internal/server/handler.go:489` |
 | 出站 UA 默认三段式与覆盖（空 = `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`） | `cmd/server/config.go:154`；接线 `cmd/server/main.go:158`；默认值 `internal/upstream/headers.go:19` |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/pool.go:249-253`（`sessionDeadThreshold`） |

@@ -201,7 +201,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	}
 }
 
-// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
+// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31，适用 6004/6000）：把该模型的冷却截止
 // 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
 //
 //   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
@@ -244,8 +244,8 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	}
 }
 
-// RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
-// 典型场景是 6004 没有可解析重置时间：账号仍按原有有界退避冷却，
+// RecordModelRateLimitAudit 记录无法参与模型路由的 6004/6000 展示项。
+// 典型场景是 6004/6000 没有可解析重置时间：账号仍按原有有界退避冷却，
 // 本方法只把模型名挂到 e.until 上供账号页展示，不影响 healthyForModel。
 func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	if uid == "" || model == "" {
@@ -303,7 +303,7 @@ const (
 // 写 modelCooldowns[model]，Until 为指数退避 TTL，选号侧 healthyForModel 自动对该
 // 账号避开该模型。
 //
-// 语义与 6004 正交：6004 是「模型被限流、对齐重置墙钟」，本入口是「官方确定该后端
+// 语义与 6004/6000 正交：6004/6000 是「模型被限流、对齐重置墙钟」，本入口是「官方确定该后端
 // 无此模型、重试无意义，只能换模型/换账号」。resetAt 无需传（11102 无重置文案），
 // ResetAt 保持零值，与 6004 台账共用 Until 判定——11102 条目会以 11102 reason 出现在
 // /status 台账，运维可见。
@@ -342,7 +342,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 
 // BlockModelClear 清除 (账号, 模型) 的确定性模型拒绝负缓存（11102/11158；该模型
 // 实测又通了）。半开探测或正常请求对该模型成功后调用（handler 成功路径）。只清
-// 这两类条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
+// 这两类条目、不碰 6004/6000 独立冷却表——6004/6000 有自身上游重置墙钟语义，成功不该抹掉。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
@@ -437,7 +437,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
 //
 // 语义：
-//   - resetAt 非零（上游带权威重置时间，无论 6004 还是 11140 rate-limiting）→
+//   - resetAt 非零（上游带权威重置时间，无论 6004/6000 还是 11140 rate-limiting）→
 //     账号级直到该墙钟（截断到 softRateMax，绝不指数堆加）；**不**在
 //     modelCooldowns 记模型（账号级语义，不产生切模型豁免——普通账号级限流不该
 //     因切模型绕过）。

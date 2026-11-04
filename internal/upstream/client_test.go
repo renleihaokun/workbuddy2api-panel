@@ -199,8 +199,10 @@ func TestParseRetryAfterBody(t *testing.T) {
 	}
 }
 
-// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
+// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004/6000）。
 func TestIsModelRateLimit(t *testing.T) {
+	// 2026-11-04 上游真实 6000 文案（cn:glm-5.3 触发，同账号切其他模型仍可用）。
+	const real6000 = `{"code":6000,"msg":"您的使用量已超出频率限制，将在 2026-11-04 17:38:48 UTC+8 重置，您也可以切换其他模型继续使用。","requestId":"82469d5bcd2e7b01a19cc3abe9c969d9"}`
 	cases := []struct {
 		body string
 		want bool
@@ -208,9 +210,14 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 6004：模型级限流（issue #31 的核心场景）。
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
 		{`{"code": 6004,"msg":"x"}`, true},
+		// 6000：模型级频率限制（2026-11-04 实案，此前被误按账号级冷却）。
+		{real6000, true},
+		{`{"code": 6000,"msg":"x"}`, true},
+		{`{"code":"6000","msg":"x"}`, true},
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
+		{`{"code":16000,"msg":"x"}`, false}, // 前缀含 6000 但 code 不同，不得误命中
 	}
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
@@ -219,7 +226,22 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
-// TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
+// TestModelRateLimitReason 台账 reason 带触发业务码，面板/status 可区分 6004/6000。
+func TestModelRateLimitReason(t *testing.T) {
+	cases := []struct{ body, want string }{
+		{`{"code":6004,"msg":"x"}`, "6004 model rate limit"},
+		{`{"code": 6000,"msg":"x"}`, "6000 model rate limit"},
+		{`{"code":"6000","msg":"x"}`, "6000 model rate limit"},
+		{`not json`, "model rate limit"},
+	}
+	for _, c := range cases {
+		if got := ModelRateLimitReason(c.body); got != c.want {
+			t.Errorf("ModelRateLimitReason(%q)=%q want %q", c.body, got, c.want)
+		}
+	}
+}
+
+// TestParseSoftRateReset 解析上游 429 限流 msg 里的「将在 … 重置」时间（## UTC+8）。
 func TestParseSoftRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)
 	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
@@ -230,8 +252,9 @@ func TestParseSoftRateReset(t *testing.T) {
 	}{
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		{"6000 带时间+UTC+8 后缀", `{"code":6000,"msg":"您的使用量已超出频率限制，将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 6004 判定）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
+		{"非 6004/6000 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 code 判定）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}

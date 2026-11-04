@@ -318,17 +318,23 @@ func isPromptTooLongStatus(status int) bool {
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
 
-// softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
+// softRateResetLoc 上游 429 限流文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
 var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
-// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
-// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
-const modelRateLimitCode = "6004"
+// modelRateLimitCodes 明确指向「模型级 429 限流」的业务 code：
+//   - 6004：该模型的使用量超限（msg 带「将在 … 重置」，issue #31 原始场景）；
+//   - 6000：该模型的「使用量已超出频率限制」，msg 明确带「您也可以切换其他模型继续使用」。
+//
+// 6000 此前按账号级软冷却处置（非 6004 一律 CooldownSoftRate）。2026-11-04 实案证明
+// 它是**模型级**的：同一账号在 glm-5.3 上反复 429 code=6000（重置时刻 = 该模型 5h
+// 窗口起点 + 5h），同一时段切到 deepseek-v4.1-flash 仍正常 200。按账号级处置会把整号
+// （含其他模型）冻结最长 soft_rate_max，池子被抽干后客户端只能拿到 429——与上游
+// 「您也可以切换其他模型继续使用」的指引正好相反。
+var modelRateLimitCodes = []string{"6004", "6000"}
 
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
@@ -339,7 +345,8 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	// 捕获组供 ModelRateLimitReason 取触发业务码（6004/6000）。
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?(` + strings.Join(modelRateLimitCodes, "|") + `)"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -347,11 +354,20 @@ var (
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
-// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004/6000）。
+// 用于区分"账号级软限流"（按账号冷却）与"模型级用量/频率限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
+	// `"code":6004` / `"code": 6000` / `"code":"6000"` 均可命中（JSON 空格容差）。
 	return reModelRateLimit.MatchString(body)
+}
+
+// ModelRateLimitReason 返回模型级限流冷却/台账的 reason（面板与 /status 展示用）。
+// 带上触发业务码，便于运维区分 6004（模型用量超限）与 6000（模型级频率限制）。
+func ModelRateLimitReason(body string) string {
+	if m := reModelRateLimit.FindStringSubmatch(body); len(m) > 1 {
+		return m[1] + " model rate limit"
+	}
+	return "model rate limit"
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。

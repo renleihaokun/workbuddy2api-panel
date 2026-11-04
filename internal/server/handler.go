@@ -1611,8 +1611,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //
 // 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
+//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004/6000 走模型级
+//     豁免、其余走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
 //     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
@@ -1645,13 +1645,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
-		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
-		modelRateLimited := upstream.IsModelRateLimit(body)
+		// 6004/6000 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
+		//   - 模型级（6004/6000）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
+		//   - 账号级（其余 code，或拿不到模型名）→ CooldownSoftRate：写账号级 until，
+		//     不产生模型豁免。
+		// model 为空（如搜索端点的错误路径）时不写模型台账：modelCooldowns[""] 会被
+		// modelExempt 当成有效模型豁免、在面板留一行空模型，退账号级冷却更安全。
+		modelRateLimited := model != "" && upstream.IsModelRateLimit(body)
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if modelRateLimited {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, upstream.ModelRateLimitReason(body))
 				return
 			}
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
@@ -1662,7 +1665,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		if uerr != nil && uerr.RetryAfter > 0 {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
 			if modelRateLimited {
-				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
+				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, upstream.ModelRateLimitReason(body)+" (reset unknown)")
 			}
 			return
 		}
@@ -1671,7 +1674,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// （热改优先），管理面板改 soft_rate 后立即生效。
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
 		if modelRateLimited {
-			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
+			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, upstream.ModelRateLimitReason(body)+" (reset unknown)")
 		}
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
