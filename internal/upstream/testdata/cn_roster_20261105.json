@@ -1,0 +1,356 @@
+{
+  "captured_at": "2026-11-05T14:45:53.509Z",
+  "source": "WorkBuddy client product-config snapshot (productName=WorkBuddy, deploymentType=SaaS)",
+  "models": [
+    {
+      "id": "fast-model",
+      "cli": true,
+      "context_length": 300000,
+      "max_output_tokens": 48000,
+      "efforts": [],
+      "default_effort": "medium",
+      "credits": "x0.15"
+    },
+    {
+      "id": "balanced-model",
+      "cli": true,
+      "context_length": 300000,
+      "max_output_tokens": 48000,
+      "efforts": [],
+      "default_effort": "medium",
+      "credits": "x0.50"
+    },
+    {
+      "id": "deep-model",
+      "cli": true,
+      "context_length": 300000,
+      "max_output_tokens": 48000,
+      "efforts": [],
+      "default_effort": "medium",
+      "credits": "x1.00"
+    },
+    {
+      "id": "hy4free",
+      "cli": true,
+      "context_length": 960000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "high"
+      ],
+      "default_effort": "high",
+      "credits": "x0.00"
+    },
+    {
+      "id": "hy4std",
+      "cli": true,
+      "context_length": 960000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "high"
+      ],
+      "default_effort": "high",
+      "credits": "x0.29"
+    },
+    {
+      "id": "hy3",
+      "cli": true,
+      "context_length": 192000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "low",
+        "high"
+      ],
+      "default_effort": "high",
+      "credits": "x0.00"
+    },
+    {
+      "id": "hy3-x",
+      "cli": true,
+      "context_length": 192000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "low",
+        "high"
+      ],
+      "default_effort": "high",
+      "credits": "x0.05"
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 128000,
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default_effort": "high",
+      "credits": "x0.11"
+    },
+    {
+      "id": "glm-5.3",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default_effort": "high",
+      "credits": "x0.69"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 131072,
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default_effort": "high",
+      "credits": "x0.08"
+    },
+    {
+      "id": "glm-5.2",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "high",
+      "credits": "x0.79"
+    },
+    {
+      "id": "space-bunny",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 128000,
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "max",
+      "credits": "x0.08"
+    },
+    {
+      "id": "minimax-m3.1-flash",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 128000,
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default_effort": "max",
+      "credits": "x0.08"
+    },
+    {
+      "id": "kimi-k3.1-pro",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 32000,
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default_effort": "high",
+      "credits": "x0.97"
+    },
+    {
+      "id": "kimi-k3-1",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 32000,
+      "efforts": [
+        "low",
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "high",
+      "credits": "x1.62"
+    },
+    {
+      "id": "kimi-k2.8-preview",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default_effort": "high",
+      "credits": "x0.77"
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 128000,
+      "efforts": [
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "high",
+      "credits": "x0.51"
+    },
+    {
+      "id": "step-5-preview",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "default_effort": "high",
+      "credits": "x0.33"
+    },
+    {
+      "id": "mimo-v2.6-pro",
+      "cli": true,
+      "context_length": 1000000,
+      "max_output_tokens": 128000,
+      "efforts": [],
+      "default_effort": "high",
+      "credits": "x0.13"
+    }
+  ],
+  "extra_models": [
+    {
+      "id": "deepseek-v4-flash",
+      "cli": false,
+      "context_length": 1000000,
+      "max_output_tokens": 50000,
+      "efforts": [
+        "high",
+        "xhigh"
+      ],
+      "default_effort": "high",
+      "credits": "x0.17"
+    },
+    {
+      "id": "hy4-preview-x",
+      "cli": false,
+      "context_length": 960000,
+      "max_output_tokens": 64000,
+      "efforts": [
+        "high"
+      ],
+      "default_effort": "high",
+      "credits": "x0.29"
+    }
+  ],
+  "promotions": [
+    {
+      "id": "glm-52-night-discount-202607",
+      "enabled": true,
+      "model_ids": [
+        "glm-5.2"
+      ],
+      "badge": "夜间折扣",
+      "factor": 0.5,
+      "discounted_credits": "0.50x",
+      "daily": [
+        {
+          "start": "23:00",
+          "end": "7:50"
+        }
+      ],
+      "timezone": "Asia/Shanghai",
+      "note": "每晚 23:00—次日 8:00 积分限时立减，错峰用更省",
+      "priority": 100
+    },
+    {
+      "id": "glm-52-night-discount-daytime-badge-202607",
+      "enabled": true,
+      "model_ids": [
+        "glm-5.2"
+      ],
+      "badge": "夜间折扣",
+      "daily": [
+        {
+          "start": "7:50",
+          "end": "23:00"
+        }
+      ],
+      "timezone": "Asia/Shanghai",
+      "note": "每晚 23:00—次日 8:00 积分限时立减，错峰用更省",
+      "priority": 50
+    },
+    {
+      "id": "hy3-free-trial-202608",
+      "enabled": true,
+      "model_ids": [
+        "hy3",
+        "hy3-b",
+        "hy3-c"
+      ],
+      "badge": "限时免费",
+      "factor": 0,
+      "discounted_credits": "0x",
+      "timezone": "Asia/Shanghai",
+      "note": "7月6日–11月15日，每日赠送免费额度。",
+      "priority": 200
+    },
+    {
+      "id": "ds-discount-daytime-badge-202608",
+      "enabled": true,
+      "model_ids": [
+        "deepseek-v4-flash-ioa",
+        "deepseek-v4.1-flash",
+        "deepseek-v4-pro-ioa",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro"
+      ],
+      "badge": "夜间折扣",
+      "daily": [
+        {
+          "start": "0:00",
+          "end": "23:59"
+        }
+      ],
+      "timezone": "Asia/Shanghai",
+      "note": "周一至周五 09:00–12:00、14:00–18:00 属高峰原价，非高峰期积分5折",
+      "priority": 50
+    },
+    {
+      "id": "space-bunny-discount-202610",
+      "enabled": true,
+      "model_ids": [
+        "space-bunny"
+      ],
+      "badge": "限时折扣",
+      "timezone": "Asia/Shanghai",
+      "note": "10月2日-10月7日，享限时折扣。",
+      "priority": 100
+    },
+    {
+      "id": "hy4-free-trial-202611",
+      "enabled": true,
+      "model_ids": [
+        "hy4free"
+      ],
+      "badge": "限时免费",
+      "factor": 0,
+      "discounted_credits": "0x",
+      "timezone": "Asia/Shanghai",
+      "note": "11月4日–11月15日，每日赠送免费额度，订阅用户享更高配额。",
+      "priority": 200
+    }
+  ]
+}

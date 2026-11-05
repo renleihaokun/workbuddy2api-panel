@@ -52,3 +52,48 @@ func TestPanelModelEntryStyle(t *testing.T) {
 		t.Errorf("空 name 不应被编造: %v", e["name"])
 	}
 }
+
+// TestPanelModelEntryPricing 定价字段透出：牌价（credits）、生效价（promo_factor/
+// promo_credits）、促销标签与说明；badge-only 条目不得伪造 promo_factor。
+// 价格本身来自上游实时目录，这里只锁「有值就透出、无值不编造」的契约。
+func TestPanelModelEntryPricing(t *testing.T) {
+	factor := 0.5
+	mi := upstream.ModelInfo{
+		ID:           "glm-5.2",
+		Name:         "GLM-5.2",
+		Credits:      "x0.79",
+		PromoFactor:  &factor,
+		PromoCredits: "0.50x",
+		PromoLabel:   "夜间折扣",
+		PromoNote:    "每晚 23:00—次日 8:00 积分限时立减",
+	}
+	e := panelModelEntry(modelid.StyleColon, false, "cn", mi, nil, "", nil)
+	if e["credits"] != "x0.79" {
+		t.Errorf("credits=%v want x0.79", e["credits"])
+	}
+	if v, ok := e["promo_factor"].(float64); !ok || v != 0.5 {
+		t.Errorf("promo_factor=%v want 0.5", e["promo_factor"])
+	}
+	if e["promo_credits"] != "0.50x" || e["promo_label"] != "夜间折扣" || e["promo_note"] == "" {
+		t.Errorf("促销字段透出不全: %v", e)
+	}
+
+	// badge-only（错峰类）：只有标签/说明，没有机器可读折扣 → 不应出现 promo_factor。
+	e = panelModelEntry(modelid.StyleColon, false, "cn", upstream.ModelInfo{
+		ID: "space-bunny", Credits: "x0.08", PromoLabel: "限时折扣", PromoNote: "限时活动",
+	}, nil, "", nil)
+	if _, has := e["promo_factor"]; has {
+		t.Errorf("badge-only 不应携带 promo_factor: %v", e)
+	}
+	if e["promo_label"] != "限时折扣" {
+		t.Errorf("badge-only 标签丢失: %v", e)
+	}
+
+	// 无促销：只有牌价，不编造 promo_*。
+	e = panelModelEntry(modelid.StyleColon, false, "cn", upstream.ModelInfo{ID: "hy3", Credits: "0"}, nil, "", nil)
+	for _, k := range []string{"promo_factor", "promo_credits", "promo_label", "promo_note"} {
+		if _, has := e[k]; has {
+			t.Errorf("无促销时不应有 %s: %v", k, e)
+		}
+	}
+}

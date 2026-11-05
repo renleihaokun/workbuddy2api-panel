@@ -14,12 +14,14 @@
 // 706412584 实测结论「两区是同一套 API 的两次部署」，同 id 上下文一致，无按 realm
 // 分表必要（与 effort 档位的 realm 分表刻意不同）。
 //
-// 值来源两类，逐条注释标注：
+// 值来源三类，逐条注释标注：
 //   - fork 实测：706412584 直连上游 /console/enterprises/personal/models 的
 //     maxInputTokens（/tmp/fork_diffs/70_927f57f9.diff，2026-09-13 实测；
 //     global 侧无法直测、按同 id 外推）；
 //   - models.dev：https://models.dev/ 收录值（2026-09-16 查询，取多 provider 共识值；
-//     官方源如 moonshotai/zai 优先）。未收录或歧义大者不编造。
+//     官方源如 moonshotai/zai 优先）。未收录或歧义大者不编造；
+//   - 2026-11-05 官方客户端 product-config 快照：WorkBuddy CLI 目录的
+//     maxInputTokens/maxOutputTokens（同一产品的生效上限；maxOutput 优先于厂商理论值）。
 package upstream
 
 // DefaultContextWindow 知识表也未收录的模型的 context_length 兜底：1M。
@@ -36,33 +38,44 @@ type contextCap struct {
 
 // contextCapFallback context_length / max_output_tokens 知识表（CN/global 共用）。
 // 每条注释标注来源：实测 = fork 706412584 直连 CN /console 实测 maxInputTokens
-// （global 侧为同 id 外推）；models.dev = 2026-09-16 收录共识值；估算 = 同族外推。
+// （global 侧为同 id 外推）；models.dev = 2026-09-16 收录共识值；估算 = 同族外推；
+// 2026-11-05 官方客户端 product-config = WorkBuddy 客户端 CLI 目录快照的
+// maxInputTokens/maxOutputTokens（同一产品的生效上限，优先于厂商理论值）。
 var contextCapFallback = map[string]contextCap{
 	// ---- GLM 家族（z-ai）----
-	"glm-5.2":       {context: 1000000, maxOutput: 131072}, // 实测（CN 1M；models.dev 共识 1M/131072）
+	"glm-5.2":       {context: 1000000, maxOutput: 64000},  // 实测（CN 1M）；输出 2026-11-05 官方客户端 64000
 	"glm-5.1":       {context: 200000, maxOutput: 131072},  // 实测（CN 200K；models.dev 共识 200K/131072）
-	"glm-5.3":       {context: 1000000, maxOutput: 131072}, // 实测外推 + models.dev 共识 1M/131072
-	"glm-5.3-flash": {context: 1000000, maxOutput: 131072}, // models.dev 共识 1M/131072
+	"glm-5.3":       {context: 1000000, maxOutput: 64000},  // 实测外推 1M；输出 2026-11-05 官方客户端 64000
+	"glm-5.3-flash": {context: 1000000, maxOutput: 131072}, // 2026-11-05 官方客户端 1M/131072
 	"glm-5v-turbo":  {context: 200000, maxOutput: 131072},  // 实测（CN 200K；models.dev 共识 200K/131072）
 
 	// ---- Kimi 家族（moonshot）----
-	"kimi-k2.7":         {context: 256000, maxOutput: 65536},   // 实测（CN 256K）；输出 65536 为 models.dev kimi-k2.7-code 同族估算
-	"kimi-k2.6":         {context: 256000, maxOutput: 262144},  // 实测（CN 256K）；输出 models.dev 官方 262144
+	"kimi-k3.1-pro":     {context: 1000000, maxOutput: 32000},  // 2026-11-05 官方客户端 1M/32000
+	"kimi-k3-1":         {context: 1000000, maxOutput: 32000},  // 2026-11-05 官方客户端 1M/32000
+	"kimi-k2.8-preview": {context: 1048576, maxOutput: 64000},  // models.dev 1M；输出 2026-11-05 官方客户端 64000
+	"kimi-k2.7":         {context: 256000, maxOutput: 32000},   // 实测（CN 256K）；输出 2026-11-05 官方客户端 32000
+	"kimi-k2.6":         {context: 256000, maxOutput: 32000},   // 实测（CN 256K）；输出 2026-11-05 官方客户端 32000
 	"kimi-k2.5":         {context: 164000, maxOutput: 262144},  // 实测（global 侧同 id 外推 164K）；输出 models.dev 共识 262144
 	"kimi-k3":           {context: 1048576, maxOutput: 131072}, // models.dev 官方（moonshotai 1M/128K）
-	"kimi-k2.8-preview": {context: 1048576, maxOutput: 0},      // models.dev（Kimi K2.8 Preview 1M；输出上限未收录，省略）
 
-	// ---- MiniMax / 混元（tencent）----
-	"minimax-m3":    {context: 512000, maxOutput: 512000}, // 实测（CN 512K）；输出 models.dev 共识 512000
-	"hy3":           {context: 192000, maxOutput: 64000},  // 实测（CN 192K/64K，repo hy3 抓取样本同值）
-	"hy3-preview":   {context: 262144, maxOutput: 64000},  // models.dev（共识 262144/64000）
-	"hy4-preview":   {context: 1000000, maxOutput: 64000}, // 实测外推 + models.dev（~1M/64000）
-	"hy4-preview-x": {context: 1000000, maxOutput: 64000}, // 实测外推（1M）；输出同族 hy4-preview 估算
+	// ---- MiniMax / 混元 / Step / Space / MiMo ----
+	"minimax-m3.1-flash": {context: 1000000, maxOutput: 128000}, // 2026-11-05 官方客户端 1M/128000
+	"minimax-m3":         {context: 512000, maxOutput: 64000},   // 实测（CN 512K）；输出 2026-11-05 官方客户端 64000
+	"hy3":                {context: 192000, maxOutput: 64000},   // 实测（CN 192K/64K，repo hy3 抓取样本同值）
+	"hy3-x":              {context: 192000, maxOutput: 64000},   // 2026-11-05 官方客户端 192K/64000
+	"hy3-preview":        {context: 262144, maxOutput: 64000},   // models.dev（共识 262144/64000）
+	"hy4free":            {context: 960000, maxOutput: 64000},   // 2026-11-05 官方客户端（Hy4 正式版限免通道）
+	"hy4std":             {context: 960000, maxOutput: 64000},   // 2026-11-05 官方客户端（Hy4 正式版标准通道）
+	"hy4-preview":        {context: 1000000, maxOutput: 64000},  // 实测外推 + models.dev（~1M/64000）；已退役，保留兜底
+	"hy4-preview-x":      {context: 1000000, maxOutput: 64000},  // 实测外推（1M）；输出 2026-11-05 官方客户端 64000
+	"step-5-preview":     {context: 1000000, maxOutput: 64000},  // 2026-11-05 官方客户端 1M/64000
+	"space-bunny":        {context: 1000000, maxOutput: 128000}, // 2026-11-05 官方客户端 1M/128000
+	"mimo-v2.6-pro":      {context: 1000000, maxOutput: 128000}, // 2026-11-05 官方客户端 1M/128000
 
 	// ---- DeepSeek 家族 ----
-	"deepseek-v4-pro":     {context: 1000000, maxOutput: 384000}, // 实测（CN 1M；models.dev 共识 1M/384000）
-	"deepseek-v4-flash":   {context: 1000000, maxOutput: 384000}, // 实测（CN 1M；models.dev 共识 1M/384000）
-	"deepseek-v4.1-flash": {context: 1000000, maxOutput: 384000}, // 实测外推 + models.dev 共识 1M/384000
+	"deepseek-v4-pro":     {context: 1000000, maxOutput: 128000}, // 实测（CN 1M）；输出 2026-11-05 官方客户端 128000
+	"deepseek-v4-flash":   {context: 1000000, maxOutput: 50000},  // 实测（CN 1M）；输出 2026-11-05 官方客户端 50000
+	"deepseek-v4.1-flash": {context: 1000000, maxOutput: 128000}, // 实测外推 1M；输出 2026-11-05 官方客户端 128000
 
 	// ---- OpenAI / Google（global 域家族）----
 	"gpt-6-astra":      {context: 1050000, maxOutput: 128000}, // models.dev（全 provider 一致 1050000/128000）
@@ -73,6 +86,11 @@ var contextCapFallback = map[string]contextCap{
 	"gpt-5.4":          {context: 1050000, maxOutput: 128000}, // models.dev 共识
 	"gpt-5.3-codex":    {context: 400000, maxOutput: 128000},  // models.dev（全 provider 一致 400000/128000）
 	"gemini-3.5-flash": {context: 1048576, maxOutput: 65536},  // models.dev 共识
+
+	// ---- 路由别名（固定档）----
+	"fast-model":     {context: 300000, maxOutput: 48000}, // 2026-11-05 官方客户端 300K/48K
+	"balanced-model": {context: 300000, maxOutput: 48000}, // 2026-11-05 官方客户端 300K/48K
+	"deep-model":     {context: 300000, maxOutput: 48000}, // 2026-11-05 官方客户端 300K/48K
 
 	// ---- global 域路由别名/别名模型 ----
 	"auto": {context: 168000, maxOutput: 0}, // 实测外推（fork global 静态表 168K）；输出上限未知，省略

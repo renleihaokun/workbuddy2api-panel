@@ -1045,9 +1045,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
-		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
-		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
-		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
+		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（如 deepseek-v4.1-flash
+		// 的 low/high/max，2026-10 实测）。当前探测桶为空时也按静态表降级，不全程透传。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
@@ -1847,10 +1846,15 @@ func promoActive(p *v3ModelPromotion, now time.Time) bool {
 // 最高（实测 glm-5.2 白天 badge-only(50) 与夜间五折(100) 靠 priority+daily 双轨
 // 切换）。无 discount 对象的条目也挂标签/说明（错峰类），PromoFactor 留 nil。
 func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
+	applyModelPromotionsAt(out, promos, time.Now().In(promoZone))
+}
+
+// applyModelPromotionsAt applyModelPromotions 的可注入时间版本（测试用）：
+// now 必须已是 promoZone 时区（调用方负责转换）。语义与线上完全一致。
+func applyModelPromotionsAt(out map[string]ModelInfo, promos []v3ModelPromotion, now time.Time) {
 	if len(promos) == 0 || len(out) == 0 {
 		return
 	}
-	now := time.Now().In(promoZone)
 	type cand struct {
 		prio int
 		p    *v3ModelPromotion
