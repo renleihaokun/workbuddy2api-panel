@@ -25,13 +25,14 @@ var sanitizeFeatures = []string{
 	// 的真机复现也只命中整句，所以这里不再匹配裸 "DeepSeek Harness"：否则用户
 	// 在对话里讨论 DSH、或让模型读/改含品牌词的仓库文档时，正文会被无谓改写。
 	"You are an AI agent powered by DeepSeek Harness",
-	// 审查插件（官方 dsh-auto-review + 三方 auto-review-zh）的 system/policy 身份句：
-	// 这些提示词由客户端作为独立一次模型调用的正文发出，同样按逐字指纹被拦。
-	"You are a read-only safety reviewer for a coding agent",                     // 官方 REVIEW_SYSTEM_PROMPT
-	"You are the auto-review safety reviewer of",                                 // 官方审查请求正文
-	"You are a READ-ONLY reviewer:",                                              // 官方审查请求正文第二句
-	"You are the eval reviewer of the dsh-eval engine",                           // 官方 eval 审查
-	"You are the final authorization reviewer for exactly one pending tool call", // 三方 REVIEW_POLICY
+	// 审查插件的 system/policy 身份句：这些提示词由客户端作为独立一次模型调用的
+	// 正文发出，同样按逐字指纹被拦。归属：三方 dsh-auto-review（PerryLink）四句 +
+	// 官方 @deepseek-ai/dsh-experimental-auto-review 的 REVIEW_POLICY 首句。
+	"You are a read-only safety reviewer for a coding agent",                     // 三方 dsh-auto-review REVIEW_SYSTEM_PROMPT
+	"You are the auto-review safety reviewer of",                                 // 三方 dsh-auto-review 审查请求正文
+	"You are a READ-ONLY reviewer:",                                              // 三方 dsh-auto-review 审查请求正文第二句
+	"You are the eval reviewer of the dsh-eval engine",                           // 三方 dsh-auto-review 的 eval 审查
+	"You are the final authorization reviewer for exactly one pending tool call", // 官方 auto-review 的 REVIEW_POLICY 首句
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -98,16 +99,16 @@ var sanitizeRewrites = [][2]string{
 		"You are an AI agent that helps the user with programming tasks",
 	},
 	{
-		// 官方自动审查插件 dsh-auto-review 的 REVIEW_SYSTEM_PROMPT：
+		// 三方插件 dsh-auto-review（PerryLink）的 REVIEW_SYSTEM_PROMPT：
 		// "You are a read-only safety reviewer for a coding agent. ..."
 		// 只把 reviewer 换成 checker（同一角色、语义不变），破坏逐字指纹。
 		"You are a read-only safety reviewer for a coding agent",
 		"You are a read-only safety checker for a coding agent",
 	},
 	{
-		// 官方 dsh-auto-review 审查请求正文的身份句与只读约束句。
-		// 原文以 "of DeepSeek Harness." 收尾，但品牌词另有全局改写规则——这里刻意
-		// 只匹配到 "of"，与品牌词规则解耦，任意先后顺序都能命中。
+		// 三方 dsh-auto-review 审查请求正文的身份句与只读约束句。
+		// 原文以 "of DeepSeek Harness." 收尾；品牌词本身不是指纹（详见 DSH 身份句
+		// 规则），这里刻意只匹配到 "of"，与品牌词边界解耦，任意先后顺序都能命中。
 		"You are the auto-review safety reviewer of",
 		"You are the auto-review safety checker of",
 	},
@@ -116,12 +117,14 @@ var sanitizeRewrites = [][2]string{
 		"You are a READ-ONLY checker:",
 	},
 	{
-		// 官方 dsh-auto-review 的 eval 审查身份句（dsh-eval 引擎）。
+		// 三方 dsh-auto-review 的 eval 审查身份句（dsh-eval 引擎）。
 		"You are the eval reviewer of the dsh-eval engine",
 		"You are the eval checker of the dsh-eval engine",
 	},
 	{
-		// 三方审查插件 auto-review-zh 的 REVIEW_POLICY 首句。
+		// 官方 @deepseek-ai/dsh-experimental-auto-review 的 REVIEW_POLICY 首句
+		// （中文副本 auto-review-zh 沿用同一句）。插件把它作为独立一次模型调用的
+		// system 发出，逐字命中同样被上游按通道拒绝。
 		"You are the final authorization reviewer for exactly one pending tool call",
 		"You are the final authorization checker for exactly one pending tool call",
 	},

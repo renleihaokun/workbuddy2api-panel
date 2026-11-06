@@ -485,8 +485,9 @@ func TestSanitizeLeavesUserAndToolMessagesUntouched(t *testing.T) {
 	}
 }
 
-// 审查插件（官方 dsh-auto-review + 三方 auto-review-zh）的提示词身份句同样是逐字
-// 指纹：客户端把它们作为独立一次模型调用的正文发出，上游照样按「非官方渠道」拦。
+// 审查插件的提示词身份句同样是逐字指纹：客户端把它们作为独立一次模型调用的正文
+// 发出，上游照样按「非官方渠道」拦。三方 dsh-auto-review（PerryLink）四句 + 官方
+// @deepseek-ai/dsh-experimental-auto-review 的 REVIEW_POLICY 首句。
 // 口径与既有规则一致——只把 reviewer 换成 checker，语义不变、破坏逐字匹配。
 func TestReviewPluginPromptsRewritten(t *testing.T) {
 	cases := []struct {
@@ -495,27 +496,27 @@ func TestReviewPluginPromptsRewritten(t *testing.T) {
 		want string
 	}{
 		{
-			"official REVIEW_SYSTEM_PROMPT",
+			"third-party REVIEW_SYSTEM_PROMPT",
 			"You are a read-only safety reviewer for a coding agent. Follow the verdict rules in the user message exactly.",
 			"You are a read-only safety checker for a coding agent.",
 		},
 		{
-			"official auto-review request",
+			"third-party auto-review request",
 			"You are the auto-review safety reviewer of DeepSeek Harness. A tool call is about to cross a permission boundary.",
 			"You are the auto-review safety checker of DeepSeek Harness.",
 		},
 		{
-			"official read-only sentence",
+			"third-party read-only sentence",
 			"the evidence below ONLY. You are a READ-ONLY reviewer: you cannot and must not execute",
 			"You are a READ-ONLY checker: you cannot and must not execute",
 		},
 		{
-			"official eval reviewer",
+			"third-party eval reviewer",
 			"You are the eval reviewer of the dsh-eval engine. You judge whether one finished",
 			"You are the eval checker of the dsh-eval engine.",
 		},
 		{
-			"third-party auto-review-zh",
+			"official REVIEW_POLICY",
 			"You are the final authorization reviewer for exactly one pending tool call. Your decision replaces human approval for this call.",
 			"You are the final authorization checker for exactly one pending tool call.",
 		},
