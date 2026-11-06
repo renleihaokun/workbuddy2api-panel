@@ -369,22 +369,27 @@ func fmtCreditsPrefix(raw string) string {
 // max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
 // 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
 // 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
-// 字段（零值）整体省略——不编造。
-func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
+// 字段（零值）整体省略——不编造。credits 缺失时落静态快照参考价（realm 区分，
+// 只做展示，不参与选号/计费）。
+func applyModelInfoFields(entry map[string]any, realm string, mi upstream.ModelInfo) map[string]any {
+	credits := upstream.CreditsListing(realm, mi.ID, mi.Credits)
 	if mi.Name != "" {
 		entry["name"] = mi.Name
 	}
 	if mi.Description != "" {
 		// 积分倍率前缀：从 "x0.05 credits" / "x0.29" 等格式提取纯数字，
 		// 统一为 "[x0.05 credit]" 前缀拼入 description，方便下游面板直接展示。
-		if mi.Credits != "" {
-			entry["description"] = fmtCreditsPrefix(mi.Credits) + " " + mi.Description
+		if credits != "" {
+			entry["description"] = fmtCreditsPrefix(credits) + " " + mi.Description
 		} else {
 			entry["description"] = mi.Description // descriptionZh 中文描述
 		}
 	}
-	if mi.Credits != "" {
-		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+	if credits != "" {
+		entry["credits"] = credits // 积分倍率原文（如 "x0.05"），仅展示
+		if mi.Credits == "" {
+			entry["credits_reference"] = true
+		}
 	}
 	if len(mi.Tags) > 0 {
 		entry["tags"] = mi.Tags
@@ -472,7 +477,7 @@ func (h *Handler) modelList(style modelid.Style, realmNamePrefix bool) []map[str
 			entry["max_output_tokens"] = mo
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
-		entry = applyModelInfoFields(entry, mi)
+		entry = applyModelInfoFields(entry, "cn", mi)
 		withRealmName(entry, modelid.RealmCN, realmNamePrefix)
 		// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 		// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
@@ -511,7 +516,7 @@ func (h *Handler) modelList(style modelid.Style, realmNamePrefix bool) []map[str
 			// context_length / max_output_tokens 四级查找（与 CN 动态分支同口径）。
 			var remoteCtx, remoteOut int64
 			if mi, ok := globalInfos[id]; ok {
-				entry = applyModelInfoFields(entry, mi)
+				entry = applyModelInfoFields(entry, "global", mi)
 				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
 			}
 			withRealmName(entry, modelid.RealmGlobal, realmNamePrefix)

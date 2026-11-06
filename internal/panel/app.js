@@ -708,7 +708,8 @@ function outCell(m, pr) {
    WorkBuddy 客户端显示的正是生效价。有折扣：生效价大字 + 标签 + 划线牌价，
    悬停带时段说明；无 factor 只有标签（错峰类）：牌价 + 标签。 */
 function rateCell(m) {
-  const tip = m.promo_note ? ' title="' + esc(m.promo_note) + '"' : '';
+  const tipText = m.promo_note || (m.credits_reference ? '上游未下发实时倍率，显示 2026-11-05 官方快照参考价' : '');
+  const tip = tipText ? ' title="' + esc(tipText) + '"' : '';
   if (m.promo_factor != null && m.promo_credits) {
     const base = m.credits ? ' <s style="color:var(--ink-3);font-size:11.5px">' + esc(m.credits) + '</s>' : '';
     const label = m.promo_label ? ' <span class="tag ok">' + esc(m.promo_label) + '</span>' : '';
@@ -718,7 +719,7 @@ function rateCell(m) {
     return '<span' + tip + ' style="cursor:help">' + (m.credits ? esc(m.credits) : '—') +
       ' <span class="tag warn">' + esc(m.promo_label) + '</span></span>';
   }
-  return m.credits ? esc(m.credits) : '—';
+  return m.credits ? '<span' + tip + ' style="cursor:help">' + esc(m.credits) + '</span>' : '—';
 }
 
 async function loadModels() {

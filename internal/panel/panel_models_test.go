@@ -96,4 +96,18 @@ func TestPanelModelEntryPricing(t *testing.T) {
 			t.Errorf("无促销时不应有 %s: %v", k, e)
 		}
 	}
+
+	// 远端缺 credits → 落 2026-11-05 快照参考价，并标记 credits_reference。
+	e = panelModelEntry(modelid.StyleColon, false, "cn", upstream.ModelInfo{ID: "hy4free"}, nil, "", nil)
+	if e["credits"] != "x0.00" || e["credits_reference"] != true {
+		t.Errorf("快照参考价未生效: %v", e)
+	}
+	// 远端有值 → 原样优先，不标记。
+	e = panelModelEntry(modelid.StyleColon, false, "cn", upstream.ModelInfo{ID: "hy4free", Credits: "x0.99"}, nil, "", nil)
+	if e["credits"] != "x0.99" {
+		t.Errorf("远端牌价应优先: %v", e)
+	}
+	if _, has := e["credits_reference"]; has {
+		t.Errorf("实时价不应标记 credits_reference: %v", e)
+	}
 }

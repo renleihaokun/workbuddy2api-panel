@@ -1168,7 +1168,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 |---|---|---|
 | 思考档位 | `internal/upstream/effort_catalog.go` | CN 取官方 WorkBuddy 客户端 product-config 快照（`%USERPROFILE%\.workbuddy\storage\*\scoped\*\wb-product-config.json`，当前基线 `captured_at=2026-11-05T14:45:53Z`）；global 取线上实测。按 realm 分表，不混用 |
 | 上下文 / 输出上限 | `internal/upstream/context_catalog.go` + `internal/upstream/model.json` | 同一快照的 `maxInputTokens`/`maxOutputTokens`（产品生效上限）；context 遵循「宁可高估不低估」，maxOutput 取官方值。两文件必须逐条一致 |
-| 定价（牌价/促销） | 无静态表 | `credits` 与 `modelPromotions` 由 `/v3/config` **实时**解析（1h 缓存），面板展示「生效价 + 划线牌价」；促销按当前时间窗计算。价格时效性强，**不做静态兜底**，避免过期价误导或干扰 credit-floor |
+| 定价（牌价/促销） | `internal/upstream/rate_catalog.go`（仅展示兜底） | `credits` 与 `modelPromotions` 由 `/v3/config` **实时**解析（1h 缓存），面板展示「生效价 + 划线牌价」；促销按当前时间窗计算。**远端永远优先**；只有上游缺 `credits` 时才用 2026-11-05 官方快照牌价补位并标 `credits_reference`。静态牌价不参与 `ModelRate` / credit-floor / 选号 |
 
 更新流程（改完三处后）：
 
@@ -1184,7 +1184,7 @@ WB2A_AUDIT_URL=http://127.0.0.1:7863 WB2A_AUDIT_KEY=sk-xxx \
   go test ./internal/upstream -run TestLiveCatalogAudit -v
 ```
 
-报告分三档：`FAIL`（思考模型缺档位、远端档位与静态表冲突、context 缺失）、`WARN`（缺输出上限/缺倍率）、`INFO`（上游调价、退役模型）。新模型上线后先跑一次审计，再按报告补 `effort_catalog.go` / `context_catalog.go` / `model.json`。
+报告分三档：`FAIL`（思考模型缺档位、远端档位与静态表冲突、context 缺失）、`WARN`（缺输出上限/缺倍率）、`INFO`（上游调价、退役模型）。新模型上线后先跑一次审计，再按报告补 `effort_catalog.go` / `context_catalog.go` / `model.json` / `rate_catalog.go`。
 
 ### 账号管理
 

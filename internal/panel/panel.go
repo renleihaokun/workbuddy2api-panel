@@ -285,8 +285,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 
@@ -513,7 +513,6 @@ func panelModelEntry(style modelid.Style, realmNamePrefix bool, realm string, mi
 		"can_disable_thinking": mi.CanDisableThinking,
 		"supports_reasoning":   mi.SupportsReasoning,
 		"supports_images":      mi.SupportsImages,
-		"credits":              mi.Credits,
 		"description":          mi.Description,
 		"tags":                 mi.Tags,
 		"vendor":               mi.Vendor,
@@ -522,6 +521,14 @@ func panelModelEntry(style modelid.Style, realmNamePrefix bool, realm string, mi
 		"only_reasoning":       mi.OnlyReasoning,
 		"reasoning_effort":     mi.ReasoningEffort,
 		"reasoning_summary":    mi.ReasoningSummary,
+	}
+	// 牌价：远端原文优先；上游没下发时才落 2026-11-05 官方客户端快照参考价，
+	// 并标记 credits_reference 供前端/排障区分「实时价」与「参考价」。
+	if credits := upstream.CreditsListing(realm, mi.ID, mi.Credits); credits != "" {
+		entry["credits"] = credits
+		if mi.Credits == "" {
+			entry["credits_reference"] = true
+		}
 	}
 	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣
 	//（WorkBuddy 客户端显示的就是这个生效价）。前端据此显示「生效价+标签+划线牌价」。
