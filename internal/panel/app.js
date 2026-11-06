@@ -507,7 +507,9 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      // 名字单独包一层 .nm-text：省略号只作用于名字，realm 徽标固定不收缩——
+      // 否则长邮箱名会把徽标一起裁掉（2026-11-06 面板截图反馈）。
+      '<td class="who"><div class="nm"><span class="nm-text" title="' + esc(s.nickname || '') + '">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</span>' + (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '') + (s.enterprise ? '<span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -1741,7 +1743,12 @@ const AUTO_TASKS = {
   'Sequential_Tasks_4': '小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件 → 领奖（判据待解锁验证）',
   'Sequential_Tasks_5': '小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）',
   'Sequential_Tasks_6': '小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖',
-  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）'
+  'Sequential_Tasks_7': '体验灵感功能（预留，疑 PC 口径）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）',
+  'expert_use_maidehao': '体验「中国电商运营专家」：真实召唤 + 一次真实对话 + expert_actual_use 上报',
+  'expert_use_douyinyin': '体验「抖音策略师」：真实召唤 + 一次真实对话 + expert_actual_use 上报',
+  'expert_use_shangjia_xuanchuan': '体验「商家宣传页与海报设计师」：真实召唤 + 一次真实对话 + expert_actual_use 上报',
+  'expert_use_bowangwang': '体验「直播电商教练」：真实召唤 + 一次真实对话 + expert_actual_use 上报',
+  'WorkBuddy_Valorant': '体验「无畏契约拼豆专家」：按名查专家市场 → 真实召唤 + 对话 + 上报'
 };
 
 function openTasks(uid) {

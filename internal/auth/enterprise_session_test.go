@@ -12,19 +12,27 @@ func mustJWT(t *testing.T, payload string) string {
 	return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
 }
 
-// TestIsEnterpriseSession 企业切换会话判定：JWT token_source=enterprise_switch
-// 视为企业上下文；无该声明 / 非 JWT / 空 token 一律否（老凭证零回归）；
-// enterpriseId 非空短路为真（与 IsEnterprise 同口径）。
+// TestIsEnterpriseSession 企业上下文判定（2026-11-06 改判据）：
+// 只认 JWT 里**非空 enterprise_id** 或 auth 文件的 EnterpriseID；
+// token_source=enterprise_switch 不再单独作为判据——2026-11 起 CN 侧
+// CLI 登录会给个人号也打该标记（enterprise_id 为空），实测计分正常。
 func TestIsEnterpriseSession(t *testing.T) {
 	cases := []struct {
 		name  string
 		token string
 		want  bool
 	}{
-		{"enterprise_switch", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch"}`), true},
+		// 2026-11 新形态：个人号被签成 enterprise_switch，但 enterprise_id 为空。
+		{"enterprise_switch + 空 enterprise_id", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch","enterprise_id":""}`), false},
+		{"enterprise_switch + 无 enterprise_id 键", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch"}`), false},
+		// 真企业上下文。
+		{"enterprise_switch + 非空 enterprise_id", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch","enterprise_id":"e-123"}`), true},
+		{"仅 enterprise_id（无 token_source）", mustJWT(t, `{"sub":"u1","enterprise_id":"e-123"}`), true},
+		{"enterprise_id 仅空白", mustJWT(t, `{"sub":"u1","enterprise_id":"   "}`), false},
+		// 其它形态零回归。
 		{"无 token_source 声明", mustJWT(t, `{"sub":"u1","scope":"openid profile"}`), false},
 		{"其他 token_source", mustJWT(t, `{"sub":"u1","token_source":"password"}`), false},
-		{"带填充 base64url", "hdr." + base64.URLEncoding.EncodeToString([]byte(`{"token_source":"enterprise_switch"}`)) + ".sig", true},
+		{"带填充 base64url + 非空 enterprise_id", "hdr." + base64.URLEncoding.EncodeToString([]byte(`{"enterprise_id":"e-123"}`)) + ".sig", true},
 		{"payload 非 JSON", "hdr." + base64.RawURLEncoding.EncodeToString([]byte("not-json")) + ".sig", false},
 		{"非 JWT 形态", "opaque-token", false},
 		{"空 token", "", false},
@@ -45,10 +53,10 @@ func TestIsEnterpriseSession(t *testing.T) {
 		}
 	})
 
-	t.Run("企业切换会话不影响 IsEnterprise（计费口径隔离）", func(t *testing.T) {
-		a := &Auth{UID: "u1", AccessToken: mustJWT(t, `{"token_source":"enterprise_switch"}`)}
+	t.Run("个人形态不翻转 IsEnterprise（计费口径隔离）", func(t *testing.T) {
+		a := &Auth{UID: "u1", AccessToken: mustJWT(t, `{"token_source":"enterprise_switch","enterprise_id":""}`)}
 		if a.IsEnterprise() {
-			t.Error("仅 token_source=enterprise_switch 不应翻转 IsEnterprise（额度查询仍走个人口径）")
+			t.Error("token_source=enterprise_switch 不应翻转 IsEnterprise（额度查询仍走个人口径）")
 		}
 	})
 }

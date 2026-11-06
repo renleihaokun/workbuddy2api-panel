@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
+  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（22/24）</b> · 流式 / 非流式
 </p>
 
 <p align="center">
@@ -136,7 +136,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 |---|---|
 | `f661291` | 11-128 分流、派生会话键脱敏与若干运维修复 |
 | `3bcb868` | DSH 指纹脱敏 + system→user 搬移重试 + 学习表 / 配置 / 面板开关 |
-| `5e75d0a` | 脱敏覆盖官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件身份句 |
+| `5e75d0a` | 脱敏覆盖审查插件身份句：三方 `dsh-auto-review` 四句 + 官方 `auto-review` 的 `REVIEW_POLICY` 首句 |
 | `637c86e` | 对齐 magpie 粒度：只洗 system/assistant、整句替换、通道/内容错误分流、`<instructions>` 搬移 |
 | `0765ef2` | 面板前端重构：跟随系统主题（无 JS 也生效）、按钮四态与加载反馈、毛玻璃 + 动效、WCAG AA 色板、13 个无标签 checkbox 转 label；并修掉 10 个前端 bug（失效接口、静态资源缓存、CSP 拦内联处理器、配置保存提示、用量账号标识、错误文本渲染等） |
 
@@ -160,9 +160,9 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（**默认跟随系统明暗**，可三态循环锁定；毛玻璃侧栏/顶栏/弹层 + 入场动效；七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
 
-## 🎯 成长任务一键完成（17/18）
+## 🎯 成长任务一键完成（22/24）
 
-官方「成长计划」的 18 个成长任务中，**17 个可在面板上一键纯 API 完成**——无需安装官方客户端、无需人工交互，点一下「一键完成」即自动推进进度、等待异步计分落定并**自动领奖**。剩余任务展示操作指引。
+官方「成长计划」的 24 个成长任务中，**22 个可在面板上一键纯 API 完成**——无需安装官方客户端、无需人工交互，点一下「一键完成」即自动推进进度、等待异步计分落定并**自动领奖**。剩余任务展示操作指引。
 
 ### 任务覆盖与奖励
 
@@ -184,14 +184,20 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `Hp_Appearance` | +100c +5e | 主题设置 + 皮肤生效事件 |
 | `Expert_lighthouse` | +100c +5e | 轻量云专家召唤+使用链（真实对话 requestId，**可免费领一个月轻量服务器**） |
 | `skill_1` | +100c +5e | 真实对话 + 技能加载事件（skill_info） |
+| `expert_use_maidehao` | +50c +5e | 「中国电商运营专家」：任务 `jump_url` 取 expertId → 真实召唤+对话 → expert_actual_use |
+| `expert_use_douyinyin` | +50c +5e | 「抖音策略师」：同上 |
+| `expert_use_shangjia_xuanchuan` | +50c +5e | 「商家宣传页与海报设计师」：同上 |
+| `expert_use_bowangwang` | +50c +5e | 「直播电商教练」：同上 |
+| `WorkBuddy_Valorant` | +100c +5e | 「无畏契约拼豆专家」：按名查专家市场 → 真实召唤+对话 → 上报 |
 
-**全新账号一键全做完 ≈ +1950 credits +78 能量**，其中仅数个任务涉及真实对话（`Model_chat_GLM5.2` 一条、`expert_5`/`Expert_team_use_3`/`skill_1` 各数条 fast-model 短对话），其余全部为行为事件上报，零对话消耗。
+**全新账号一键全做完 ≈ +2250 credits +78 能量**，其中仅数个任务涉及真实对话（`Model_chat_GLM5.2` 一条、`expert_5`/`Expert_team_use_3`/`skill_1`/5 个专家体验任务各数条 fast-model 短对话），其余全部为行为事件上报，零对话消耗。
 
-### 不可自动的 1 个
+### 不可自动的 2 个
 
 | 任务 | 原因 |
 |---|---|
 | `Expert_Philanthropy` | 需真实捐款（服务端领奖时校验捐赠回执，已实测无法绕过） |
+| `wb_wechat_oa_subscribe_task` | 需真实关注「腾讯 WorkBuddy」公众号满 24h，无可校验的 API（纯上报无法证明真实关注） |
 
 ### 实现原理（简述）
 
@@ -203,7 +209,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 
 「任务中心」视图把散落的任务能力收拢成一处：
 
-- **全账号任务扫描**：一键拉取每个账号的成长任务（未完成且可自动化的 19 项，含小程序口径的「校园日」与「小程序首对话」）+ 开学季待办，列表一目了然
+- **全账号任务扫描**：一键拉取每个账号的成长任务（未完成且可自动化的 24 项，含小程序口径的「校园日」与「小程序首对话」）+ 开学季待办，列表一目了然
 - **执行队列**：把待办按账号排队执行——账号内串行（与单任务/一键完成共用互斥锁），账号间可选并发（1-3）；执行进度实时更新到每个条目
 - **开学季独立状态卡**：每账号 5 任务（分享/桌面/对话×3/专家/学生认证）的状态矩阵 + 剩余抽奖次数，一键触发全账号闭环
 - **日志分频道**：运行日志按「任务 / 对话 / 系统」三个频道筛选——对话流量再大，任务结果也不会被冲掉；日志条目带频道徽标与时间
@@ -491,7 +497,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 三段式默认：CN `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`，global `WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1`；可用 `client_version` / `cli_version` 调版本段）。官网「使用端」列按出站 UA 服务端归因 |
-| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体**整句**指纹脱敏：Claude Code / Codex 模板句、裸 `11128`、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 审查插件的身份句。**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样（上游通道校验只读 system / developer 与 assistant，2026-10-21 真机 A/B） |
+| `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体**整句**指纹脱敏：Claude Code / Codex 模板句、裸 `11128`、DSH 身份句、三方 `dsh-auto-review` 与官方 `auto-review`（含中文副本 `auto-review-zh`）审查插件的身份句。**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样（上游通道校验只读 system / developer 与 assistant，2026-10-21 真机 A/B） |
 | `features.system_as_user_fallback` | `true` | **system→user 搬移重试**：只在「身份句被拒」（`request illegal` / `unapproved channel` / `illegal api invocation`）时把 system 原文搬进首条 user（`<instructions>` 包裹）、system 留中性提示词、同请求内重发一次；成功后记住该段 system（哈希，24h / 上限 512）。结构性拒绝（首条不是 system、缺会话 id）不重试；搬完仍拒 → `400 channel_refused` 终止轮转。`false` = 关闭搬移 |
 | `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`/`"cn/xxx"`/`"global/xxx"`=只藏该域（斜杠与冒号等价，大小写敏感）。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
 | `models.id_style` | `colon` | 模型列表/面板输出的 ID 分隔符：`colon`=`cn:model`（默认，既有协议，零回归）；`slash`=`cn/model`（Cherry Studio 2.x 等按 `/` 取末段匹配内置模型目录的客户端必须用这个，否则模型会被降级成无能力/上下文的「自定义模型」）。**只影响展示**：请求侧永远同时接受 `cn:`、`global:`、`cn/`、`global/` 与裸名。面板保存后热生效，无需重启 |
@@ -559,7 +565,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制），仅在 `custom` / `append` 模式下使用。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
 
-指纹脱敏的口径与 magpie 的 WorkBuddy 插件一致：**整句替换**（不做裸词替换），且**只作用于 system / developer / assistant 消息**，**user / tool 消息逐字原样**——上游通道校验只读 system（含 developer）与 assistant（2026-10-21 真机 A/B）。因此讨论 DSH、贴错误码、翻译原文、让模型读改仓库文档都不受影响；覆盖范围含 CLI 模板句、DSH 身份句、官方 `dsh-auto-review` 与三方 `auto-review-zh` 的身份句。
+指纹脱敏的口径与 magpie 的 WorkBuddy 插件一致：**整句替换**（不做裸词替换），且**只作用于 system / developer / assistant 消息**，**user / tool 消息逐字原样**——上游通道校验只读 system（含 developer）与 assistant（2026-10-21 真机 A/B）。因此讨论 DSH、贴错误码、翻译原文、让模型读改仓库文档都不受影响；覆盖范围含 CLI 模板句、DSH 身份句、三方 `dsh-auto-review` 与官方 `auto-review`（含中文副本 `auto-review-zh`）的身份句。
 
 ### 通道校验被拦：system→user 搬移重试
 
@@ -709,6 +715,8 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | `GET /activity/growth/*`（连登 / 旅行 / 热力图 / 抽奖）与 `GET /v2/activity/growth/tasks`（成长任务） | `403`「growth system is only available for personal users」 |
 
 因此网关对企业号**不发起**这五类调用（签到 / 活跃上报 / 猫猫旅行 / 夜猫子 / 连登管家），面板也不渲染「签到」「任务」按钮（只留「额度」）。判定（`auth.Auth.IsEnterprise()`）与既有 `IsGlobal()`（D4 门控）在**同一批引用处并列书写**，`upstream` 侧零改动。
+
+> **判据修正（2026-11-06）**：行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）另用 `auth.Auth.IsEnterpriseSession()` 判定——`auth` 文件 `enterpriseId` 非空，**或** AccessToken 的 JWT 里 `enterprise_id` 非空。历史实现曾把 JWT `token_source=enterprise_switch` 直接当企业上下文，但 2026-11 起 CN 侧 CLI 登录（`platform=CLI`）会给**个人号**也打该标记（`enterprise_id` 为空），实测这类号的 `/v2/report` 正常计分（连登 0→1、`first_buddy` 直接 `completed`），故该标记已不再作为判据，否则会把个人号整批误跳过。
 
 **企业版照常的能力**：选号派发、保活（token 刷新仍必需——不刷新同样会过期失效）、额度查询。
 

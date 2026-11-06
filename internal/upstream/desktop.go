@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -379,9 +380,25 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
-	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
+	return c.marketExpertListPage(a, expertType, 1, 20, "")
+}
+
+// marketExpertListPage 专家市场分页拉取（page 从 1 起；keyword 非空时走服务端关键词搜索）。
+// 拆出来是为了「按名字找专家」——市场列表默认按推荐序下发、长尾专家翻页翻不到，
+// 而 keyword 搜索能精确命中（实测 keyword=无畏契约拼豆专家 直接返回唯一一条）。
+func (c *Client) marketExpertListPage(a *auth.Auth, expertType string, page, pageSize int, keyword string) ([]MarketExpert, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	body := map[string]any{"page": page, "page_size": pageSize, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
+	}
+	if keyword != "" {
+		body["keyword"] = keyword
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -410,6 +427,49 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 		return nil, fmt.Errorf("expert list parse: %w", err)
 	}
 	return out.Experts, nil
+}
+
+// MarketExpertFindByName 在专家市场里按名称查找专家。
+// 用于「体验某专家」类任务只在标题里给名称、jump_url 不给 expertId 的形态
+// （如 WorkBuddy_Valorant「无畏契约拼豆专家」）。找不到返回 (nil, nil)，不是错误。
+//
+// 两条路：先走服务端 keyword 搜索（实测精确命中，长尾专家在推荐序里翻不到），
+// 搜不到再按推荐序翻页扫描兜底。
+func (c *Client) MarketExpertFindByName(a *auth.Auth, name string) (*MarketExpert, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, nil
+	}
+	if list, err := c.marketExpertListPage(a, "agent", 1, 20, name); err == nil && len(list) > 0 {
+		for i := range list {
+			if list[i].DisplayNameZH == name || list[i].ProfessionZH == name {
+				return &list[i], nil
+			}
+		}
+		// 搜索命中的首条即最相关（上游按相关度排序），名称被截断/加后缀时也能用。
+		if strings.Contains(list[0].DisplayNameZH, name) || strings.Contains(name, list[0].DisplayNameZH) {
+			return &list[0], nil
+		}
+	}
+	const pageSize = 100
+	for page := 1; page <= 5; page++ {
+		list, err := c.marketExpertListPage(a, "agent", page, pageSize, "")
+		if err != nil {
+			return nil, err
+		}
+		if len(list) == 0 {
+			return nil, nil
+		}
+		for i := range list {
+			if strings.Contains(list[i].DisplayNameZH, name) || strings.Contains(list[i].ProfessionZH, name) {
+				return &list[i], nil
+			}
+		}
+		if len(list) < pageSize {
+			return nil, nil // 已到最后一页
+		}
+	}
+	return nil, nil
 }
 
 // DesktopChatWithExpert 发一条真实桌面指纹 chat 请求（可带 X-Expert-Id），从 SSE 流

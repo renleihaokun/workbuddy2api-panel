@@ -10,19 +10,17 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// sessionTestScheduler 与 enterpriseTestScheduler 同构：switched=true 时账号的
-// AccessToken 为带 token_source=enterprise_switch 的 JWT（企业**切换会话**，
-// enterpriseId 为空——网关无法凭 enterpriseId 识别的形态）；false 为个人号对照组。
-func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUpstream) {
+// sessionTestSchedulerWith 用给定 JWT payload 造一个单账号调度器；
+// payload 为空表示个人号（AccessToken 为普通 opaque token）。
+func sessionTestSchedulerWith(t *testing.T, payload string) (*Scheduler, *recorderUpstream) {
 	t.Helper()
 	r := &recorderUpstream{}
 	srv := r.server()
 	t.Cleanup(srv.Close)
 
 	token := "at"
-	if switched {
-		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
-		token = "hdr." + payload + ".sig"
+	if payload != "" {
+		token = "hdr." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
 	}
 	a := &auth.Auth{UID: "u1", AccessToken: token, RefreshToken: "rt", ExpiresAt: 9999999999}
 	p := pool.New("")
@@ -38,9 +36,18 @@ func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUps
 	return s, r
 }
 
-// TestEnterpriseSessionGateSkipsBehaviorTasks 企业切换会话的行为类任务门控：
-// /v2/report 等行为事件对该形态返回 200 却被上游静默丢弃（实测 2026-10-12，
-// 15 个成长任务全部 0/x 且 90s 内进度从不跳动），执行即零收益白跑——
+// sessionTestScheduler switched=true：真企业上下文（JWT enterprise_id 非空）；
+// false：个人号对照组。
+func sessionTestScheduler(t *testing.T, switched bool) (*Scheduler, *recorderUpstream) {
+	t.Helper()
+	if switched {
+		return sessionTestSchedulerWith(t, `{"sub":"u1","token_source":"enterprise_switch","enterprise_id":"e-123"}`)
+	}
+	return sessionTestSchedulerWith(t, "")
+}
+
+// TestEnterpriseSessionGateSkipsBehaviorTasks 真企业上下文的行为类任务门控：
+// /v2/report 等行为事件对该形态返回 200 却被上游丢弃，执行即零收益白跑——
 // 活跃上报 / 连登管家 / 猫猫旅行 / 夜猫子必须一个上游调用都不发；
 // 签到不在此列（对该形态未观测到静默失败，且失败是显式报错）。
 // 每个子用例配个人号对照，证明"没发请求"是门控生效而非构造有误。
@@ -55,7 +62,7 @@ func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 		run  func(*Scheduler)
 		// endpoint 是该任务在**个人号**上必然发起的上游路径（对照组判据）。
 		endpoint string
-		// gated=true 期望切换会话不发该请求；false 期望照常发（不门控）。
+		// gated=true 期望企业上下文不发该请求；false 期望照常发（不门控）。
 		gated bool
 	}{
 		{"签到", func(s *Scheduler) { s.RunCheckinNow() }, "/daily-checkin", false},
@@ -69,10 +76,10 @@ func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 			sSess, rSess := sessionTestScheduler(t, true)
 			c.run(sSess)
 			if c.gated && rSess.has(c.endpoint) {
-				t.Errorf("企业切换会话不应发起 %s，实际请求=%v", c.endpoint, rSess.snapshot())
+				t.Errorf("企业上下文不应发起 %s，实际请求=%v", c.endpoint, rSess.snapshot())
 			}
 			if !c.gated && !rSess.has(c.endpoint) {
-				t.Errorf("企业切换会话应照常发起 %s（不门控），实际请求=%v", c.endpoint, rSess.snapshot())
+				t.Errorf("企业上下文应照常发起 %s（不门控），实际请求=%v", c.endpoint, rSess.snapshot())
 			}
 
 			sPer, rPer := sessionTestScheduler(t, false)
@@ -84,12 +91,42 @@ func TestEnterpriseSessionGateSkipsBehaviorTasks(t *testing.T) {
 	}
 }
 
-// TestEnterpriseSessionKeepsKeepalive 切换会话照常保活（token 会过期，会话
+// TestLegacyEnterpriseSwitchMarkerIsPersonal 回归：token_source=enterprise_switch
+// 但 enterprise_id 为空 = 个人号（2026-11 起 CN CLI 登录的默认形态，实测计分正常），
+// 行为类任务必须照常执行——这是 2026-11-06 改判据的核心，防回退。
+func TestLegacyEnterpriseSwitchMarkerIsPersonal(t *testing.T) {
+	restoreClock := nowForNightWindow
+	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 12, 23, 30, 0, 0, time.Local) }
+	t.Cleanup(func() { nowForNightWindow = restoreClock })
+
+	const payload = `{"sub":"u1","token_source":"enterprise_switch","enterprise_id":""}`
+	cases := []struct {
+		name     string
+		run      func(*Scheduler)
+		endpoint string
+	}{
+		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
+		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
+		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
+		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, r := sessionTestSchedulerWith(t, payload)
+			c.run(s)
+			if !r.has(c.endpoint) {
+				t.Errorf("个人号（enterprise_switch + 空 enterprise_id）应照常发起 %s，实际请求=%v", c.endpoint, r.snapshot())
+			}
+		})
+	}
+}
+
+// TestEnterpriseSessionKeepsKeepalive 企业上下文照常保活（token 会过期，会话
 // 形态不影响选号/刷新能力）。
 func TestEnterpriseSessionKeepsKeepalive(t *testing.T) {
 	s, r := sessionTestScheduler(t, true)
 	s.RunKeepaliveNow()
 	if !r.has("/token/refresh") {
-		t.Errorf("企业切换会话必须照常保活，实际请求=%v", r.snapshot())
+		t.Errorf("企业上下文必须照常保活，实际请求=%v", r.snapshot())
 	}
 }

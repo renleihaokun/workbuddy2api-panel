@@ -223,15 +223,16 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 				return
 			}
 			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			// 企业切换会话（token_source=enterprise_switch）同跳：任务列表读得到，
-			// 但执行后行为事件被上游静默丢弃（200 不计分）——每项都是零收益白跑
-			// （含 expert_5 等真实对话配额），故不入队并给出重登指引（见
-			// auth.IsEnterpriseSession）。
+			// 真企业上下文（JWT enterprise_id 非空）同跳：行为事件被上游丢弃
+			// （200 不计分）——每项都是零收益白跑（含 expert_5 等真实对话配额），
+			// 故不入队并给出重登指引。注意 token_source=enterprise_switch 自
+			// 2026-11 起也会出现在个人号上（enterprise_id 为空），那种形态计分
+			// 正常，不再跳过（见 auth.IsEnterpriseSession）。
 			if a.IsEnterprise() {
 				return
 			}
 			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证为企业切换会话（token_source=enterprise_switch），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业切换（个人身份）后重新登录", a.UID, a.Nickname)
+				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证带企业上下文（JWT enterprise_id 非空），成长任务行为事件会被上游丢弃；请移除该账号后以个人身份重新登录", a.UID, a.Nickname)
 				return
 			}
 			if growth {

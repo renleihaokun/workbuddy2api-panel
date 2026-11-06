@@ -1998,3 +1998,59 @@ process.stdout.write(JSON.stringify(out));`
 		t.Fatalf("model id separators=%s want %s", out, want)
 	}
 }
+
+// TestAppJSAccountRowKeepsRealmTag 长账号名不能把「国际版」徽标挤出可视区。
+//
+// 回归背景（2026-11-06 面板截图）：`.nm` 整块吃 overflow:hidden + ellipsis，
+// 徽标作为 `.nm` 的兄弟文本节点跟在名字后面，长邮箱名被截断时徽标一起被裁掉。
+// 修法是名字单独包 `.nm-text`（只它截断）、徽标 flex:none。这里渲染一行真实数据，
+// 断言 DOM 结构保持该形状。
+func TestAppJSAccountRowKeepsRealmTag(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; account row test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function renderAccounts');
+const end = src.indexOf('function renderModelLocks');
+if (start < 0 || end < 0) throw new Error('renderAccounts not found');
+const box = { innerHTML: '' };
+const ctx = {
+  Date, Math, String, Number, Array, JSON, RegExp,
+  esc: s => String(s),
+  remarkName: (u, n) => n,
+  rateLimitRowsHtml: () => '',
+  dur: () => '-', ago: () => '-',
+  formatTokenCount: () => '-', formatLatency: () => '-', formatRate: () => '-',
+  $: () => box,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderAccounts = renderAccounts;', ctx);
+ctx.renderAccounts([{
+  uid: '2de5eaa8-601f-4d95-957d-fe126593a596',
+  nickname: 'renleihaokun2@gmail.com',
+  realm: 'global',
+  credits: 10, credits_total: 20,
+}]);
+process.stdout.write(box.innerHTML);`
+	f, err := os.CreateTemp(t.TempDir(), "acc-row-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("account row node test failed: %v\n%s", err, out)
+	}
+	html := string(out)
+	// 名字必须在 .nm-text 里，徽标紧随其后（同一 .nm 容器内、不被名字吞掉）。
+	wantInner := `<span class="nm-text" title="renleihaokun2@gmail.com">renleihaokun2@gmail.com</span><span class="realm-tag">国际版</span></div>`
+	if !strings.Contains(html, wantInner) {
+		t.Fatalf("账号名与徽标结构不对，长名会挤掉「国际版」；got=%s", html)
+	}
+}
