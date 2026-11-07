@@ -55,59 +55,62 @@ func growthPending(t upstream.Task) bool {
 }
 
 // tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，并发拉取（账号数个位数）。
+// 只读操作，账号间并发上限走 pool.batch_concurrency（默认 3）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
-	var wg sync.WaitGroup
+	type scanJob struct {
+		idx int
+		uid string
+	}
+	var jobs []scanJob
 	for i, st := range states {
 		if st.Disabled {
 			continue
 		}
-		wg.Add(1)
-		go func(i int, uid string) {
-			defer wg.Done()
-			a := p.cfg.Pool.AuthByUID(uid)
-			if a == nil {
-				return
-			}
-			it := &items[i]
-			it.UID, it.Nickname = uid, a.Nickname
-			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-			if a.IsGlobal() {
-				return
-			}
-			// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
-			// 上游 403「growth system is only available for personal users」）。
-			if a.IsEnterprise() {
-				return
-			}
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
-				it.GrowthErr = err.Error()
-			} else {
-				for _, t := range tasks {
-					if growthPending(t) {
-						it.Growth = append(it.Growth, t)
-					}
-				}
-			}
-			// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
-			// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
-			// 静默（无 mp 任务的部署/活动结束时零影响）。
-			if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-				seen := map[string]bool{}
-				for _, t := range it.Growth {
-					seen[t.TaskCode] = true
-				}
-				for _, t := range mpTasks {
-					if growthPending(t) && !seen[t.TaskCode] {
-						it.Growth = append(it.Growth, t)
-					}
-				}
-			}
-		}(i, st.UID)
+		jobs = append(jobs, scanJob{idx: i, uid: st.UID})
 	}
-	wg.Wait()
+	p.cfg.Pool.BatchForEach(len(jobs), func(k int) {
+		j := jobs[k]
+		a := p.cfg.Pool.AuthByUID(j.uid)
+		if a == nil {
+			return
+		}
+		it := &items[j.idx]
+		it.UID, it.Nickname = j.uid, a.Nickname
+		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
+		if a.IsGlobal() {
+			return
+		}
+		// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
+		// 上游 403「growth system is only available for personal users」）。
+		if a.IsEnterprise() {
+			return
+		}
+		if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
+			it.GrowthErr = err.Error()
+		} else {
+			for _, t := range tasks {
+				if growthPending(t) {
+					it.Growth = append(it.Growth, t)
+				}
+			}
+		}
+		// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
+		// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
+		// 静默（无 mp 任务的部署/活动结束时零影响）。
+		if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
+			seen := map[string]bool{}
+			for _, t := range it.Growth {
+				seen[t.TaskCode] = true
+			}
+			for _, t := range mpTasks {
+				if growthPending(t) && !seen[t.TaskCode] {
+					it.Growth = append(it.Growth, t)
+				}
+			}
+		}
+	})
 	pending := 0
 	for _, it := range items {
 		pending += len(it.Growth)
@@ -204,8 +207,8 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	states := p.cfg.Pool.List()
 
 	var accts []queueAccount
-	var wg sync.WaitGroup
 	var mu sync.Mutex
+	var scanAccts []*auth.Auth
 	for _, st := range states {
 		if st.Disabled {
 			continue
@@ -214,61 +217,62 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 		if a == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(a *auth.Auth) {
-			defer wg.Done()
-			one := queueAccount{a: a}
-			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-			if a.IsGlobal() {
-				return
-			}
-			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			// 真企业上下文（JWT enterprise_id 非空）同跳：行为事件被上游丢弃
-			// （200 不计分）——每项都是零收益白跑（含 expert_5 等真实对话配额），
-			// 故不入队并给出重登指引。注意 token_source=enterprise_switch 自
-			// 2026-11 起也会出现在个人号上（enterprise_id 为空），那种形态计分
-			// 正常，不再跳过（见 auth.IsEnterpriseSession）。
-			if a.IsEnterprise() {
-				return
-			}
-			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证带企业上下文（JWT enterprise_id 非空），成长任务行为事件会被上游丢弃；请移除该账号后以个人身份重新登录", a.UID, a.Nickname)
-				return
-			}
-			if growth {
-				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
-					for _, t := range tasks {
-						if growthPending(t) {
+		scanAccts = append(scanAccts, a)
+	}
+	// 扫描段并发上限走 pool.batch_concurrency；执行段的账号并发仍由
+	// runQueueItems 的 1-4 信号量控制（那是用户显式选择，且含真实对话）。
+	p.cfg.Pool.BatchForEach(len(scanAccts), func(i int) {
+		a := scanAccts[i]
+		one := queueAccount{a: a}
+		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
+		if a.IsGlobal() {
+			return
+		}
+		// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
+		// 真企业上下文（JWT enterprise_id 非空）同跳：行为事件被上游丢弃
+		// （200 不计分）——每项都是零收益白跑（含 expert_5 等真实对话配额），
+		// 故不入队并给出重登指引。注意 token_source=enterprise_switch 自
+		// 2026-11 起也会出现在个人号上（enterprise_id 为空），那种形态计分
+		// 正常，不再跳过（见 auth.IsEnterpriseSession）。
+		if a.IsEnterprise() {
+			return
+		}
+		if a.IsEnterpriseSession() {
+			log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证带企业上下文（JWT enterprise_id 非空），成长任务行为事件会被上游丢弃；请移除该账号后以个人身份重新登录", a.UID, a.Nickname)
+			return
+		}
+		if growth {
+			if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+				for _, t := range tasks {
+					if growthPending(t) {
+						one.grow = append(one.grow, t)
+					}
+				}
+				// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
+				// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
+				// mp 待办而队列报"无可执行待办"。
+				if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+					seen := map[string]bool{}
+					for _, t := range one.grow {
+						seen[t.TaskCode] = true
+					}
+					for _, t := range mpTasks {
+						if growthPending(t) && !seen[t.TaskCode] {
 							one.grow = append(one.grow, t)
 						}
 					}
-					// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
-					// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
-					// mp 待办而队列报"无可执行待办"。
-					if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
-						seen := map[string]bool{}
-						for _, t := range one.grow {
-							seen[t.TaskCode] = true
-						}
-						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
-								one.grow = append(one.grow, t)
-							}
-						}
-					}
-					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
-						return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
-					})
 				}
+				sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
+					return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
+				})
 			}
-			if len(one.grow) > 0 {
-				mu.Lock()
-				accts = append(accts, one)
-				mu.Unlock()
-			}
-		}(a)
-	}
-	wg.Wait()
+		}
+		if len(one.grow) > 0 {
+			mu.Lock()
+			accts = append(accts, one)
+			mu.Unlock()
+		}
+	})
 
 	// 组装队列（账号分组，保持顺序）。
 	var items []queueItem
@@ -498,8 +502,11 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		Err      string                   `json:"error,omitempty"`
 	}
 	out := make([]row, len(accts))
-	sem := make(chan struct{}, 3)
-	var wg sync.WaitGroup
+	type voucherJob struct {
+		idx int
+		a   *auth.Auth
+	}
+	var jobs []voucherJob
 	for i, st := range accts {
 		if st.Disabled {
 			continue // 未占位，行末统一压掉
@@ -508,27 +515,26 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		if a == nil {
 			continue
 		}
-		wg.Add(1)
-		go func(i int, a *auth.Auth) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			it := row{UID: a.UID, Nickname: a.Nickname}
-			switch {
-			case a.IsGlobal():
-				it.Err = "global realm（无开学季活动）"
-			default:
-				vs, err := p.cfg.Upstream.SchoolVouchers(a)
-				if err != nil {
-					it.Err = err.Error()
-				} else {
-					it.Vouchers = vs
-				}
-			}
-			out[i] = it
-		}(i, a)
+		jobs = append(jobs, voucherJob{idx: i, a: a})
 	}
-	wg.Wait()
+	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
+	p.cfg.Pool.BatchForEach(len(jobs), func(k int) {
+		j := jobs[k]
+		a := j.a
+		it := row{UID: a.UID, Nickname: a.Nickname}
+		switch {
+		case a.IsGlobal():
+			it.Err = "global realm（无开学季活动）"
+		default:
+			vs, err := p.cfg.Upstream.SchoolVouchers(a)
+			if err != nil {
+				it.Err = err.Error()
+			} else {
+				it.Vouchers = vs
+			}
+		}
+		out[j.idx] = it
+	})
 	res := make([]row, 0, len(out))
 	for _, it := range out {
 		if it.UID != "" {

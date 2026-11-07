@@ -42,10 +42,23 @@ type TaskSweepStats struct {
 
 // RunTaskSweepOnce 对所有账号做一轮幂等补领清扫（账号间并发、账号内串行）。
 // 由 scheduler 的 ticker 调用（详见 scheduler.StartTaskSweep）。
+//
+// 单飞：上一轮没结束（上游慢/账号多）时直接跳过本轮并返回零值统计——15 分钟
+// ticker 不该在慢轮上再叠一批并发。并发上限走 pool.batch_concurrency。
 func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 	var st TaskSweepStats
+	if !p.sweepRun.TryLock() {
+		log.Printf("panel: 任务补领清扫上一轮仍在执行，跳过本轮")
+		return st
+	}
+	defer p.sweepRun.Unlock()
+
 	var mu sync.Mutex
-	var wg sync.WaitGroup
+	type sweepTarget struct {
+		a   *auth.Auth
+		uid string
+	}
+	var targets []sweepTarget
 
 	for _, ps := range p.cfg.Pool.List() {
 		if ps.Disabled {
@@ -55,22 +68,21 @@ func (p *Panel) RunTaskSweepOnce() TaskSweepStats {
 		if a == nil || a.IsGlobal() || a.IsEnterpriseSession() {
 			continue // 无个人成长体系（含企业切换会话）：零上游请求
 		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			r := p.sweepAccount(a, uid)
-			mu.Lock()
-			defer mu.Unlock()
-			st.Accounts += r.accounts
-			st.Skipped += r.skipped
-			st.Accepted += r.accepted
-			st.Claimed += r.claimed
-			st.Credits += r.credit
-			st.Energy += r.energy
-			st.Errors += r.errors
-		}(a, ps.UID)
+		targets = append(targets, sweepTarget{a: a, uid: ps.UID})
 	}
-	wg.Wait()
+
+	p.cfg.Pool.BatchForEach(len(targets), func(i int) {
+		r := p.sweepAccount(targets[i].a, targets[i].uid)
+		mu.Lock()
+		defer mu.Unlock()
+		st.Accounts += r.accounts
+		st.Skipped += r.skipped
+		st.Accepted += r.accepted
+		st.Claimed += r.claimed
+		st.Credits += r.credit
+		st.Energy += r.energy
+		st.Errors += r.errors
+	})
 
 	if st.Claims() > 0 || st.Errors > 0 || st.Accepted > 0 {
 		log.Printf("panel: 任务补领清扫：%d 个账号（跳过 %d）· 接受 %d · 领奖 %d · +%d 分 +%d 能 · 出错 %d",

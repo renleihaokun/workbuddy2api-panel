@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/batch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -97,6 +98,18 @@ type Scheduler struct {
 	// 供面板「到期提醒」标注数据年龄：卡片展示的是这份快照，必须让年龄可读，
 	// 否则界面 5 秒轮询会让人误以为数据也是 5 秒级新鲜。
 	lastBalanceRefresh atomic.Int64
+
+	// 批量任务单飞：同一任务同一时刻只允许一轮，避免「定时器 + 面板按钮」或
+	// 重复点击把同一批账号打两遍。
+	//   - balanceRun 用 Coalescer 合并：手动刷新恰逢后台在跑时等它结束（数据就是
+	//     刚查回来那份），不重复打上游；
+	//   - 其余四个任务用 TryLock 跳过：动作幂等但重复跑纯属浪费配额，直接让
+	//     后来者拿到 false / 打一行跳过日志。
+	balanceRun   batch.Coalescer
+	checkinRun   sync.Mutex
+	travelRun    sync.Mutex
+	activityRun  sync.Mutex
+	keepaliveRun sync.Mutex
 }
 
 // New 构建。
@@ -463,7 +476,20 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) RunCheckinNow() {
+//
+// 返回 false 表示上一轮仍在执行、本次触发被单飞跳过（面板据此如实回显）。
+func (s *Scheduler) RunCheckinNow() bool {
+	if !s.checkinRun.TryLock() {
+		log.Printf("checkin: 上一轮仍在执行，跳过本次触发")
+		return false
+	}
+	defer s.checkinRun.Unlock()
+	s.runCheckin()
+	return true
+}
+
+// runCheckin 签到任务体（不含单飞锁，供 RunCheckinNow / StartCheckin 共用）。
+func (s *Scheduler) runCheckin() {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -530,12 +556,24 @@ func (s *Scheduler) RunCheckinNow() {
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
-func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+func (s *Scheduler) RunActivityNow() bool {
+	return s.runActivity(context.Background())
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+// 返回 false 表示上一轮仍在执行、本次触发被单飞跳过。
+func (s *Scheduler) runActivity(ctx context.Context) bool {
+	if !s.activityRun.TryLock() {
+		log.Printf("activity: 上一轮仍在执行，跳过本次触发")
+		return false
+	}
+	defer s.activityRun.Unlock()
+	s.runActivityBody(ctx)
+	return true
+}
+
+// runActivityBody 活跃上报任务体（不含单飞锁，供 runActivity / StartActivity 共用）。
+func (s *Scheduler) runActivityBody(ctx context.Context) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -603,7 +641,20 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
-func (s *Scheduler) RunKeepaliveNow() {
+//
+// 返回 false 表示上一轮仍在执行、本次触发被单飞跳过。
+func (s *Scheduler) RunKeepaliveNow() bool {
+	if !s.keepaliveRun.TryLock() {
+		log.Printf("keepalive: 上一轮仍在执行，跳过本次触发")
+		return false
+	}
+	defer s.keepaliveRun.Unlock()
+	s.runKeepalive()
+	return true
+}
+
+// runKeepalive 保活任务体（不含单飞锁）。
+func (s *Scheduler) runKeepalive() {
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -630,6 +681,40 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
+// startAsync 非阻塞触发批量任务（面板按钮用）：已在跑返回 false，不排队、不重复。
+// 与 RunXxxNow 共用同一把单飞锁——定时器与按钮谁先到谁跑，另一个被挡。
+func (s *Scheduler) startAsync(mu *sync.Mutex, name string, fn func()) bool {
+	if !mu.TryLock() {
+		log.Printf("%s: 上一轮仍在执行，跳过本次触发", name)
+		return false
+	}
+	go func() {
+		defer mu.Unlock()
+		fn()
+	}()
+	return true
+}
+
+// StartCheckin 面板「全部签到」：已在跑返回 false。
+func (s *Scheduler) StartCheckin() bool {
+	return s.startAsync(&s.checkinRun, "checkin", s.runCheckin)
+}
+
+// StartTravel 面板「旅行巡检」：已在跑返回 false。
+func (s *Scheduler) StartTravel() bool {
+	return s.startAsync(&s.travelRun, "travel", s.runTravel)
+}
+
+// StartActivity 面板「活跃上报」：已在跑返回 false。
+func (s *Scheduler) StartActivity() bool {
+	return s.startAsync(&s.activityRun, "activity", func() { s.runActivityBody(context.Background()) })
+}
+
+// StartKeepalive 面板「全部保活」：已在跑返回 false。
+func (s *Scheduler) StartKeepalive() bool {
+	return s.startAsync(&s.keepaliveRun, "keepalive", s.runKeepalive)
+}
+
 // poolExpiryBuckets 把 upstream 的按日到期批次转换为 pool 结构。两个包字段同构，
 // 手工转换是为了不让底层 pool 反向依赖 upstream。
 func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
@@ -650,28 +735,38 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
+//
+// 并发上限走 pool.BatchForEach（pool.batch_concurrency，默认 3）。本轮进行中再次
+// 触发（定时器撞面板手动刷新）由 Coalescer 合并：等待方在这轮结束后返回，数据就是
+// 刚查回来那份，不重复打上游。
 func (s *Scheduler) RunBalanceRefreshNow() {
-	var wg sync.WaitGroup
-	expiringSoon := s.ExpiringSoonWindow()
-	includeDisabled := s.includeDisabledInTasks()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
-			continue
+	s.balanceRun.Do(func() {
+		expiringSoon := s.ExpiringSoonWindow()
+		includeDisabled := s.includeDisabledInTasks()
+		type target struct {
+			uid string
+			a   *auth.Auth
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
+		var targets []target
+		for _, st := range s.cfg.Pool.List() {
+			if st.Disabled && !includeDisabled {
+				continue
+			}
+			a := s.cfg.Pool.AuthByUID(st.UID)
+			if a == nil {
+				continue
+			}
+			targets = append(targets, target{uid: st.UID, a: a})
 		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
+		s.cfg.Pool.BatchForEach(len(targets), func(i int) {
+			t := targets[i]
+			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(t.a, expiringSoon)
 			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				log.Printf("balance %s: %v", logfmt.Label(t.uid, t.a.Nickname), err)
 				return
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+			s.cfg.Pool.ReenableIfCredits(t.uid, remain, total)
+			s.cfg.Pool.SetCreditsSnapshot(t.uid, pool.CreditsSnapshot{
 				Remain:            remain,
 				Total:             total,
 				Expiring:          expiring,
@@ -679,10 +774,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				EarliestRemaining: earliestRemaining,
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
-			}(a, st.UID)
-	}
-	wg.Wait()
-	s.lastBalanceRefresh.Store(time.Now().UnixNano())
+		})
+		s.lastBalanceRefresh.Store(time.Now().UnixNano())
+	})
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。

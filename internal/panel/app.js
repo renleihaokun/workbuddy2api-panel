@@ -657,19 +657,35 @@ $('accBody').addEventListener('click', async ev => {
 });
 
 $('btnCheckinAll').onclick = async () => {
-  try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
+  try {
+    const d = await api('checkin_all', { method: 'POST' });
+    const skipped = d && d.started === false;
+    toast(skipped ? '上一轮签到仍在执行，本次已跳过' : '全部签到已开始，结果见日志', skipped ? '' : 'ok');
+  }
   catch (e) { toast(e.message, 'err'); }
 };
 $('btnKeepaliveAll').onclick = async () => {
-  try { await api('keepalive_all', { method: 'POST' }); toast('全部保活已开始，结果见日志', 'ok'); }
+  try {
+    const d = await api('keepalive_all', { method: 'POST' });
+    const skipped = d && d.started === false;
+    toast(skipped ? '上一轮保活仍在执行，本次已跳过' : '全部保活已开始，结果见日志', skipped ? '' : 'ok');
+  }
   catch (e) { toast(e.message, 'err'); }
 };
 $('btnTravelAll').onclick = async () => {
-  try { await api('travel_all', { method: 'POST' }); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); }
+  try {
+    const d = await api('travel_all', { method: 'POST' });
+    const skipped = d && d.started === false;
+    toast(skipped ? '上一轮旅行巡检仍在执行，本次已跳过' : '旅行巡检已开始（含领养链路），结果见日志', skipped ? '' : 'ok');
+  }
   catch (e) { toast(e.message, 'err'); }
 };
 $('btnActivityAll').onclick = async () => {
-  try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
+  try {
+    const d = await api('activity_all', { method: 'POST' });
+    const skipped = d && d.started === false;
+    toast(skipped ? '上一轮活跃上报仍在执行，本次已跳过' : '活跃上报已开始，结果见日志', skipped ? '' : 'ok');
+  }
   catch (e) { toast(e.message, 'err'); }
 };
 
@@ -1254,6 +1270,7 @@ const CFG_MAP = {
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
+  batch_concurrency: ['pool', 'batch_concurrency'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],

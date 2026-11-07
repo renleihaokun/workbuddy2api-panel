@@ -13,7 +13,6 @@ package scheduler
 import (
 	"errors"
 	"log"
-	"sync"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -117,29 +116,31 @@ func (s *Scheduler) CompensationStatusAll() []CompensationRow {
 	targets := s.compTargets()
 	rows := make([]CompensationRow, len(targets))
 
-	sem := make(chan struct{}, 3)
-	var wg sync.WaitGroup
+	// 只把需要发请求的账号收进工作列表：跳过行直接按原下标写好，行序与 Pool.List 一致。
+	type idxTarget struct {
+		i int
+		t compTarget
+	}
+	var work []idxTarget
 	for i, t := range targets {
 		if t.a == nil {
 			rows[i] = CompensationRow{UID: t.uid, Nickname: t.nick, Skip: t.skip, SkipMsg: t.msg}
 			continue
 		}
-		wg.Add(1)
-		go func(i int, t compTarget) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			row := CompensationRow{UID: t.uid, Nickname: t.nick}
-			st, err := s.cfg.Upstream.GetCompensationStatus(t.a)
-			if err != nil {
-				row.Error = err.Error()
-			} else {
-				row.Status = st
-			}
-			rows[i] = row
-		}(i, t)
+		work = append(work, idxTarget{i: i, t: t})
 	}
-	wg.Wait()
+	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
+	s.cfg.Pool.BatchForEach(len(work), func(k int) {
+		w := work[k]
+		row := CompensationRow{UID: w.t.uid, Nickname: w.t.nick}
+		st, err := s.cfg.Upstream.GetCompensationStatus(w.t.a)
+		if err != nil {
+			row.Error = err.Error()
+		} else {
+			row.Status = st
+		}
+		rows[w.i] = row
+	})
 	return rows
 }
 

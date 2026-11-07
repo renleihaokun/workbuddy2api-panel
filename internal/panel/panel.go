@@ -101,6 +101,10 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// sweepRun 任务补领清扫单飞：上一轮未结束时（上游慢/账号多）跳过本轮，
+	// 避免 15 分钟 ticker 与手动入口叠加出两批并发清扫。
+	sweepRun sync.Mutex
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -757,14 +761,19 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
+// started=false 表示上一轮签到仍在执行、本次触发被单飞跳过（前端据此如实提示）。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	started := p.cfg.Scheduler.StartCheckin()
+	msg := "全部签到已开始，结果见日志"
+	if !started {
+		msg = "上一轮签到仍在执行，本次已跳过"
+	}
+	log.Printf("panel: 手动全量签到触发：started=%v", started)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": started, "message": msg})
 }
 
 // travelAll 手动触发全量猫猫旅行巡检（异步执行）。
@@ -773,9 +782,13 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
-	log.Printf("panel: 手动全量旅行巡检已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	started := p.cfg.Scheduler.StartTravel()
+	msg := "旅行巡检已开始（含领养链路），结果见日志"
+	if !started {
+		msg = "上一轮旅行巡检仍在执行，本次已跳过"
+	}
+	log.Printf("panel: 手动全量旅行巡检触发：started=%v", started)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": started, "message": msg})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
@@ -784,9 +797,13 @@ func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
-	log.Printf("panel: 手动全量活跃上报已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	started := p.cfg.Scheduler.StartActivity()
+	msg := "活跃上报已开始，结果见日志"
+	if !started {
+		msg = "上一轮活跃上报仍在执行，本次已跳过"
+	}
+	log.Printf("panel: 手动全量活跃上报触发：started=%v", started)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": started, "message": msg})
 }
 
 // keepaliveAll 手动触发全量 token 保活（异步执行）。
@@ -795,9 +812,13 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
-	log.Printf("panel: 手动全量保活已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	started := p.cfg.Scheduler.StartKeepalive()
+	msg := "全部保活已开始，结果见日志"
+	if !started {
+		msg = "上一轮保活仍在执行，本次已跳过"
+	}
+	log.Printf("panel: 手动全量保活触发：started=%v", started)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": started, "message": msg})
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
@@ -933,30 +954,23 @@ func (p *Panel) syncNicknames() {
 		mu      sync.Mutex
 		updated int
 		failed  int
-		sem     = make(chan struct{}, 3)
-		wg      sync.WaitGroup
 	)
-	for _, j := range jobs {
-		wg.Add(1)
-		go func(j job) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
-			if err != nil {
-				mu.Lock()
-				failed++
-				mu.Unlock()
-				return
-			}
-			if p.cfg.Pool.SetNickname(j.uid, nick) {
-				mu.Lock()
-				updated++
-				mu.Unlock()
-			}
-		}(j)
-	}
-	wg.Wait()
+	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
+	p.cfg.Pool.BatchForEach(len(jobs), func(k int) {
+		j := jobs[k]
+		nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
+		if err != nil {
+			mu.Lock()
+			failed++
+			mu.Unlock()
+			return
+		}
+		if p.cfg.Pool.SetNickname(j.uid, nick) {
+			mu.Lock()
+			updated++
+			mu.Unlock()
+		}
+	})
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
 	}
@@ -1055,35 +1069,27 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]row, len(accts))
 
-	sem := make(chan struct{}, 3)
-	var wg sync.WaitGroup
-	for i, s := range accts {
-		wg.Add(1)
-		go func(i int, s pool.Status) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
-			a := p.cfg.Pool.AuthByUID(s.UID)
-			if a == nil {
-				it.Error = "account not loaded"
-				out[i] = it
-				return
-			}
-			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
-			if err != nil {
-				it.Error = err.Error()
-				out[i] = it
-				return
-			}
-			it.Packages = packs
-			it.Remain = remain
-			it.Size = size
+	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
+	p.cfg.Pool.BatchForEach(len(accts), func(i int) {
+		s := accts[i]
+		it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+		a := p.cfg.Pool.AuthByUID(s.UID)
+		if a == nil {
+			it.Error = "account not loaded"
 			out[i] = it
-		}(i, s)
-	}
-	wg.Wait()
+			return
+		}
+		packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+		if err != nil {
+			it.Error = err.Error()
+			out[i] = it
+			return
+		}
+		it.Packages = packs
+		it.Remain = remain
+		it.Size = size
+		out[i] = it
+	})
 
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })

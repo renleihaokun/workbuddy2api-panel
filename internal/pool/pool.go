@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/batch"
 )
 
 type Pool struct {
@@ -69,6 +70,11 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// batchGate 控制面批量任务的共享并发闸门（余额刷新 / 任务补领清扫 / 任务中心
+	// 扫描等「按账号扇出」的任务统一从这里取名额）。与 maxInFlight 正交：后者管
+	// 数据面单号在途，前者管后台批量任务的账号并发总数，两者互不占用名额。
+	// 由 SetBatchConcurrency 注入；零值 Pool 由 batchGateHandle 懒创建兜底。
+	batchGate *batch.Gate
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -108,6 +114,7 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		batchGate:           batch.NewGate(batch.Default),
 	}
 	if stateFp != "" {
 		p.load()
@@ -278,6 +285,35 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 	if n >= 0 {
 		p.maxInFlightGlobal = n
 	}
+}
+
+// batchGateHandle 返回批量闸门实例（零值 Pool / 测试裸构造时懒创建，等价默认上限）。
+// 只在取闸门指针时短暂持 p.mu；后续 ForEach/Acquire 不再持池锁。
+func (p *Pool) batchGateHandle() *batch.Gate {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.batchGate == nil {
+		p.batchGate = batch.NewGate(batch.Default)
+	}
+	return p.batchGate
+}
+
+// SetBatchConcurrency 注入控制面批量任务的账号并发上限（pool.batch_concurrency）。
+// <=0 回落默认 3，>8 钳到 8；面板保存后热生效——正在跑的一轮按旧上限，下一轮起
+// 用新值。与 max_in_flight 无关：它只管余额刷新/补领清扫/任务扫描这类批量任务。
+func (p *Pool) SetBatchConcurrency(n int) {
+	p.batchGateHandle().Set(n)
+}
+
+// BatchConcurrency 返回当前生效的批量并发上限。
+func (p *Pool) BatchConcurrency() int {
+	return p.batchGateHandle().Limit()
+}
+
+// BatchForEach 以不超过批量上限的并发对 0..n-1 各执行一次 fn。
+// 供 scheduler / panel 的批量任务复用；fn 内不得再调用 BatchForEach（禁止嵌套占位）。
+func (p *Pool) BatchForEach(n int, fn func(int)) {
+	p.batchGateHandle().ForEach(n, fn)
 }
 
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；

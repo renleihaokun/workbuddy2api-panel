@@ -212,6 +212,35 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 }
 
+// TestBatchConcurrencyConfig 控制面批量并发上限：默认 3、显式值生效、越界收敛。
+func TestBatchConcurrencyConfig(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.BatchConcurrency != 3 {
+		t.Fatalf("默认 batch_concurrency=%d want 3", c.Pool.BatchConcurrency)
+	}
+	cases := []struct {
+		raw  string
+		want int
+	}{
+		{`{"pool":{"batch_concurrency":5}}`, 5},
+		{`{"pool":{"batch_concurrency":0}}`, 3},
+		{`{"pool":{"batch_concurrency":-2}}`, 3},
+		{`{"pool":{"batch_concurrency":99}}`, 8},
+	}
+	for _, tc := range cases {
+		cfg, err := ParseConfig([]byte(tc.raw))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if got := cfg.Pool.BatchConcurrency; got != tc.want {
+			t.Errorf("%s -> batch_concurrency=%d want %d", tc.raw, got, tc.want)
+		}
+	}
+}
+
 func TestSoftRateMaxParsedFromFile(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

@@ -35,6 +35,8 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "task_sweep_enabled": true,
+    "task_sweep_minutes": 15,
     "include_disabled_in_tasks": false
   },
   "global": {
@@ -86,6 +88,7 @@
     },
     "max_in_flight": 3,
     "max_in_flight_global": 2,
+    "batch_concurrency": 3,
     "breaker_threshold": 3,
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",

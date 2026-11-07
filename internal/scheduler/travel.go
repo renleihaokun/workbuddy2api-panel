@@ -46,7 +46,20 @@ func travelDay(t time.Time) string {
 // 领奖 + 领养前置上报），不发模型对话，与「让位防风控」不冲突；
 // 401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
-func (s *Scheduler) RunTravelNow() {
+//
+// 返回 false 表示上一轮仍在执行、本次触发被单飞跳过。
+func (s *Scheduler) RunTravelNow() bool {
+	if !s.travelRun.TryLock() {
+		log.Printf("travel: 上一轮仍在执行，跳过本次触发")
+		return false
+	}
+	defer s.travelRun.Unlock()
+	s.runTravel()
+	return true
+}
+
+// runTravel 旅行巡检任务体（不含单飞锁）。
+func (s *Scheduler) runTravel() {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {

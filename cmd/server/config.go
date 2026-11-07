@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/batch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
@@ -217,13 +218,18 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		Strategy           pool.RegionStrategies   `json:"strategy"`
-		AccountOrder       pool.RegionAccountOrder `json:"account_order,omitempty"`
-		MaxInFlight        int                     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int                     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
-		BreakerThreshold   int                     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string                  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string                  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		Strategy          pool.RegionStrategies   `json:"strategy"`
+		AccountOrder      pool.RegionAccountOrder `json:"account_order,omitempty"`
+		MaxInFlight       int                     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal int                     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		// BatchConcurrency 控制面批量任务的账号并发上限：余额刷新 / 任务补领清扫 /
+		// 任务中心扫描等「按账号扇出」的任务，同一轮同时打上游的账号数。
+		// 与 max_in_flight* 正交（后者只管数据面 chat/search 的单号在途）。
+		// <=0 回落默认 3，>8 钳到 8；面板保存后热生效（下一轮批量任务起效）。
+		BatchConcurrency   int    `json:"batch_concurrency"`
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114）：ErrClient/传输层这类「不罚号」失败连续计数，达阈
 		// 临时出池。与冷却/熔断并存取更长者不叠加。默认 5 次 / 10m。
 		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
@@ -339,6 +345,10 @@ func Default() *Config {
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。
 	c.Pool.MaxInFlightGlobal = 2
+	// BatchConcurrency 缺省 3：与改造前几处手写 sem 的取值一致（零行为回归）。
+	// 它约束的是控制面批量任务（余额刷新/补领清扫/任务扫描）的账号并发，不是
+	// 数据面在途——账号多时可调低到 1 进一步防风控，上限 8。
+	c.Pool.BatchConcurrency = batch.Default
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
@@ -611,6 +621,8 @@ func (c *Config) normalize() error {
 	if c.Pool.MaxInFlightGlobal <= 0 {
 		c.Pool.MaxInFlightGlobal = 2
 	}
+	// 批量并发：0/负数回落默认 3，>8 钳到 8（不报错，与 max_in_flight_global 同风格）。
+	c.Pool.BatchConcurrency = batch.Normalize(c.Pool.BatchConcurrency)
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5
 	}

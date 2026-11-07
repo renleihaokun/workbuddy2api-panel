@@ -1339,6 +1339,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">国际版在途上限</span>
                 <input name="max_in_flight_global" type="number" min="1" placeholder="2">
                 <span class="hint">global 域风控更紧，默认 2</span></label>
+              <label class="fld"><span class="lb">批量任务并发</span>
+                <input name="batch_concurrency" type="number" min="1" max="8" placeholder="3">
+                <span class="hint">余额刷新/任务清扫等批量任务同时打上游的账号数，默认 3、上限 8</span></label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
             </div>

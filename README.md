@@ -493,6 +493,10 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
+| `schedule.balance_refresh_enabled` | `true` | 余额后台刷新开关；开启时按 `balance_refresh_minutes`（默认 5）周期查全部账号余额 |
+| `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；并发上限受 `pool.batch_concurrency` 约束 |
+| `schedule.task_sweep_enabled` | `true` | 任务补领清扫开关：分钟级、幂等地 accept 未接受任务、claim 已达标未领奖励（不跑任何行为链路）。默认开启 |
+| `schedule.task_sweep_minutes` | `15` | 补领清扫周期（分钟）；与成长队列（行为链路、成本高）不同，清扫只做 accept/claim 两条幂等 RPC |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -507,6 +511,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
+| `pool.batch_concurrency` | `3` | **控制面批量任务并发**：余额刷新 / 任务补领清扫 / 任务中心扫描 / 积分构成 / 补偿状态 / 券码 / 昵称同步等「按账号扇出」的任务，同一时刻最多有几个账号在打上游（`<=0` 回落 3，`>8` 钳到 8）。这些任务共享同一个进程级闸门，多个任务同时跑也不会叠加成 N×3；与数据面 `max_in_flight*` 正交（后者只管 chat/search 单号在途）。面板保存后热生效（下一轮批量任务起效） |
 | `pool.degrade_threshold` | `5` | 连败降权阈值：未知错误（ErrClient/传输层）连败 N 次临时出池 |
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
@@ -682,6 +687,19 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
 
+#### 批量任务并发与单飞（`pool.batch_concurrency`）
+
+按账号扇出的控制面任务（余额刷新、任务补领清扫、任务中心扫描、成长队列扫描、积分构成、
+补偿状态、券码、昵称同步）共享同一个进程级闸门：同一时刻最多 `pool.batch_concurrency`
+个账号在打上游（缺省 3，范围 1-8，面板保存后热生效、下一轮任务起效）。改造前这些任务
+每个账号一个 goroutine、彼此独立，账号一多就是 N～2N 个请求同时打出，还会和 chat 流量叠加。
+
+同一任务还带单飞（同一时刻只跑一轮）：余额刷新用**合并**语义（手动刷新恰逢后台在跑时，
+等这一轮结束即返回，数据就是刚查回来的），签到 / 旅行 / 活跃上报 / 保活 / 补领清扫用
+**跳过**语义（后来者直接返回「上一轮仍在执行」，面板按钮会如实提示）。数据面
+（`/v1/chat/completions` 等）不经此闸门，仍由 `pool.max_in_flight*` 按账号控制在途。
+多实例部署时闸门不跨进程协调。
+
 #### 禁用账号与保号任务（`schedule.include_disabled_in_tasks`）
 
 缺省 `false`：禁用账号被上述**签到 / 活跃上报 / 保活 / 余额刷新**四任务跳过，与选号过滤一致。
@@ -834,7 +852,7 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 > `blocked_domains`（折成 `(-site:)` 拼进 query）在服务端均**静默失效**——传了不报错也
 > 不生效。本端点因此不接受这三个字段，避免调用方产生「已过滤」的错误预期。
 
-**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
+**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分（并发上限 `pool.batch_concurrency`，缺省 3；与补领清扫等批量任务共享同一进程级闸门）——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
 
 ## 🖥️ Web 管理面板
 
@@ -945,7 +963,7 @@ http://127.0.0.1:7863/panel/
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`features.system_as_user_fallback`、`models.hidden`、`models.id_style`、`models.realm_name_prefix`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、
+`features.system_as_user_fallback`、`models.hidden`、`models.id_style`、`models.realm_name_prefix`、`logging.request_client_info`、`pool.*`（熔断/在途/批量并发/权重）、
 `schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
