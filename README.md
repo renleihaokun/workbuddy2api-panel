@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.17.5-panel`，与 Release `v1.17.5` 对齐。
+> 当前版本 `1.17.6-panel`，与 Release `v1.17.6` 对齐。
 
 ## 核心能力
 
@@ -367,13 +367,15 @@ flowchart LR
 ```bash
 # 1. 准备配置与数据目录
 mkdir -p auths data && cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    ⚠️ 务必把 config.json 里的 api_key 改成随机长串（openssl rand -hex 24）：
+#    示例值是空串 = 不鉴权，端口映射出去等于把账号池敞开给任何人。
+#    （程序只在你"没有 config.json"时才会自动生成随机 key，cp 出来的文件不算）
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/renleihaokun/workbuddy2api-panel:1.17.5
+  ghcr.io/renleihaokun/workbuddy2api-panel:1.17.6
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -383,7 +385,7 @@ curl -s http://localhost:7863/healthz
 > Package settings → Change visibility → Public。若 `docker pull` 仍要求登录，先检查这里。
 >
 > 镜像 tag 规则（fork workflow）：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 发布
-> `1.17.5` / `1.17` / `sha-xxxxxx` 语义化版本；PR 仅构建验证、不推送。
+> `1.17.6` / `1.17` / `sha-xxxxxx` 语义化版本；PR 仅构建验证、不推送。
 
 ### 方式一：Docker Compose（推荐服务器部署）
 
@@ -394,7 +396,8 @@ cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    ⚠️ 务必将 api_key 改成随机长串（openssl rand -hex 24）：示例值空串 = 不鉴权。
+#    程序只在 config.json 不存在时才自动生成随机 key。
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -495,7 +498,7 @@ curl -s http://localhost:7863/v1/search/messages \
 
 ## 配置说明
 
-**`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。下表为字段含义速查。
+**`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到。**示例值不含任何真实密钥**，`api_key` 也刻意留空（= 不鉴权）——复制后请先填一个随机长串，别用 `test_key` 这类公开占位符。下表为字段含义速查。
 
 ### 字段速查
 
@@ -722,8 +725,9 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 内容拦截 | HTTP 400 + `blocked by security policy` | **不罚账号**，`passthrough` / `append` 模式走降级重试 | 即时 |
 | 通道校验失败 | HTTP 400/403 + code `11128` / `11-128`，或文案 `unapproved channel` / `illegal api invocation` | **不罚账号**；身份句被拒时自动 system→user 搬移重试一次；搬完仍拒或结构性拒绝 → `400 channel_refused` 立即终止轮转（换号无用） | 即时（按 `gateway_hint` 排查 assistant 历史） |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
+| 请求体过大 | 超过网关 64 MiB 安全网（`/v1/chat/completions`、`/v1/responses`） | 本地直接 `413 request_too_large`，不选号、不打上游 | 即时（客户端缩小请求） |
 
-请求体解析失败（`11101`）、提示词过长（`11115`）与图片无效一样**不罚账号、不轮转**：问题在请求内容而非账号健康，换号必然同样失败。网关不做请求体截断与预拦截，`11101` 均为客户端发来的畸形 JSON。
+请求体解析失败（`11101`）、提示词过长（`11115`）与图片无效一样**不罚账号、不轮转**：问题在请求内容而非账号健康，换号必然同样失败。网关不做请求体内二次截断，`11101` 均为客户端发来的畸形 JSON；唯一例外是 64 MiB 的读入安全网（防无上限 `ReadAll` 打爆内存），超限由网关直接 413，不会走到上游。
 
 **熔断器**：冷却入口与 5xx（`14003` / `6021` / `502001` 等明确不罚号的分类除外）共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
@@ -1320,7 +1324,7 @@ WB2A_AUDIT_URL=http://127.0.0.1:7863 WB2A_AUDIT_KEY=sk-xxx \
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
-- **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
+- **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 落盘同样显式 `0600`（`os.open` 指定 mode + 写后 `chmod`，覆盖旧文件也不会继承宽权限）
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
 
 ### 2. 网络暴露与日志敏感度

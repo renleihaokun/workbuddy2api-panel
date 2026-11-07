@@ -33,7 +33,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.17.5-panel"
+const appVersion = "1.17.6-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -409,6 +409,13 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
+	// 空 api_key = 网关与面板双双不鉴权（httpauth 的既有语义）。这是个很容易踩的
+	// 部署坑：cp config.example.json 后忘记改 key，端口再一映射就成公开服务。
+	// 启动即喊一嗓子，别让"忘了填"静默通过。
+	if cfg.APIKey == "" {
+		log.Printf("WARN: api_key 为空 —— 网关与面板均不鉴权，任何能访问 %s 的人都能调用接口、改配置、删账号。"+
+			"公网/内网暴露前请设置 api_key（例如 `openssl rand -hex 24`），或删掉配置文件让程序自动生成随机 key。", cfg.Listen)
+	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)

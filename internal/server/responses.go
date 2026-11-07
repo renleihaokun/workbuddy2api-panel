@@ -24,9 +24,14 @@ import (
 
 // responses 处理 POST /v1/responses。
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
-	// 与 chat 端点同策略：不设本地上限，超限由上游返回（其错误信息更有价值）。
-	body, err := io.ReadAll(r.Body)
+	// 与 chat 端点共用同一道 64 MiB 安全网：上限内仍交上游判定，越过才由网关 413。
+	body, err := readBodyLimited(w, r)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeResponsesError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyTooLargeMsg())
+			return
+		}
 		writeResponsesError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}

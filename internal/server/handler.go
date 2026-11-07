@@ -128,6 +128,29 @@ func (h *Handler) softCooldown() time.Duration {
 // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
 const notFoundCooldown = 60 * time.Second
 
+// maxChatBodyBytes 聊天 / Responses 请求体上限（含多模态内联 base64 图片）。
+//
+// 刻意宽松（64 MiB）：正常的大上下文不该被网关拦，这里只兜住「无上限 ReadAll
+// 把进程内存打爆」这一类畸形/恶意请求。上限以内的超限判定仍交给上游（它的错误
+// 分类更准）；只有越过这道安全网才由网关直接 413。
+//
+// var 而非 const：测试注入小上限用（与 wafIPWindow 同风格），生产恒 64 MiB。
+var maxChatBodyBytes int64 = 64 << 20
+
+// readBodyLimited 读请求体并施加 maxChatBodyBytes 上限。
+// 超限返回 *http.MaxBytesError（调用方据此回 413 而不是 400）。
+func readBodyLimited(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	return io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatBodyBytes))
+}
+
+// bodyTooLargeMsg 超限时的统一文案（OpenAI / Responses 两个端点共用）。
+func bodyTooLargeMsg() string {
+	if maxChatBodyBytes >= 1<<20 {
+		return fmt.Sprintf("request body exceeds the gateway limit of %d MiB", maxChatBodyBytes>>20)
+	}
+	return fmt.Sprintf("request body exceeds the gateway limit of %d bytes", maxChatBodyBytes)
+}
+
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -622,12 +645,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入，超限类问题交由
-	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
-	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
-	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
+	// 请求体走 maxChatBodyBytes 安全网（64 MiB）：不再无限读内存，但也不做
+	// 精细的「按内容判定超限」——那部分语义仍交上游（其错误分类更准）。#41 的
+	// 截断防御语义保留在读错误路径：读 body 出错就地 400/413，不把半截 JSON
+	// 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
+	body, err := readBodyLimited(w, r)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyTooLargeMsg())
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}

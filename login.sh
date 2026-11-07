@@ -153,9 +153,15 @@ auth = {
         "domain": os.environ["WB2A_LOGIN_DOMAIN"],
     },
 }
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
+path = os.environ["WB2A_LOGIN_AUTH_FILE"]
+# 权限必须显式 0600：这里落的是明文 accessToken / refreshToken，而 open(path, "w")
+# 走的是 0666 & ~umask（常见 umask 022 → 0644），同机其他用户可直接读走凭证。
+# 用 os.open 指定 mode 只对"新建"生效，覆盖已存在文件时保留旧权限，故写完再 chmod 一次。
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
     json.dump(auth, f, indent=1)
-print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
+os.chmod(path, 0o600)
+print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {path}")
 PYEOF
 
 # ─── 重启服务 ────────────────────────────────────────────

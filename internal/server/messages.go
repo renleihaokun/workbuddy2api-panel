@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -251,8 +252,16 @@ func writeMessagesError(w http.ResponseWriter, status int, errType, msg string) 
 
 // messages 处理 POST /v1/search/messages（Anthropic Messages 兼容搜索端点）。
 func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(io.LimitReader(r.Body, messagesBodyLimit))
+	// 超限回 413 而不是让 LimitReader 静默截断（截断后只会得到「body must be a
+	// JSON object」这种误导性错误，客户端根本看不出是自己传大了）。
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, messagesBodyLimit))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeMessagesError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				fmt.Sprintf("request body exceeds the %d KiB limit", messagesBodyLimit>>10))
+			return
+		}
 		writeMessagesError(w, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
 		return
 	}

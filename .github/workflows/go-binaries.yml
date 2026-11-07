@@ -35,7 +35,9 @@ jobs:
         with:
           go-version-file: go.mod
       # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
-      - run: go test ./...
+      # -race：pool/scheduler/auth 的并发路径只有 race detector 才抓得到（本地 Windows
+      # 无 CGO 跑不了，CI 的 gcc 环境是唯一常规回归口）。
+      - run: go test -race ./...
 
   build:
     needs: test

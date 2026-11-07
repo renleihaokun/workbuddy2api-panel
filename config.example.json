@@ -1,6 +1,7 @@
 {
+  "_comment_api_key": "api_key 留空 = 网关与面板都不鉴权（任何能访问本端口的人都能调用接口、改配置、删账号）。部署前务必填一个随机长串，例如 `openssl rand -hex 24`；或者直接删掉本文件——程序首次启动会自动生成配置并写入随机 api_key。不要用 test_key 这类公开占位符，那等于没有密钥。",
   "listen": ":7863",
-  "api_key": "test_key",
+  "api_key": "",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "dns_servers": [],

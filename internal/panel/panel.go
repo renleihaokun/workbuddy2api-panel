@@ -87,7 +87,8 @@ type Panel struct {
 	logs    *Ring
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
-	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
+	// poll 成功或超时（loginTTL）后剔除；另有 maxPendingLogins 硬上限，
+	// 防「反复点添加账号不完成登录」把表撑大（见 registerLoginLocked）。
 	loginMu sync.Mutex
 	logins  map[string]loginSession
 
@@ -135,6 +136,37 @@ func (p *Panel) unlockAccount(uid string) {
 // loginTTL 授权 URL 的最长有效期：超时的 state 直接回收，
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
+
+// maxPendingLogins 待登录会话表的硬上限。
+//
+// 光靠 loginTTL 不够：过期清理只在**下一次** loginStart 时跑，而发起一条
+// state 只需一次 POST——重复点「添加账号」却不完成登录，表就会一直长。
+// 到上限后淘汰最旧的（它们最接近过期），内存始终有界。
+const maxPendingLogins = 128
+
+// registerLoginLocked 登记一条待登录会话：先清过期，再按需淘汰最旧，最后写入。
+// 调用方必须已持 p.loginMu。
+func (p *Panel) registerLoginLocked(state, realm string, now time.Time) {
+	for s, sess := range p.logins {
+		if now.Sub(sess.created) > loginTTL {
+			delete(p.logins, s)
+		}
+	}
+	for len(p.logins) >= maxPendingLogins {
+		oldestKey := ""
+		var oldest time.Time
+		for s, sess := range p.logins {
+			if oldestKey == "" || sess.created.Before(oldest) {
+				oldestKey, oldest = s, sess.created
+			}
+		}
+		if oldestKey == "" {
+			break // 表为空却仍满足 >= 上限：只可能是上限被配置成 0，防御性退出
+		}
+		delete(p.logins, oldestKey)
+	}
+	p.logins[state] = loginSession{created: now, realm: realm}
+}
 
 // loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
 type loginSession struct {

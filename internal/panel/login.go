@@ -142,13 +142,9 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.loginMu.Lock()
-	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
-	for s, sess := range p.logins {
-		if time.Since(sess.created) > loginTTL {
-			delete(p.logins, s)
-		}
-	}
-	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
+	// 顺手回收过期会话（防"开弹窗走开"的 state 滞留）+ 维护硬上限（防反复
+	// 发起登录把表撑大），两件事都收在 registerLoginLocked 里。
+	p.registerLoginLocked(st.State, realm, time.Now())
 	p.loginMu.Unlock()
 	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
