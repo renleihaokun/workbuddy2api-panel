@@ -261,6 +261,60 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 	}
 }
 
+// desktopSkillShareVersion skill_share 任务说明要求「电脑端 5.9.0 或以上」，
+// 事件指纹按 5.9.3 报（本机安装的官方客户端版本），避免 5.5.6 桌面指纹被上游按
+// 低版本忽略。
+const desktopSkillShareVersion = "5.9.3"
+
+// DesktopSkillShareSequence 构造「分享一个技能给好友」事件链（skill_share）。
+//
+// 2026-11-15 首测（052d7be1 郭律师）：**单条** skill_share_channel_action
+// （panelAction=success）即把 skill_share 从 0/1 推到 1/1，随后 Web 域领奖
+// 成功 +50c +5e。此处按客户端真实分享流程补三条（entry_click → channel_action
+// click → channel_action success），防止上游后续按事件链加严。
+//
+// 字段取自 WorkBuddy 5.9.3 app.asar renderer 的 useSkillShare：
+// reportShareEntryClick → {skillId,skillName,skillType,skillSource,entry,status,
+// actionSuccessful,tooltip,clickAt}；reportShareChannelAction → {skillId,skillName,
+// skillType,action,panelAction,panelType,isSuccessful,cost,id,actionAt}，其中
+// panelType 由渠道映射而来（link→clipboard / wechat|moments→mini_program_card /
+// qrcode→qrcode_image / browser→external_browser），id 为 createShare 拿到的
+// shareCode。服务端只认事件码与成功标记，shareCode 用本地生成值即可。
+func DesktopSkillShareSequence(skillID, skillName string) []DesktopEvent {
+	now := time.Now().UnixMilli()
+	shareID := fmt.Sprintf("share-%x", now)
+	identity := map[string]any{
+		"skillId": skillID, "skillName": skillName,
+		"skillType": "market", "skillSource": "marketplace",
+		// 业务字段优先于公共指纹：把桌面版本对齐到任务要求的 5.9.x。
+		"ideVersion": desktopSkillShareVersion, "extVersion": desktopSkillShareVersion,
+	}
+	mk := func(code string, extra map[string]any) DesktopEvent {
+		ev := DesktopEvent{"eventCode": code}
+		for k, v := range identity {
+			ev[k] = v
+		}
+		for k, v := range extra {
+			ev[k] = v
+		}
+		return ev
+	}
+	return []DesktopEvent{
+		mk("skill_share_entry_click", map[string]any{
+			"entry": "skill_detail", "status": "safe", "actionSuccessful": true,
+			"tooltip": "", "clickAt": now,
+		}),
+		mk("skill_share_channel_action", map[string]any{
+			"action": "link", "panelAction": "click", "panelType": "clipboard",
+			"isSuccessful": true, "cost": 0, "id": shareID, "actionAt": now,
+		}),
+		mk("skill_share_channel_action", map[string]any{
+			"action": "link", "panelAction": "success", "panelType": "clipboard",
+			"isSuccessful": true, "cost": 120, "id": shareID, "actionAt": now,
+		}),
+	}
+}
+
 // ReportWebEvent 以 Web 端指纹向 www.workbuddy.cn/v2/report 上报单事件。
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。

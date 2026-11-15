@@ -68,6 +68,41 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	}
 }
 
+// TestDesktopSkillShareSequenceShape 断言 skill_share 事件链的形状：
+// entry_click → channel_action(click) → channel_action(success)，成功那条带
+// isSuccessful=true，事件版本对齐任务要求的 5.9.x（覆盖 5.5.6 公共指纹）。
+func TestDesktopSkillShareSequenceShape(t *testing.T) {
+	events := DesktopSkillShareSequence("skill-x", "示例技能")
+	want := []string{"skill_share_entry_click", "skill_share_channel_action", "skill_share_channel_action"}
+	if len(events) != len(want) {
+		t.Fatalf("events=%d want %d", len(events), len(want))
+	}
+	for i, code := range want {
+		if got := events[i]["eventCode"]; got != code {
+			t.Errorf("事件 %d eventCode=%v want %s", i, got, code)
+		}
+		if got := events[i]["skillId"]; got != "skill-x" {
+			t.Errorf("事件 %d skillId=%v want skill-x", i, got)
+		}
+		if got := events[i]["ideVersion"]; got != desktopSkillShareVersion {
+			t.Errorf("事件 %d ideVersion=%v want %s", i, got, desktopSkillShareVersion)
+		}
+	}
+	if events[0]["clickAt"] == nil {
+		t.Error("entry_click 缺 clickAt")
+	}
+	success := events[2]
+	if success["panelAction"] != "success" || success["isSuccessful"] != true {
+		t.Errorf("success 事件 panelAction/isSuccessful=%v/%v", success["panelAction"], success["isSuccessful"])
+	}
+	if success["panelType"] != "clipboard" || success["action"] != "link" {
+		t.Errorf("success 事件 action/panelType=%v/%v", success["action"], success["panelType"])
+	}
+	if events[1]["panelAction"] != "click" {
+		t.Errorf("中间事件 panelAction=%v want click", events[1]["panelAction"])
+	}
+}
+
 // TestDesktopChatSequenceShape 断言完整对话事件链的事件码顺序与关键字段。
 func TestDesktopChatSequenceShape(t *testing.T) {
 	events := DesktopChatSequence("conv-1", "req-1", "msg-1", "fast-model", "fast-model")

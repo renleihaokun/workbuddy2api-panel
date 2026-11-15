@@ -125,6 +125,11 @@ var autoActions = []autoAction{
 		run:      runSkillFresh,
 	},
 	{
+		TaskCode: "skill_share",
+		Desc:     "分享一个技能给好友：桌面指纹上报 skill_share_channel_action 事件链（2026-11-15 实测点亮并自动领奖）",
+		run:      runSkillShare,
+	},
+	{
 		TaskCode: "Expert_lighthouse",
 		Desc:     "真实轻量云专家召唤+使用链（chat 链带 has_expert，已验证：两账号点亮）",
 		run:      runExpertLighthouse,
@@ -965,6 +970,26 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 		return "", fmt.Errorf("skill_info 事件: %w", err)
 	}
 	return "已上报真实对话 + skill_info 技能加载事件", nil
+}
+
+// runSkillShare 完成 skill_share（分享一个技能给好友，上游 2026-11 新任务）。
+//
+// 判据（2026-11-15 首测，052d7be1）：POST /v2/report 的 skill_share_channel_action
+// 事件（桌面指纹，panelAction=click/success 时客户端会带 isSuccessful=true）——
+// 单条 success 即 0/1 → 1/1，随后 Web 域 /activity/growth/tasks/skill_share/claim
+// 到账 +50c +5e。此处按客户端真实分享流程发 entry_click → click → success 三条。
+//
+// 不需要真实安装技能或真实分享：事件里的 skillId/skillName 用仓库既有样本技能，
+// shareCode 本地生成（服务端不校验）。
+func runSkillShare(p *Panel, a *auth.Auth) (string, error) {
+	const (
+		skillID   = "skill_2097350077599879168"
+		skillName = "润泽小馆·日报撰写"
+	)
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopSkillShareSequence(skillID, skillName)...); err != nil {
+		return "", fmt.Errorf("skill_share 事件: %w", err)
+	}
+	return "已上报技能分享事件链（skill_share_channel_action）", nil
 }
 
 // runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。
