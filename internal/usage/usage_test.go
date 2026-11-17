@@ -2,10 +2,13 @@ package usage
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pricing"
 )
 
 // 成功/失败尝试计数、total 的 pt+ct 兜底口径、按域/账号聚合。
@@ -382,5 +385,117 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 	snap := r2.Snapshot(0, nil)
 	if snap.CreditByModel[0].CacheHitRate != 75 {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
+	}
+}
+
+// 官方价折算：分段计价（命中/未命中/输出）、未定价模型只计 token 不计金额、
+// 覆盖率按 token 口径、历史累计金额不受窗口影响。
+func TestSnapshotPricing(t *testing.T) {
+	cheap := func(v float64) *float64 { return &v }
+	tbl := pricing.NewTable(map[string]pricing.Price{
+		"glm-5.3": {Input: 8, Output: 28, CacheHit: cheap(2)},
+	}, pricing.Meta{})
+
+	r := New("")
+	now := time.Now()
+	// 1e6 prompt（命中 5e5 / 未命中 5e5）+ 1e5 输出 → 5e5×2 + 5e5×8 + 1e5×28 = 7.8 元
+	r.Add(now, "cn", "u1", "glm-5.3", Delta{
+		PromptTokens: 1_000_000, HasPromptTokens: true,
+		CompletionTokens: 100_000, HasCompletion: true,
+		CacheHitTokens: 500_000, CacheMissTokens: 500_000, HasCacheTokens: true,
+	}, true)
+	// 无牌价模型：只进 unpriced_tokens
+	r.Add(now, "cn", "u1", "mystery-model", Delta{
+		PromptTokens: 1000, HasPromptTokens: true,
+		CompletionTokens: 1000, HasCompletion: true,
+	}, true)
+	// 100 天前（窗口外）的同模型桶：只影响「历史累计已省」
+	r.Add(now.AddDate(0, 0, -100), "cn", "u1", "glm-5.3", Delta{
+		PromptTokens: 1_000_000, HasPromptTokens: true,
+	}, true)
+
+	s := r.SnapshotWindowPricing(Window{Hours: 24}, nil, nil, tbl)
+	if math.Abs(s.Totals.SavedYuan-7.8) > 1e-9 {
+		t.Fatalf("saved_yuan=%v want 7.8", s.Totals.SavedYuan)
+	}
+	if s.Totals.PricedTokens != 1_100_000 || s.Totals.UnpricedTokens != 2000 {
+		t.Fatalf("priced/unpriced=%d/%d want 1100000/2000", s.Totals.PricedTokens, s.Totals.UnpricedTokens)
+	}
+	if !s.Pricing.Enabled || s.Pricing.Source == "" {
+		t.Fatalf("pricing meta 缺失: %+v", s.Pricing)
+	}
+	if s.Pricing.SavedYuan != s.Totals.SavedYuan {
+		t.Fatalf("pricing.saved_yuan=%v totals=%v 应一致", s.Pricing.SavedYuan, s.Totals.SavedYuan)
+	}
+	// 窗口外那 1e6 prompt 按未命中价 8 元计入累计
+	if math.Abs(s.Pricing.LifetimeSavedYuan-15.8) > 1e-9 {
+		t.Fatalf("lifetime=%v want 15.8", s.Pricing.LifetimeSavedYuan)
+	}
+	wantCoverage := float64(1_100_000) / float64(1_102_000) * 100
+	if math.Abs(s.Pricing.CoveragePct-wantCoverage) > 1e-9 {
+		t.Fatalf("coverage=%v want %v", s.Pricing.CoveragePct, wantCoverage)
+	}
+	if len(s.Pricing.UnpricedModels) != 1 || s.Pricing.UnpricedModels[0] != "mystery-model" {
+		t.Fatalf("unpriced_models=%v", s.Pricing.UnpricedModels)
+	}
+	// 按模型维度也要带金额
+	found := false
+	for _, row := range s.ByModel {
+		if row.Key == "glm-5.3" {
+			found = true
+			if math.Abs(row.SavedYuan-7.8) > 1e-9 {
+				t.Fatalf("by_model glm-5.3 saved_yuan=%v want 7.8", row.SavedYuan)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("by_model 缺 glm-5.3 行")
+	}
+	// 时序点也带金额（后续做图不用再查一次）
+	var seriesSum float64
+	for _, p := range s.Series {
+		seriesSum += p.SavedYuan
+	}
+	if math.Abs(seriesSum-7.8) > 1e-9 {
+		t.Fatalf("series saved 合计=%v want 7.8", seriesSum)
+	}
+}
+
+// 没有牌价表时：金额全零、Pricing.Enabled=false（面板显示"未启用"，不是"省了 0 元"）。
+func TestSnapshotPricingDisabled(t *testing.T) {
+	r := New("")
+	r.Add(time.Now(), "cn", "u1", "glm-5.3", Delta{PromptTokens: 1_000_000, HasPromptTokens: true}, true)
+	s := r.SnapshotWindowPricing(Window{Hours: 24}, nil, nil, nil)
+	if s.Totals.SavedYuan != 0 || s.Totals.PricedTokens != 0 || s.Totals.UnpricedTokens != 0 {
+		t.Fatalf("无牌价表时金额应为零: %+v", s.Totals)
+	}
+	if s.Pricing.Enabled || s.Pricing.SavedYuan != 0 {
+		t.Fatalf("无牌价表时 pricing 应 disabled: %+v", s.Pricing)
+	}
+	// 旧入口（SnapshotWindow）等价于不带牌价表
+	if old := r.SnapshotWindow(Window{Hours: 24}, nil, nil); old.Pricing.Enabled {
+		t.Fatal("SnapshotWindow 不应带牌价表")
+	}
+}
+
+// 峰谷价在聚合层同样生效：同一模型上午（高峰）与午休（空闲）单价不同。
+func TestSnapshotPricingPeakHours(t *testing.T) {
+	tbl := pricing.Seed()
+	r := New("")
+	day := time.Now().Truncate(24 * time.Hour)
+	peak := day.Add(10 * time.Hour) // 北京时间 10 点由 pricing.FactorAt 换算
+	off := day.Add(13 * time.Hour)  // 13 点（午休）
+	r.Add(peak, "cn", "u1", "deepseek-v4-pro", Delta{PromptTokens: 1_000_000, HasPromptTokens: true}, true)
+	r.Add(off, "cn", "u1", "deepseek-v4-pro", Delta{PromptTokens: 1_000_000, HasPromptTokens: true}, true)
+
+	s := r.SnapshotWindowPricing(Window{Hours: 48}, nil, nil, tbl)
+	// 两个桶按各自时刻的系数计价：峰 9 元 + 谷 4.5 元（若两个都在同一时区口径下）
+	// 这里不硬编码整点（now 依赖运行时刻），只校验"峰谷规则被用上了"：
+	// 上限 = 两桶都按高峰 18 元；若都用高峰说明峰谷没生效。
+	if s.Totals.SavedYuan <= 0 || s.Totals.SavedYuan >= 18 {
+		t.Fatalf("峰谷计价未生效：saved=%v（应介于 9~18 之间）", s.Totals.SavedYuan)
+	}
+	if len(s.Pricing.PeakModels) != 3 {
+		t.Fatalf("peak_models=%v want 3 个 deepseek 系列", s.Pricing.PeakModels)
 	}
 }

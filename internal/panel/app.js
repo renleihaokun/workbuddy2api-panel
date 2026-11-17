@@ -2331,6 +2331,17 @@ function fmtModelRate(rate) {
   const s = String(rate || '').trim();
   return s ? 'x' + s : '—';
 }
+/* fmtMoney 官方价折算的金额格式：￥ + 两位小数 + 千分位。
+   手写分组而不是 toLocaleString：面板要在 node 冒烟测试的极简沙箱里跑，
+   Intl 行为随宿主 ICU 版本漂移，输出不稳定。 */
+function fmtMoney(v) {
+  const n = Number(v || 0);
+  if (!Number.isFinite(n)) return '—';
+  const neg = n < 0;
+  const parts = Math.abs(n).toFixed(2).split('.');
+  const int = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (neg ? '-' : '') + '￥' + int + '.' + parts[1];
+}
 
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
@@ -2368,6 +2379,52 @@ function usPct(part, total) {
   return (Number(part || 0) / t * 100).toFixed(1) + '%';
 }
 
+/* usCostCell「官方价」单元格：只有确实计过价的 token 才显示金额；
+   未定价行给 —（显示 0.00 会被读成"这个模型不要钱"）。 */
+function usCostCell(a) {
+  if (!Number(a && a.priced_tokens ? a.priced_tokens : 0)) return '<span class="muted">—</span>';
+  return '<span title="按官方 API 牌价折算（元）">' + esc(fmtMoney(a.saved_yuan)) + '</span>';
+}
+
+/* renderSaveStats 官方 API 价折算卡片：
+   - 已省 = 所选窗口内的折算金额，副行给历史累计（不受窗口影响）；
+   - 覆盖率 = 已定价 token / 全部 token，未定价模型单独点名，不伪造价格；
+   - 牌价表卡片标快照日期与来源（seed = 内置，seed+file = 读到 data/prices.json）。 */
+function renderSaveStats(p, t) {
+  p = p || {}; t = t || {};
+  const on = !!p.enabled;
+  const saved = Number(p.saved_yuan != null ? p.saved_yuan : (t.saved_yuan || 0));
+  const life = Number(p.lifetime_saved_yuan || 0);
+  const cov = Number(p.coverage_pct || 0);
+  const unpriced = Number(t.unpriced_tokens || 0);
+  const models = Number(p.models || 0);
+  const names = (p.unpriced_models || []).slice(0, 6);
+  const more = Number(p.unpriced_model_count || 0) - names.length;
+  const sourceText = p.source === 'seed+file' ? '种子 + 本地覆盖' : '内置种子';
+  const peak = (p.peak_models || []);
+  $('usSaveStats').innerHTML =
+    usKpi(on ? fmtMoney(saved) : '—', '已省（本区间）', on ? 'c-ok' : 'c-mute',
+      on ? '累计 ' + fmtMoney(life) : '牌价表未启用') +
+    usKpi(on ? cov.toFixed(1) + '%' : '—', '牌价覆盖', 'c-soft',
+      '已定价 token / 全部 token') +
+    usKpi(fmtTok(unpriced), '未定价 token', unpriced > 0 ? 'c-warn' : 'c-mute',
+      names.length ? '无牌价：' + names.join('、') + (more > 0 ? ' 等 ' + (more + names.length) + ' 个' : '') : '全部模型都有牌价') +
+    usKpi(String(models) + ' 个模型', '牌价表', 'c-mute',
+      (p.updated ? '快照 ' + p.updated : '') + ' · ' + sourceText);
+  const bits = [];
+  if (!on) bits.push('牌价表未接线，本区不折算金额');
+  else {
+    bits.push('按厂商官网牌价折算（元/百万 tokens），只统计不参与计费');
+    if (peak.length) {
+      bits.push('峰谷价：' + (peak.length > 3 ? peak.slice(0, 3).join('、') + ' 等 ' + peak.length + ' 个' : peak.join('、')) + '，高峰原价、其余半价');
+    }
+    bits.push('未上报缓存命中按未命中价计（偏高）');
+    if (p.error) bits.push('牌价文件读取失败：' + p.error + '（沿用上一版）');
+  }
+  $('usSaveNote').textContent = bits.join(' · ');
+  $('usSaveNote').title = bits.join(' · '); // 窄屏单行截断时靠悬停看全
+}
+
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
 /* nameHtml 非空时替代 esc(name)（已转义的富文本，见 remarkName）：账号维度的第一列
@@ -2387,6 +2444,7 @@ function usRow(name, sub, a, mid, withPerf, nameHtml) {
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
       : '') +
+    '<td class="num">' + usCostCell(a) + '</td>' +
     '</tr>';
 }
 
@@ -2394,9 +2452,10 @@ function usRow(name, sub, a, mid, withPerf, nameHtml) {
    账号 / 模型 / 域三张表此前各自占一个 box，页面纵向拉得很长且表头结构几乎一样。
    现在合成一个 box：表头由维度定义生成，行渲染复用 usRow，切换零请求。 */
 const US_DIMS = {
-  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
-  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
-  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+  // span = 该维度表格的列数（含新增的「官方价」列），空行 colspan 用它。
+  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 11 },
+  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 8 },
+  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 8 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -2418,6 +2477,7 @@ function usDimHead(dim) {
     '<th class="num">请求</th><th class="num">失败</th>' +
     '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
     (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
+    '<th class="num" title="按官方 API 牌价折算（元）">官方价</th>' +
     '</tr>';
 }
 
@@ -2458,7 +2518,7 @@ function renderUsageDim() {
       m.withPerf,
       isAcct ? remarkName(x.key, esc(primary)) : '');
   }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
-  $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
+  $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试 · 官方价按牌价折算';
 }
 
 /* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
@@ -2579,6 +2639,7 @@ function renderUsage(d) {
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
     (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
 
+  renderSaveStats(usageData.pricing, t);
   renderUsageDim();
   renderCreditDim();
   renderUsageChart(usageData.series || []);

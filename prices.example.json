@@ -1,0 +1,179 @@
+{
+  "_comment_用法": "复制本文件到 data/prices.json（与 state_file 同目录，默认 ./data/）后按需修改；面板「用量 → 官方 API 价折算」刷新即生效（按文件 mtime 热重载，无需重启、无需改 config.json）。不建这个文件就用程序内置种子牌价。",
+  "_comment_字段": "input=缓存未命中的输入价，output=输出价，cache_hit=缓存命中价（省略=没有单独缓存档位，按 input 算；写 0=缓存免费）。单位：人民币 / 每百万 tokens。数值必须非负；写错的行会被剔除并打 WARN，整份文件坏则保留上一版。",
+  "_comment_键": "裸模型名对 cn/global 两域都生效；cn:xxx 或 global:xxx（斜杠写法也认）只覆盖该域。",
+  "_comment_峰谷": "peak = 峰谷价：input/output/cache_hit 写高峰价，非高峰时段乘 factor；hours 是北京时间高峰时段（左闭右开），weekdays_only=true 让周末全天低谷，holidays 里列出的日期整天低谷（法定节假日只能手填，不填则该日按工作日算、金额偏高）。DeepSeek 系列内置已按此配置。",
+  "_comment_来源": "下面 19 条均按厂商官网人民币牌价核对（2026-11-17；DeepSeek 取高峰价）。厂商调价后请自己更新。fast-model / balanced-model / deep-model 是 WorkBuddy 自己的档位别名、没有官方对应型号，故未收录（面板显示未定价）；查不到就留空，别把估值当官方价。",
+  "version": 1,
+  "updated": "2026-11-17",
+  "currency": "CNY",
+  "unit": "per_1m_tokens",
+  "models": {
+    "glm-5.3": {
+      "input": 8,
+      "output": 28,
+      "cache_hit": 2,
+      "source": "docs.bigmodel.cn/cn/guide/start/pricing"
+    },
+    "glm-5.3-flash": {
+      "input": 0.8,
+      "output": 2.8,
+      "cache_hit": 0.23,
+      "source": "docs.bigmodel.cn/cn/guide/start/pricing"
+    },
+    "glm-5.2": {
+      "input": 8,
+      "output": 28,
+      "cache_hit": 2,
+      "source": "docs.bigmodel.cn/cn/guide/start/pricing"
+    },
+    "deepseek-v4.1-flash": {
+      "input": 2,
+      "output": 8,
+      "cache_hit": 0.04,
+      "peak": {
+        "factor": 0.5,
+        "hours": [
+          [
+            9,
+            12
+          ],
+          [
+            14,
+            18
+          ]
+        ],
+        "weekdays_only": true,
+        "holidays": []
+      },
+      "source": "api-docs.deepseek.com/zh-cn/quick_start/pricing"
+    },
+    "deepseek-v4-flash": {
+      "input": 2,
+      "output": 8,
+      "cache_hit": 0.04,
+      "peak": {
+        "factor": 0.5,
+        "hours": [
+          [
+            9,
+            12
+          ],
+          [
+            14,
+            18
+          ]
+        ],
+        "weekdays_only": true,
+        "holidays": []
+      },
+      "source": "api-docs.deepseek.com/zh-cn/quick_start/pricing",
+      "note": "官方已下线，请求由 DeepSeek-V4.1-Flash 承接并按 Flash 价计费"
+    },
+    "deepseek-v4-pro": {
+      "input": 9,
+      "output": 27,
+      "cache_hit": 0.3,
+      "peak": {
+        "factor": 0.5,
+        "hours": [
+          [
+            9,
+            12
+          ],
+          [
+            14,
+            18
+          ]
+        ],
+        "weekdays_only": true,
+        "holidays": []
+      },
+      "source": "api-docs.deepseek.com/zh-cn/quick_start/pricing"
+    },
+    "kimi-k3.1-pro": {
+      "input": 13,
+      "output": 68,
+      "cache_hit": 1.3,
+      "source": "platform.kimi.com/docs/pricing/chat",
+      "note": "缓存写入 5min 13 / 1h 26 元/百万另行计费"
+    },
+    "kimi-k3": {
+      "input": 20,
+      "output": 100,
+      "cache_hit": 2,
+      "source": "platform.kimi.com/docs/pricing/chat",
+      "note": "缓存写入 5min 20 / 1h 40 元/百万另行计费"
+    },
+    "minimax-m3.1-flash": {
+      "input": 1,
+      "output": 4,
+      "cache_hit": 0.1,
+      "source": "platform.minimaxi.com/docs/pricing/overview"
+    },
+    "space-bunny": {
+      "input": 1,
+      "output": 4,
+      "cache_hit": 0.1,
+      "source": "platform.minimaxi.com/docs/pricing/overview",
+      "note": "MiniMax M3.1 Flash 的早期匿名版本"
+    },
+    "mimo-v2.6-pro": {
+      "input": 3,
+      "output": 6,
+      "cache_hit": 0.025,
+      "source": "mimo.mi.com/models/zh-CN/mimo-v2.6-pro"
+    },
+    "step-5-preview": {
+      "input": 7,
+      "output": 20,
+      "cache_hit": 0.7,
+      "source": "platform.stepfun.com/docs/zh/guides/pricing/details"
+    },
+    "hy3": {
+      "input": 1,
+      "output": 4,
+      "cache_hit": 0.25,
+      "source": "cloud.tencent.com/document/product/1823/130055"
+    },
+    "hy3-x": {
+      "input": 1,
+      "output": 4,
+      "cache_hit": 0.25,
+      "source": "cloud.tencent.com/document/product/1823/130055",
+      "note": "WorkBuddy 的付费档别名，按 Hy3 官方牌价折"
+    },
+    "hy4std": {
+      "input": 6,
+      "output": 18,
+      "cache_hit": 0.3,
+      "source": "cloud.tencent.com/document/product/1823/130055"
+    },
+    "hy4free": {
+      "input": 6,
+      "output": 18,
+      "cache_hit": 0.3,
+      "source": "cloud.tencent.com/document/product/1823/130055",
+      "note": "WorkBuddy 内为免费档，官方按 Hy4 牌价折"
+    },
+    "hy4-preview-x": {
+      "input": 6,
+      "output": 18,
+      "cache_hit": 0.3,
+      "source": "cloud.tencent.com/document/product/1823/130055"
+    },
+    "kimi-k2.8-preview": {
+      "input": 6.5,
+      "output": 27,
+      "cache_hit": 1.7,
+      "source": "cloud.tencent.com/document/product/1823/130055"
+    },
+    "kimi-k3-1": {
+      "input": 20,
+      "output": 100,
+      "cache_hit": 2,
+      "source": "platform.kimi.com/docs/pricing/chat",
+      "note": "WorkBuddy 侧加的 -1 后缀，官方价目表无此 id；按 Kimi K3 牌价折算"
+    }
+  }
+}

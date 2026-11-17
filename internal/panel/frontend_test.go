@@ -2054,3 +2054,43 @@ process.stdout.write(box.innerHTML);`
 		t.Fatalf("账号名与徽标结构不对，长名会挤掉「国际版」；got=%s", html)
 	}
 }
+// 官方价折算的金额格式化：千分位 + 两位小数；非数字给 —（页面上不能出现 NaN）。
+func TestAppJSMoneyFormatting(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; money formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function fmtMoney');
+const end = src.indexOf('function usStat');
+if (start < 0 || end < 0) throw new Error('fmtMoney not found');
+const ctx = { Number, String, Math };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.fmtMoney=fmtMoney;', ctx);
+process.stdout.write(JSON.stringify({
+  zero: ctx.fmtMoney(0),
+  small: ctx.fmtMoney(7.8),
+  thousand: ctx.fmtMoney(1234.567),
+  negative: ctx.fmtMoney(-1234.5),
+  nan: ctx.fmtMoney('abc'),
+  missing: ctx.fmtMoney(undefined),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "money-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("money formatting node test failed: %v\n%s", err, out)
+	}
+	const want = `{"zero":"￥0.00","small":"￥7.80","thousand":"￥1,234.57","negative":"-￥1,234.50","nan":"—","missing":"￥0.00"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("money formatting=%s want %s", out, want)
+	}
+}

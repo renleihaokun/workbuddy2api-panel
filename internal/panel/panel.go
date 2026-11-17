@@ -27,6 +27,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pricing"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -60,6 +61,9 @@ type Config struct {
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
+	// Pricing 官方牌价表（面板「已省」折算数据源，nil = 折算未启用，接口照常 200）。
+	// 只做展示：改价只影响面板数字，不参与选号/积分/credit-floor 任何决策。
+	Pricing *pricing.Store
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
 	// CreditHistory 积分变动账本（nil = 积分历史接口返回 501）。只读展示：
@@ -1044,7 +1048,13 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, currentRate))
+	// 官方牌价表：每次取当前快照（Store 内部按 mtime 脏检查，改 prices.json 即生效）。
+	// nil 时快照里 pricing.enabled=false，面板显示「牌价未启用」而不是 0 元。
+	var prices *pricing.Table
+	if p.cfg.Pricing != nil {
+		prices = p.cfg.Pricing.Current()
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindowPricing(win, nicks, currentRate, prices))
 }
 
 // parseTimeParam 解析时间查询参数：unix 秒（前端默认）或 RFC3339（便于手工调

@@ -23,6 +23,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pricing"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
@@ -33,7 +34,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.17.7-panel"
+const appVersion = "1.18.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -279,6 +280,19 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// 官方牌价表（面板「已省」折算，只做展示）：与 usage.json 同目录、同一条
+	// state_file 推导规则，不新增配置项。文件缺失 = 用内置种子牌价（正常形态），
+	// 手改 prices.json 后面板刷新即生效（Store 按 mtime 热重载）。
+	pricesPath := stateSibling(cfg.StateFile, "prices.json")
+	prices := pricing.NewStore(pricesPath)
+	if m := prices.Meta(); m.Enabled {
+		log.Printf("[pricing] 官方牌价 %d 个模型（来源 %s，快照 %s，文件 %s）；峰谷价：%v",
+			m.Models, m.Source, m.Updated, pricesPath, m.PeakModels)
+		if m.Error != "" {
+			log.Printf("[pricing] 牌价文件加载失败（沿用上一版）：%s", m.Error)
+		}
+	}
+
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
 	requestLog := reqlog.New(reqlog.Config{
 		Dir:           stateSibling(cfg.StateFile, "request-logs"),
@@ -306,6 +320,7 @@ func main() {
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
+		Pricing:     prices,
 		RequestLog:  requestLog,
 		Upstream:    up,
 		Scheduler:   sch,

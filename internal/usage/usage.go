@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pricing"
 )
 
 // hourlyKeep 小时桶的保留时长；超出后折叠为日桶。
@@ -362,8 +363,15 @@ type Agg struct {
 	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
 	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
-	AvgLatencyMs       float64 `json:"avg_latency_ms"`
-	AvgTPS             float64 `json:"avg_tokens_per_second"`
+	// SavedYuan 按模型官方 API 牌价折算的等价支出（元），即面板上的「已省」。
+	// 纯展示字段：只由 SnapshotWindowPricing 填充，不参与计费/选号任何决策；
+	// PricedTokens / UnpricedTokens 说明这个金额覆盖了多少 token（无牌价的模型
+	// 不计金额，只把 token 计入 UnpricedTokens，绝不编造价格）。
+	SavedYuan      float64 `json:"saved_yuan"`
+	PricedTokens   int64   `json:"priced_tokens,omitempty"`
+	UnpricedTokens int64   `json:"unpriced_tokens,omitempty"`
+	AvgLatencyMs   float64 `json:"avg_latency_ms"`
+	AvgTPS         float64 `json:"avg_tokens_per_second"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -391,6 +399,19 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+}
+
+// addCost 累计一次桶的官方价折算：有牌价 → 金额 + 已定价 token；无牌价 → token
+// 记进 UnpricedTokens（金额不加，绝不按猜测的价算）。
+func (g *aggAcc) addCost(yuan float64, priced bool, tokens int64) {
+	if priced {
+		g.SavedYuan += yuan
+		g.PricedTokens += tokens
+		return
+	}
+	if tokens > 0 {
+		g.UnpricedTokens += tokens
+	}
 }
 
 func (g *aggAcc) finish() Agg {
@@ -466,6 +487,26 @@ func (a *creditAcc) finish() CreditAgg {
 	return out
 }
 
+// PricingInfo 「已省」折算的元信息与汇总（面板「官方 API 价折算」卡片的数据源）。
+//
+// 只做展示：Enabled=false 表示这次快照没带牌价表（面板显示为未启用），
+// 各金额与 token 计数保持零值，绝不估算。
+type PricingInfo struct {
+	Enabled           bool     `json:"enabled"`
+	Currency          string   `json:"currency"`              // CNY
+	Unit              string   `json:"unit"`                  // per_1m_tokens
+	Models            int      `json:"models"`                // 牌价表行数
+	Updated           string   `json:"updated"`               // 牌价快照日期
+	Source            string   `json:"source"`                // seed / seed+file
+	Error             string   `json:"error,omitempty"`       // 牌价文件最近一次加载错误
+	PeakModels        []string `json:"peak_models,omitempty"` // 有峰谷价的模型（DeepSeek 系列）
+	SavedYuan         float64  `json:"saved_yuan"`            // 本窗口已省（元）
+	LifetimeSavedYuan float64  `json:"lifetime_saved_yuan"`   // 全库累计已省（元）
+	CoveragePct       float64  `json:"coverage_pct"`          // 已定价 token / 全部 token
+	UnpricedModels    []string `json:"unpriced_models,omitempty"`
+	UnpricedModelCnt  int      `json:"unpriced_model_count,omitempty"`
+}
+
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
 	Totals          Agg         `json:"totals"`
@@ -484,6 +525,8 @@ type Snapshot struct {
 	WindowFrom string `json:"window_from,omitempty"`
 	WindowTo   string `json:"window_to,omitempty"`
 	Generated  string `json:"generated"`
+	// Pricing 「已省」折算的元信息（无牌价表时 Enabled=false + 全零）。
+	Pricing PricingInfo `json:"pricing"`
 }
 
 // Window 用量统计窗口。三种口径按优先级解析（见 bounds）：
@@ -553,8 +596,19 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 // 生效"，已废弃）。小时桶按整点入窗；日桶（Rollup 折叠出的长期数据）按日起点入窗，
 // 故小时窗口天然不含更早的日桶。
 func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate func(realm, model string) string) Snapshot {
+	return r.SnapshotWindowPricing(w, nicks, currentRate, nil)
+}
+
+// SnapshotWindowPricing 同 SnapshotWindow，额外按官方牌价表折算「已省」。
+//
+// prices 为 nil 时行为与 SnapshotWindow 完全一致（Pricing.Enabled=false、金额全零）。
+//
+// 折算刻意放在**查询时**做，不写进桶：改价后历史数字自动跟着修正，桶结构也不必
+// 迁移。「已省」= Σ(命中×缓存价 + 未命中×输入价 + 输出×输出价) / 1e6；峰谷价按桶的
+// 时间片取系数（小时桶精确到小时，日桶按当天高峰小时数加权）。
+func (r *Recorder) SnapshotWindowPricing(w Window, nicks map[string]string, currentRate func(realm, model string) string, prices *pricing.Table) Snapshot {
 	if r == nil {
-		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
+		return Snapshot{Generated: time.Now().Format(time.RFC3339), Pricing: pricingInfo(nil, Agg{}, 0, nil)}
 	}
 	from, to := w.bounds()
 	explicit := !w.From.IsZero() || !w.To.IsZero()
@@ -578,6 +632,28 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	creditModelAgg := map[string]*creditAcc{}
 	rateCache := map[string]string{}
 
+	// 官方价折算状态：calc 为 nil = 本次快照没带牌价表，金额与 token 计数保持零值。
+	// lifetime 累计全库（含窗口外）的已省金额，供卡片副标题展示「历史累计」。
+	var calc *pricing.Calculator
+	var lifetime float64
+	unpriced := map[string]struct{}{}
+	if prices != nil {
+		calc = prices.NewCalculator()
+	}
+	// 时间片解析缓存：桶数远大于时间片数（同一小时会被多个账号/模型重复引用），
+	// 而峰谷计价要求每个桶都知道自己的时间片，所以这里按 scope 解一次复用。
+	tsCache := map[string]time.Time{}
+	scopeTime := func(scope string) (time.Time, bool) {
+		if ts, ok := tsCache[scope]; ok {
+			return ts, true
+		}
+		ts, ok := bucketTime(scope)
+		if ok {
+			tsCache[scope] = ts
+		}
+		return ts, ok
+	}
+
 	// 数据起点（全库最早分片）：不受窗口影响，表示"记录自何时开始"。scope 字典序
 	// 即时间序（同前缀内同格式排序；"d:" 恒早于 "h:"——日桶只来自 90 天前的小时折叠）。
 	since := ""
@@ -587,10 +663,20 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		if b.Scope < since || since == "" {
 			since = b.Scope
 		}
+		ts, tsOK := scopeTime(b.Scope)
+		// 折算放在窗口过滤之前：窗口外的桶也要进「历史累计已省」。
+		yuan, priced := 0.0, false
+		tokens := b.PT + b.CT
+		if calc != nil && tsOK {
+			yuan, priced = calc.Cost(b.Realm, canonicalUsageModel(b.Model), ts,
+				strings.HasPrefix(b.Scope, "h:"), b.PT, b.CT, b.CH, b.CM)
+			if priced {
+				lifetime += yuan
+			}
+		}
 		if windowed {
-			ts, ok := bucketTime(b.Scope)
 			// 解析失败的脏桶不进窗口聚合（也不该出现在任何口径里）。
-			if !ok {
+			if !tsOK {
 				continue
 			}
 			if !from.IsZero() && ts.Before(from) {
@@ -602,16 +688,28 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		}
 		matched++
 		total.add(b)
+		if calc != nil {
+			total.addCost(yuan, priced, tokens)
+			if !priced && tokens > 0 {
+				unpriced[canonicalUsageModel(b.Model)] = struct{}{}
+			}
+		}
 
 		if realmAgg[b.Realm] == nil {
 			realmAgg[b.Realm] = &aggAcc{}
 		}
 		realmAgg[b.Realm].add(b)
+		if calc != nil {
+			realmAgg[b.Realm].addCost(yuan, priced, tokens)
+		}
 
 		if acctAgg[b.UID] == nil {
 			acctAgg[b.UID] = &aggAcc{}
 		}
 		acctAgg[b.UID].add(b)
+		if calc != nil {
+			acctAgg[b.UID].addCost(yuan, priced, tokens)
+		}
 		// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
 		// keyed() 的 Realm 字段默认是空的（它按 key 分组，不知道 realm）。
 		if acctRealm[b.UID] == "" {
@@ -622,6 +720,9 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			modelAgg[b.Model] = &aggAcc{}
 		}
 		modelAgg[b.Model].add(b)
+		if calc != nil {
+			modelAgg[b.Model].addCost(yuan, priced, tokens)
+		}
 
 		if strings.HasPrefix(b.Scope, "h:") {
 			scope := strings.TrimPrefix(b.Scope, "h:")
@@ -629,12 +730,18 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 				hourSeries[scope] = &aggAcc{}
 			}
 			hourSeries[scope].add(b)
+			if calc != nil {
+				hourSeries[scope].addCost(yuan, priced, tokens)
+			}
 		} else {
 			scope := strings.TrimPrefix(b.Scope, "d:")
 			if daySeries[scope] == nil {
 				daySeries[scope] = &aggAcc{}
 			}
 			daySeries[scope].add(b)
+			if calc != nil {
+				daySeries[scope].addCost(yuan, priced, tokens)
+			}
 		}
 		if b.CRN > 0 {
 			ca := creditAcctAgg[b.UID]
@@ -669,8 +776,9 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		}
 	}
 
+	totals := total.finish()
 	snap := Snapshot{
-		Totals: total.finish(),
+		Totals: totals,
 		ByRealm: keyed(realmAgg, func(k string) (string, string) {
 			return k, ""
 		}),
@@ -682,6 +790,7 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		CreditByModel:   creditKeyed(creditModelAgg),
 		Buckets:         matched,
 		Generated:       time.Now().Format(time.RFC3339),
+		Pricing:         pricingInfo(prices, totals, lifetime, unpriced),
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
@@ -762,6 +871,48 @@ func creditKeyed(m map[string]*creditAcc) []CreditAgg {
 		return out[i].Rate < out[j].Rate
 	})
 	return out
+}
+
+// pricingInfo 组装「已省」元信息：牌价表身份 + 本窗口金额 + 覆盖率 + 未定价模型。
+//
+// prices 为 nil（未接线/测试裸用）时返回 Enabled=false 的全零结构：面板据此显示
+// 「牌价未启用」，而不是把 0 当成"真的省了 0 元"。
+func pricingInfo(prices *pricing.Table, totals Agg, lifetime float64, unpriced map[string]struct{}) PricingInfo {
+	if prices == nil {
+		return PricingInfo{}
+	}
+	m := prices.Meta()
+	info := PricingInfo{
+		Enabled:           true,
+		Currency:          m.Currency,
+		Unit:              m.Unit,
+		Models:            m.Models,
+		Updated:           m.Updated,
+		Source:            m.Source,
+		Error:             m.Error,
+		PeakModels:        m.PeakModels,
+		SavedYuan:         totals.SavedYuan,
+		LifetimeSavedYuan: lifetime,
+	}
+	if info.Source == "" {
+		info.Source = "seed"
+	}
+	if total := totals.PricedTokens + totals.UnpricedTokens; total > 0 {
+		info.CoveragePct = float64(totals.PricedTokens) / float64(total) * 100
+	}
+	if len(unpriced) > 0 {
+		names := make([]string, 0, len(unpriced))
+		for n := range unpriced {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		info.UnpricedModelCnt = len(names)
+		if len(names) > 20 { // 响应体有界：只透出前 20 个，数量另给
+			names = names[:20]
+		}
+		info.UnpricedModels = names
+	}
+	return info
 }
 
 func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg {

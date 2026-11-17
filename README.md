@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.17.7-panel`（新增 `skill_share` 任务自动化），与 Release `v1.17.6` 同源。
+> 当前版本 `1.18.0-panel`（新增面板「已省」官方 API 价折算），基于 Release `v1.17.6`。
 
 ## 核心能力
 
@@ -188,6 +188,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / 账号标签 / rid / 结果 / 积分）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌单页面板（**默认跟随系统明暗**，可三态循环锁定；毛玻璃侧栏/顶栏/弹层 + 入场动效；七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 💰 **「已省」折算** | 用量页按厂商**官网牌价**（人民币 / 百万 tokens）把 token 折成钱：已省 ￥ + 历史累计 + 牌价覆盖率 + 未定价模型清单；按命中 / 未命中 / 输出三段计价，DeepSeek 走**峰谷价**（工作日 9–12、14–18 高峰，其余半价），日桶按高峰小时加权。价格来自内置种子 + `data/prices.json` 手改覆盖（改完刷新即生效）。**纯展示**：不参与计费、选号、积分保底 |
 
 ## 🎯 成长任务一键完成（23/25）
 
@@ -957,7 +958,7 @@ http://127.0.0.1:7863/panel/
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 已暂停选号 / 积分剩余·总额 / 粘性会话）+ **积分到期提醒卡**（按最近到期批次估算、FEFO 口径；点「检查」拉逐包明细）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 暂停选号 / 恢复选号 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
-| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」） |
+| **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条与「官方价」列）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」）+ **官方 API 价折算**（「已省」卡片：把 token 按厂商官网牌价折成元，含 DeepSeek 峰谷价、币种人民币；另给牌价覆盖率与「未定价 token」，未定价模型不计金额） |
 | **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **任务中心** | 成长任务队列：一键扫描全部账号未完成待办（默认口径 + 小程序口径）→ 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询（活动已结束，仅历史券）。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
@@ -1082,7 +1083,7 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
@@ -1297,6 +1298,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 |---|---|---|
 | 思考档位 | `internal/upstream/effort_catalog.go` | CN 取官方 WorkBuddy 客户端 product-config 快照（`%USERPROFILE%\.workbuddy\storage\*\scoped\*\wb-product-config.json`，当前基线 `captured_at=2026-11-05T14:45:53Z`）；global 取线上实测。按 realm 分表，不混用 |
 | 上下文 / 输出上限 | `internal/upstream/context_catalog.go` + `internal/upstream/model.json` | 同一快照的 `maxInputTokens`/`maxOutputTokens`（产品生效上限）；context 遵循「宁可高估不低估」，maxOutput 取官方值。两文件必须逐条一致 |
+| 官方 API 牌价（面板「已省」折算） | `internal/pricing/prices.go`（内置种子）+ `data/prices.json`（本地覆盖） | 厂商**中国区官网**定价页快照，人民币 / 百万 tokens（输入 / 输出 / 缓存命中），2026-11-17 核对：GLM-5.3 = 8 / 28 / 2、GLM-5.3-Flash = 0.8 / 2.8 / 0.23、GLM-5.2 = 8 / 28 / 2、DeepSeek-V4.1-Flash = 2 / 8 / 0.04、DeepSeek-V4-Pro = 9 / 27 / 0.30（DeepSeek 取**高峰价**，空闲时段 ×0.5）、Kimi K3.1 Pro = 13 / 68 / 1.3、Kimi K3 = 20 / 100 / 2（`kimi-k3-1` 按 K3 折：那是 WorkBuddy 侧加的 -1 后缀，官方价目表无此 id）、Kimi K2.8 Preview = 6.5 / 27 / 1.7（K2.8 是 K3 之后的新预览版，价目取自腾讯 TokenHub 计费页）、MiniMax-M3.1-Flash = 1 / 4 / 0.10（`space-bunny` 是其早期匿名版）、MiMo-V2.6-Pro = 3 / 6 / 0.025、Step 5 Preview = 7 / 20 / 0.70、混元 Hy3 = 1 / 4 / 0.25（`hy3` / `hy3-x`）、混元 Hy4 = 6 / 18 / 0.3（`hy4std` / `hy4free` / `hy4-preview-x`）。**只做展示**，不参与 `ModelRate` / credit-floor / 选号。只有 `fast-model` / `balanced-model` / `deep-model` 三个 WorkBuddy 自有档位别名没有官方对应型号，保持「未定价」（按任何官方型号近似都算编，要填就自己在 `data/prices.json` 覆盖） |
 | 定价（牌价/促销） | `internal/upstream/rate_catalog.go`（仅展示兜底） | `credits` 与 `modelPromotions` 由 `/v3/config` **实时**解析（1h 缓存），面板展示「生效价 + 划线牌价」；促销按当前时间窗计算。**远端永远优先**；只有上游缺 `credits` 时才用 2026-11-05 官方快照牌价补位并标 `credits_reference`。静态牌价不参与 `ModelRate` / credit-floor / 选号 |
 
 更新流程（改完三处后）：
@@ -1314,6 +1316,31 @@ WB2A_AUDIT_URL=http://127.0.0.1:7863 WB2A_AUDIT_KEY=sk-xxx \
 ```
 
 报告分三档：`FAIL`（思考模型缺档位、远端档位与静态表冲突、context 缺失）、`WARN`（缺输出上限/缺倍率）、`INFO`（上游调价、退役模型）。新模型上线后先跑一次审计，再按报告补 `effort_catalog.go` / `context_catalog.go` / `model.json` / `rate_catalog.go`。
+
+**官方 API 牌价（「已省」折算用）**怎么维护：复制根目录 `prices.example.json` 到 `data/prices.json`（与 `state_file` 同目录，默认 `./data/`）后手改，**面板刷新即生效**（按 mtime 热重载，不用重启、也不用动 `config.json`）；不建这个文件就用内置种子牌价。
+
+```json
+{
+  "version": 1,
+  "updated": "2026-11-17",
+  "currency": "CNY",
+  "unit": "per_1m_tokens",
+  "models": {
+    "glm-5.3": { "input": 8, "output": 28, "cache_hit": 2, "source": "docs.bigmodel.cn 定价页" },
+    "deepseek-v4-pro": {
+      "input": 9, "output": 27, "cache_hit": 0.3,
+      "peak": { "factor": 0.5, "hours": [[9, 12], [14, 18]], "weekdays_only": true,
+                "holidays": ["2026-11-17"] }
+    },
+    "global:glm-5.3": { "input": 10, "output": 32, "cache_hit": 2.6, "note": "国际版按美元价折人民币" }
+  }
+}
+```
+
+- 键：裸模型名对两域生效；`cn:xxx` / `global:xxx`（斜杠写法等价）只覆盖该域。
+- `cache_hit` 缺省 = 没有单独缓存档位（按输入价算）；写 `0` = 缓存命中免费。
+- `peak` = 峰谷价：`input/output/cache_hit` 写**高峰价**，非高峰乘 `factor`；`hours` 是北京时间高峰时段（左闭右开），`weekdays_only` 让周末全天低谷，`holidays` 列出的日期整天低谷（法定节假日只能手填，不填则该日按工作日算、金额偏高）。
+- 单行写错（负数、NaN、时段越界）只剔除该行并打 WARN；整份文件坏（币种/单位不符、JSON 错）保留上一版并透出错误，面板数字不会归零。
 
 ### 账号管理
 
@@ -1409,6 +1436,23 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认为官方桌面端三段式 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`（global 平台段为 `WorkBuddy AI`），版本段可用 `client_version` / `cli_version` 调整。
 
+### 「已省」是怎么算的？和实际支出对不上怎么办？
+
+口径是「**同样这些 token 走厂商官方 API 要付多少钱**」，不是「你实际花了多少钱」：
+
+```
+已省 = Σ (缓存命中 token × 缓存价 + 缓存未命中 token × 输入价 + 输出 token × 输出价) / 1,000,000
+```
+
+- 价格取厂商**中国区官网**牌价（人民币 / 百万 tokens），DeepSeek 按**峰谷价**：工作日 9–12、14–18 点高峰原价，其余时段与周末半价；90 天前折叠成日桶的数据按当天高峰小时数加权。
+- 上游没回缓存命中信息的请求按**未命中价**算 → 偏高；DeepSeek 取高峰价 → 也偏高。想对得更准就往 `data/prices.json` 里按你的实际口径覆盖（包括把 DeepSeek 改成空闲价）。
+- 模型没有官方牌价时**不计金额**，只计入「未定价 token」并拉低覆盖率；卡片上的来源 `seed`（内置）/ `seed+file`（读到你的文件）与「快照日期」就是当次用的哪一版价。
+- 时间窗与页面其它数字一致（切区间会变），卡片副行另给「累计」（全部历史，不受窗口影响）。
+
+### 想给某个模型补牌价，但不知道官方价格？
+
+去该模型厂商官网的「API 定价」页抄三列：输入（缓存未命中）、输出、缓存命中（没有就留空）。按上一条的格式写进 `data/prices.json` → 刷新面板即生效。**不要填估值**：填错比留空更糟，留空至少会在覆盖率里显形。需要临时按你自己谈的价格算，也可以直接覆盖（覆盖优先于内置种子）。
+
 ## 关键断言 ↔ 代码出处
 
 > 本表只引文件与符号，不写行号——代码演进后行号必然漂移，符号名才是稳定锚点。
@@ -1446,6 +1490,10 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 静态兜底表含 `deepseek-v4-flash` 等 | `internal/upstream/context_catalog.go` `contextCapFallback` |
 | 批量任务闸门与单飞 | `internal/batch/batch.go` `Gate`；`internal/pool/pool.go` `Pool.BatchForEach` |
 | `global.enabled` / `cn.chat_base` 装配期生效 | `cmd/server/main.go`（`up.GlobalEnabled` / `applyCNChatBase`） |
+| 「已省」只做展示，不参与计费/选号 | `internal/pricing/prices.go`（包注释与 `Price`）；`internal/usage/usage.go` `SnapshotWindowPricing`（只写 `SavedYuan/PricedTokens`） |
+| 无牌价模型不参与折算、不伪造价格 | `internal/usage/usage.go` `aggAcc.addCost`（priced=false 只累加 `UnpricedTokens`）；`internal/pricing/prices.go` `Lookup`（未命中返回 ok=false） |
+| DeepSeek 峰谷价：工作日 9–12 / 14–18 高峰、空闲 ×0.5 | `internal/pricing/prices.go`（`deepSeekPeak` / `FactorAt`） |
+| 牌价文件热加载（mtime 脏检查，改完即生效） | `internal/pricing/store.go`（`Store.Current` / `refresh`） |
 
 ## 免责声明
 
