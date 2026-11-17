@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.18.0-panel`（新增面板「已省」官方 API 价折算），基于 Release `v1.17.6`。
+> 当前版本 `1.18.0-panel`（新增面板「已省」官方 API 价折算），与 Release `v1.18.0` 同源。
 
 ## 核心能力
 
