@@ -94,6 +94,25 @@ func TestUsageHandlerPricing(t *testing.T) {
 		t.Fatalf("unpriced_models=%v", list)
 	}
 
+	// 模型行带单价摘要（面板在模型名下展示「入 8 · 出 28 · 缓存 2」这类文字）。
+	byModel := out["by_model"].([]any)
+	var note, unpricedNote string
+	for _, raw := range byModel {
+		row := raw.(map[string]any)
+		if row["key"] == "glm-5.3" {
+			note, _ = row["price_note"].(string)
+		}
+		if row["key"] == "no-price-model" {
+			unpricedNote, _ = row["price_note"].(string)
+		}
+	}
+	if !strings.Contains(note, "入 8") {
+		t.Fatalf("glm-5.3 price_note=%q, want 含「入 8」", note)
+	}
+	if unpricedNote != "" {
+		t.Fatalf("未定价行不应有 price_note: %q", unpricedNote)
+	}
+
 	// 未接线：仍 200，但明确 enabled=false、金额为零。
 	p2 := New(Config{Version: "test", APIKey: "k", Usage: rec, Pool: pool.New("")})
 	req := httptest.NewRequest("GET", "/panel/api/usage?hours=24", nil)
@@ -120,16 +139,19 @@ func TestUsagePricingFrontendWiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, must := range []string{`id="usSaveStats"`, `id="usSaveNote"`, "官方 API 价折算"} {
+	for _, must := range []string{
+		`id="usSaveNum"`, `id="usSaveRows"`, `id="usSaveMore"`, `id="usSaveFoot"`,
+		`id="usSaveCovBar"`, "已省",
+	} {
 		if !strings.Contains(string(html), must) {
-			t.Fatalf("index.html 缺 %q（用量页折算区块）", must)
+			t.Fatalf("index.html 缺 %q（用量页已省区块）", must)
 		}
 	}
 	js, err := os.ReadFile("app.js")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, must := range []string{"function renderSaveStats(", "renderSaveStats(usageData.pricing, t)", "function fmtMoney(", "function usCostCell(", ">官方价</th>"} {
+	for _, must := range []string{"function saveRowHtml(", "function saveRowsHtml(", "function renderSaveStats(", "renderSaveStats(usageData)", "function fmtMoney(", "function usCostCell(", ">官方价</th>"} {
 		if !strings.Contains(string(js), must) {
 			t.Fatalf("app.js 缺 %q", must)
 		}

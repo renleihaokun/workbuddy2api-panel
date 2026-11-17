@@ -2094,3 +2094,87 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("money formatting=%s want %s", out, want)
 	}
 }
+// 「已省」明细行：金额/占比/未定价标记/折叠规则都要对——这块是用户看钱的地方，
+// 一旦算错（比如把未定价行也按 0 元算进占比）就会误导。
+func TestAppJSSaveRows(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; save rows test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const fmtStart = src.indexOf('function fmtTok(');
+const fmtEnd = src.indexOf('function usStat');
+const saveStart = src.indexOf('const SAVE_ROWS');
+const saveEnd = src.indexOf('/* renderSaveStats');
+if ([escStart, escEnd, fmtStart, fmtEnd, saveStart, saveEnd].some(v => v < 0)) throw new Error('save helpers not found');
+const ctx = { Number, String, Math, Array };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(saveStart, saveEnd) +
+  '\nthis.saveRowsHtml = saveRowsHtml; this.saveRowHtml = saveRowHtml;',
+  ctx
+);
+const mk = (k, req, tok, yuan, priced, note) => ({ key: k, requests: req, total_tokens: tok, saved_yuan: yuan, priced_tokens: priced, price_note: note || '' });
+const rows = [];
+for (let i = 0; i < 8; i++) rows.push(mk('m' + i, 2, 1000 * (i + 1), 10 * (i + 1), 1000 * (i + 1), '入 1 · 出 2 · 缓存 0.1'));
+rows.push(mk('fast-model', 3, 692000, 0, 0));
+const collapsed = ctx.saveRowsHtml(rows, 360, false);
+const all = ctx.saveRowsHtml(rows, 360, true);
+const count = s => (s.match(/<tr>/g) || []).length;
+process.stdout.write(JSON.stringify({
+  collapsedRows: count(collapsed),
+  allRows: count(all),
+  hasMoney: collapsed.indexOf('￥80.00') >= 0,
+  hasUnit: collapsed.indexOf('入 1 · 出 2 · 缓存 0.1') >= 0,
+  unpricedTag: collapsed.indexOf('未定价') >= 0,
+  unpricedDash: collapsed.indexOf('>—<') >= 0,
+  topPct: collapsed.indexOf('22.2%') >= 0,
+  empty: ctx.saveRowsHtml([], 0, false),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "save-rows-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("save rows node test failed: %v\n%s", err, out)
+	}
+	var got struct {
+		CollapsedRows int    `json:"collapsedRows"`
+		AllRows       int    `json:"allRows"`
+		HasMoney      bool   `json:"hasMoney"`
+		HasUnit       bool   `json:"hasUnit"`
+		UnpricedTag   bool   `json:"unpricedTag"`
+		UnpricedDash  bool   `json:"unpricedDash"`
+		TopPct        bool   `json:"topPct"`
+		Empty         string `json:"empty"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("解析 node 输出失败: %v\n%s", err, out)
+	}
+	// 8 个有价模型 + 1 个未定价：折叠时 6 + 1，展开时 8 + 1（未定价行永不折叠）。
+	if got.CollapsedRows != 7 || got.AllRows != 9 {
+		t.Fatalf("row counts = %d/%d, want 7/9", got.CollapsedRows, got.AllRows)
+	}
+	if !got.HasMoney || !got.HasUnit {
+		t.Fatalf("行内缺金额或单价摘要: %+v", got)
+	}
+	if !got.UnpricedTag || !got.UnpricedDash {
+		t.Fatalf("未定价行标记不对: %+v", got)
+	}
+	if !got.TopPct {
+		t.Fatalf("占比计算不对（80/360 应为 22.2%%）: %+v", got)
+	}
+	if !strings.Contains(got.Empty, "暂无用量数据") {
+		t.Fatalf("空态文案不对: %q", got.Empty)
+	}
+}
+

@@ -186,6 +186,18 @@
   .acc.req { min-width: 0; }
   .acc.req tr > td { grid-column: span 3; }   /* 兜底：上游将来加列也不至于错位 */
   .acc.req .clip, .acc.req .clip.ip, .acc.req .clip.rid { max-width: none; white-space: normal; overflow-wrap: anywhere; }
+
+  /* 已省（账单区块）：桌面两列 → 窄屏单列；明细表卡片化——
+     模型名整行，金额与占比各占半行，请求/token 各 3 格。 */
+  .sav-body { grid-template-columns: 1fr; }
+  .sav-hero { border-right: 0; border-bottom: 1px solid var(--line-soft); }
+  .sav-num { font-size: 26px; }
+  .sav-tbl { min-width: 0; }
+  .sav-tbl tr > td:nth-child(1) { grid-column: 1 / -1; }
+  .sav-tbl tr > td:nth-child(4) { grid-column: 1 / 7; }
+  .sav-tbl tr > td:nth-child(5) { grid-column: 7 / 13; }
+  .sv-name { white-space: normal; }
+  .sv-share .bar { width: auto; max-width: none; flex: 1 1 auto; }
   /* 请求记录（10 列，列序在 index.html 里固定）：把长字段摊开，别挤成一条竖排碎字。
      时间+结果 / 模型 / 账号+来源 / UA（整行，实测一列只有 74px 宽会折成 12 行）/ 三个指标 / 请求 ID */
   #reqBody tr > td:nth-child(1) { grid-column: 1 / 9; }

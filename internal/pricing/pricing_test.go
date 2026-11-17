@@ -141,6 +141,27 @@ func TestPeakHolidayOverride(t *testing.T) {
 	approx(t, got, 5, "节假日全天半价")
 }
 
+// 单价摘要：面板模型行下展示的那一行（入 / 出 / 缓存，元/百万 tokens）。
+func TestPriceSummary(t *testing.T) {
+	free := 0.0
+	cases := []struct {
+		name string
+		p    Price
+		want string
+	}{
+		{"普通三档", Price{Input: 8, Output: 28, CacheHit: ptr(2)}, "入 8 · 出 28 · 缓存 2"},
+		{"小数去尾零", Price{Input: 0.8, Output: 2.8, CacheHit: ptr(0.23)}, "入 0.8 · 出 2.8 · 缓存 0.23"},
+		{"缓存免费", Price{Input: 3, Output: 6, CacheHit: &free}, "入 3 · 出 6 · 缓存 0"},
+		{"无缓存档位回落输入价", Price{Input: 1, Output: 4}, "入 1 · 出 4 · 缓存 1"},
+		{"峰谷加后缀", Price{Input: 9, Output: 27, CacheHit: ptr(0.3), Peak: deepSeekPeak()}, "入 9 · 出 27 · 缓存 0.3（峰谷）"},
+	}
+	for _, c := range cases {
+		if got := c.p.Summary(); got != c.want {
+			t.Fatalf("%s: Summary()=%q want %q", c.name, got, c.want)
+		}
+	}
+}
+
 // 文件解析：非法行剔除并给告警，合法行生效；币种/单位不符整份拒绝。
 func TestParseFileValidation(t *testing.T) {
 	raw := []byte(`{

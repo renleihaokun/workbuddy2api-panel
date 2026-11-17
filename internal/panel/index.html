@@ -709,6 +709,41 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     background: var(--line); margin-top: 7px; }
   .kpi .kbar i { display: block; height: 100%; min-width: 2px; }
 
+  /* ── 已省（官方 API 价折算）：一张账单，不是一排卡片 ──────────────────
+     左边大字金额 + 覆盖率细条，右边按模型的明细表；牌价元信息压进 header 一行。 */
+  .sav-body { display: grid; grid-template-columns: 236px minmax(0, 1fr); }
+  .sav-hero { padding: 15px 17px 16px; border-right: 1px solid var(--line-soft); }
+  .sav-label { font-size: 11.5px; color: var(--ink-3); }
+  .sav-num { font: 650 30px/1.1 var(--mono); font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em; color: var(--ok); margin-top: 3px; white-space: nowrap; }
+  .sav-num.off { color: var(--ink-3); }
+  .sav-sub { font-size: 11.5px; color: var(--ink-3); margin-top: 5px; line-height: 1.5; }
+  /* 覆盖率做成短量表而不是通栏细线：通栏会被读成"分隔线"，短条才像指标。 */
+  .sav-cov { height: 4px; width: 132px; max-width: 100%; border-radius: 3px;
+    background: var(--line); overflow: hidden; margin-top: 10px; }
+  .sav-cov i { display: block; height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--ok));
+    transition: width var(--dur-3) var(--ease); }
+  .sav-covtxt { font-size: 11px; color: var(--ink-3); margin-top: 5px; }
+  .sav-list { min-width: 0; }
+  .sav-tbl { min-width: 520px; font-size: 12.5px; }
+  .sav-tbl th { padding: 8px 10px; }
+  .sav-tbl td { padding: 7px 10px; border-bottom: 1px solid var(--line-soft); }
+  .sav-tbl tbody tr:last-child td { border-bottom: none; }
+  .sv-name { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sv-price { font: 11px var(--mono); color: var(--ink-3); margin-top: 1px; white-space: nowrap; }
+  .sv-amt { font-weight: 650; color: var(--ok); }
+  .sv-amt.zero { color: var(--ink-3); font-weight: 500; }
+  .sv-share { display: flex; align-items: center; gap: 7px; }
+  .sv-share .bar { flex: none; width: 64px; max-width: 64px; height: 4px; margin-top: 0; }
+  .sv-share .pct { font: 11px var(--mono); color: var(--ink-3); min-width: 38px; text-align: right; }
+  .sav-foot { padding: 9px 17px 11px; border-top: 1px solid var(--line-soft);
+    font-size: 11.5px; color: var(--ink-3); line-height: 1.5; }
+  @media (max-width: 1180px) {
+    .sav-body { grid-template-columns: 1fr; }
+    .sav-hero { border-right: none; border-bottom: 1px solid var(--line-soft); }
+  }
+
   .uschart { border: 1px solid var(--line-soft); border-radius: 10px; overflow: hidden;
     background: var(--surface-2); }
   .uschart-hd { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
@@ -1176,14 +1211,40 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
-      <!-- 官方 API 价折算：只读统计——同样这些 token 走厂商官方 API 要付多少钱 -->
-      <div class="box">
+      <!-- 已省：同样这些 token 走厂商官方 API 要付多少钱（只读统计，不参与计费） -->
+      <div class="box sav">
         <header>
-          <h3>官方 API 价折算</h3>
+          <h3>已省<span class="hint">官方 API 价折算</span></h3>
           <span class="grow"></span>
-          <span class="note" id="usSaveNote">—</span>
+          <button class="xs ghost" id="usSaveMore" hidden></button>
+          <span class="note" id="usSaveMeta">—</span>
         </header>
-        <div class="kpis k4" id="usSaveStats"></div>
+        <div class="sav-body">
+          <div class="sav-hero">
+            <div class="sav-label">本区间已省</div>
+            <div class="sav-num" id="usSaveNum">—</div>
+            <div class="sav-sub" id="usSaveSub">—</div>
+            <div class="sav-cov"><i id="usSaveCovBar" style="width:0%"></i></div>
+            <div class="sav-covtxt" id="usSaveCovTxt">—</div>
+          </div>
+          <div class="sav-list">
+            <div class="tbl-wrap">
+              <table class="acc sav-tbl">
+                <thead>
+                  <tr>
+                    <th>模型</th>
+                    <th class="num">请求</th>
+                    <th class="num">Token</th>
+                    <th class="num">折算</th>
+                    <th>占比</th>
+                  </tr>
+                </thead>
+                <tbody id="usSaveRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="sav-foot" id="usSaveFoot">—</div>
       </div>
 
       <div class="box">

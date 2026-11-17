@@ -2386,43 +2386,110 @@ function usCostCell(a) {
   return '<span title="按官方 API 牌价折算（元）">' + esc(fmtMoney(a.saved_yuan)) + '</span>';
 }
 
-/* renderSaveStats 官方 API 价折算卡片：
-   - 已省 = 所选窗口内的折算金额，副行给历史累计（不受窗口影响）；
-   - 覆盖率 = 已定价 token / 全部 token，未定价模型单独点名，不伪造价格；
-   - 牌价表卡片标快照日期与来源（seed = 内置，seed+file = 读到 data/prices.json）。 */
-function renderSaveStats(p, t) {
-  p = p || {}; t = t || {};
+/* ── 已省：一张账单 ─────────────────────────────────────────────────
+   左边大字金额 + 覆盖率细条，右边按模型列出「请求 / token / 折算 / 占比」。
+   未定价模型永远排在末尾（不计金额，但要让人看见），有价行默认只显示前 SAVE_ROWS 个。 */
+const SAVE_ROWS = 6;
+let usSaveAll = false;
+
+/* saveRowHtml 一行：模型名 + 单价摘要 / 请求 / Token / 金额 / 占比条。
+   priced 看 priced_tokens：0 元也可能是"缓存全命中"，不能按金额判断有没有定价。 */
+function saveRowHtml(r, total) {
+  const priced = Number(r.priced_tokens || 0) > 0;
+  const amount = Number(r.saved_yuan || 0);
+  const pct = priced && total > 0 ? Math.max(0, Math.min(100, amount / total * 100)) : 0;
+  const note = String(r.price_note || '').trim();
+  return '<tr>' +
+    '<td class="who"><div class="sv-name" title="' + esc(r.key || '') + '">' + esc(r.key || '—') +
+      (priced ? '' : ' <span class="tag mute">未定价</span>') + '</div>' +
+      (note ? '<div class="sv-price">' + esc(note) + '</div>' : '') + '</td>' +
+    '<td class="num">' + fmtTok(r.requests) + '</td>' +
+    '<td class="num">' + fmtTok(r.total_tokens) + '</td>' +
+    '<td class="num sv-amt' + (priced ? '' : ' zero') + '">' + (priced ? fmtMoney(amount) : '—') + '</td>' +
+    '<td><div class="sv-share">' + (priced
+      ? '<span class="bar"><i style="width:' + pct.toFixed(2) + '%"></i></span>' +
+        '<span class="pct">' + pct.toFixed(1) + '%</span>'
+      : '<span class="pct">—</span>') + '</div></td>' +
+    '</tr>';
+}
+
+/* saveRowsHtml 行集合：有价行按金额降序（同额按 token），未定价行按 token 降序垫底。
+   all=false 时只截断**有价行**，未定价行始终全显 —— 覆盖率缺口不能靠折叠藏起来。 */
+function saveRowsHtml(rows, total, all) {
+  const list = Array.isArray(rows) ? rows.slice() : [];
+  const priced = list.filter(r => Number(r.priced_tokens || 0) > 0)
+    .sort((a, b) => (Number(b.saved_yuan || 0) - Number(a.saved_yuan || 0)) ||
+                    (Number(b.total_tokens || 0) - Number(a.total_tokens || 0)));
+  const unpriced = list.filter(r => !(Number(r.priced_tokens || 0) > 0))
+    .sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0));
+  const shown = all ? priced : priced.slice(0, SAVE_ROWS);
+  const out = shown.concat(unpriced);
+  if (!out.length) return '<tr><td colspan="5" class="empty">暂无用量数据</td></tr>';
+  return out.map(r => saveRowHtml(r, total)).join('');
+}
+
+/* renderSaveStats 把整份用量快照画成「已省」区块。入参是 usageData 本身：
+   金额与明细来自 by_model，牌价元信息来自 pricing。 */
+function renderSaveStats(d) {
+  d = d || {};
+  const p = d.pricing || {};
+  const t = d.totals || {};
   const on = !!p.enabled;
   const saved = Number(p.saved_yuan != null ? p.saved_yuan : (t.saved_yuan || 0));
   const life = Number(p.lifetime_saved_yuan || 0);
   const cov = Number(p.coverage_pct || 0);
   const unpriced = Number(t.unpriced_tokens || 0);
-  const models = Number(p.models || 0);
-  const names = (p.unpriced_models || []).slice(0, 6);
-  const more = Number(p.unpriced_model_count || 0) - names.length;
-  const sourceText = p.source === 'seed+file' ? '种子 + 本地覆盖' : '内置种子';
-  const peak = (p.peak_models || []);
-  $('usSaveStats').innerHTML =
-    usKpi(on ? fmtMoney(saved) : '—', '已省（本区间）', on ? 'c-ok' : 'c-mute',
-      on ? '累计 ' + fmtMoney(life) : '牌价表未启用') +
-    usKpi(on ? cov.toFixed(1) + '%' : '—', '牌价覆盖', 'c-soft',
-      '已定价 token / 全部 token') +
-    usKpi(fmtTok(unpriced), '未定价 token', unpriced > 0 ? 'c-warn' : 'c-mute',
-      names.length ? '无牌价：' + names.join('、') + (more > 0 ? ' 等 ' + (more + names.length) + ' 个' : '') : '全部模型都有牌价') +
-    usKpi(String(models) + ' 个模型', '牌价表', 'c-mute',
-      (p.updated ? '快照 ' + p.updated : '') + ' · ' + sourceText);
+  const rows = d.by_model || [];
+  const range = trangeLabel('usRange');
+
+  const num = $('usSaveNum');
+  num.textContent = on ? fmtMoney(saved) : '—';
+  num.classList.toggle('off', !on);
+  const reqs = Number(t.requests || 0);
+  $('usSaveSub').textContent = on
+    ? (range ? range + ' · ' : '') + (reqs > 0 ? fmtTok(reqs) + ' 次请求 · ' : '') + '累计 ' + fmtMoney(life)
+    : '牌价表未启用，本区不折算金额';
+  $('usSaveCovBar').style.width = (on ? Math.max(0, Math.min(100, cov)) : 0).toFixed(1) + '%';
+  $('usSaveCovTxt').textContent = on
+    ? '牌价覆盖 ' + cov.toFixed(1) + '%' + (unpriced > 0 ? ' · 未定价 ' + fmtTok(unpriced) : '')
+    : '—';
+
+  const peak = p.peak_models || [];
+  const meta = on
+    ? ['牌价 ' + (p.updated || '—'), String(p.models || 0) + ' 个模型',
+       p.source === 'seed+file' ? '种子+本地覆盖' : '内置种子']
+    : ['未启用'];
+  $('usSaveMeta').textContent = meta.join(' · ');
+  const tip = [];
+  if (on) {
+    tip.push('来源：' + (p.source === 'seed+file' ? '内置种子 + data/prices.json' : '内置种子（没读到 data/prices.json）'));
+    if (peak.length) tip.push('峰谷价模型：' + peak.join('、'));
+    const un = p.unpriced_models || [];
+    if (un.length) {
+      tip.push('未定价：' + un.join('、') +
+        (Number(p.unpriced_model_count || 0) > un.length ? ' 等 ' + p.unpriced_model_count + ' 个' : ''));
+    }
+    if (p.error) tip.push('价格文件读取失败：' + p.error + '（沿用上一版）');
+  }
+  $('usSaveMeta').title = tip.join('\n');
+
+  const pricedCount = rows.filter(r => Number(r.priced_tokens || 0) > 0).length;
+  const btn = $('usSaveMore');
+  if (btn) {
+    btn.hidden = pricedCount <= SAVE_ROWS;
+    if (!btn.hidden) btn.textContent = usSaveAll ? '收起' : '展开全部 ' + pricedCount + ' 个';
+  }
+  $('usSaveRows').innerHTML = saveRowsHtml(rows, saved, usSaveAll);
+
   const bits = [];
   if (!on) bits.push('牌价表未接线，本区不折算金额');
   else {
-    bits.push('按厂商官网牌价折算（元/百万 tokens），只统计不参与计费');
-    if (peak.length) {
-      bits.push('峰谷价：' + (peak.length > 3 ? peak.slice(0, 3).join('、') + ' 等 ' + peak.length + ' 个' : peak.join('、')) + '，高峰原价、其余半价');
-    }
+    bits.push('按厂商官网牌价（元/百万 tokens）折算，只统计不参与计费');
+    if (peak.length) bits.push('峰谷价：工作日 9–12、14–18 高峰原价，其余时段与周末半价');
     bits.push('未上报缓存命中按未命中价计（偏高）');
-    if (p.error) bits.push('牌价文件读取失败：' + p.error + '（沿用上一版）');
   }
-  $('usSaveNote').textContent = bits.join(' · ');
-  $('usSaveNote').title = bits.join(' · '); // 窄屏单行截断时靠悬停看全
+  $('usSaveFoot').textContent = bits.join(' · ');
+  $('usSaveFoot').title = bits.join(' · ');
 }
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
@@ -2639,7 +2706,7 @@ function renderUsage(d) {
     (usageData.credit_by_account || []).length + ' 个账号 · ' +
     (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
 
-  renderSaveStats(usageData.pricing, t);
+  renderSaveStats(usageData);
   renderUsageDim();
   renderCreditDim();
   renderUsageChart(usageData.series || []);
@@ -2661,6 +2728,10 @@ if ($('usCreditTabs')) $('usCreditTabs').addEventListener('click', ev => {
 if ($('usSort')) $('usSort').onchange = () => {
   usSort = $('usSort').value;
   renderUsageDim();
+};
+if ($('usSaveMore')) $('usSaveMore').onclick = () => {
+  usSaveAll = !usSaveAll;
+  renderSaveStats(usageData || {}); // 只重渲染行，不重新请求接口
 };
 
 /* renderUsageChart 画堆叠柱状图。

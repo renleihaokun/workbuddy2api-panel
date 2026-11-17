@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -260,6 +261,25 @@ func (t *Table) Lookup(realm, model string) (Price, bool) {
 	p, ok := t.models[model]
 	return p, ok
 }
+
+// Summary 返回单价摘要（元/百万 tokens），供面板在模型行下展示。
+//
+// 例：glm-5.3 → "入 8 · 出 28 · 缓存 2"；DeepSeek 系列带 "（峰谷）" 后缀提醒
+// 实际折算按高峰/空闲两档。
+func (p Price) Summary() string {
+	cache := p.Input
+	if p.CacheHit != nil {
+		cache = *p.CacheHit
+	}
+	s := "入 " + fmtNum(p.Input) + " · 出 " + fmtNum(p.Output) + " · 缓存 " + fmtNum(cache)
+	if p.Peak != nil {
+		s += "（峰谷）"
+	}
+	return s
+}
+
+// fmtNum 去尾零的数字格式（8 → "8"，0.04 → "0.04"，2.5 → "2.5"）。
+func fmtNum(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 
 // Cost 计算一次桶（一小时或一天）的官方等价支出（元）。ok=false 表示该模型没有牌价。
 func (t *Table) Cost(realm, model string, at time.Time, hourly bool, pt, ct, hit, miss int64) (float64, bool) {

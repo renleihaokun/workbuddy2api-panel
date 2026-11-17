@@ -446,6 +446,12 @@ func TestSnapshotPricing(t *testing.T) {
 			if math.Abs(row.SavedYuan-7.8) > 1e-9 {
 				t.Fatalf("by_model glm-5.3 saved_yuan=%v want 7.8", row.SavedYuan)
 			}
+			if row.PriceNote == "" {
+				t.Fatal("已定价模型行应带单价摘要 price_note")
+			}
+		}
+		if row.Key == "mystery-model" && row.PriceNote != "" {
+			t.Fatalf("未定价模型不应有 price_note: %q", row.PriceNote)
 		}
 	}
 	if !found {

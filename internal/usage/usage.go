@@ -436,6 +436,9 @@ type KeyedAgg struct {
 	Key   string `json:"key"`
 	Realm string `json:"realm,omitempty"`
 	Extra string `json:"extra,omitempty"` // 账号行放昵称
+	// PriceNote 模型行的单价摘要（如「入 8 · 出 28 · 缓存 2」），仅 ByModel 行有值；
+	// 未定价模型留空（前端据此显示「未定价」）。
+	PriceNote string `json:"price_note,omitempty"`
 	Agg
 }
 
@@ -637,6 +640,8 @@ func (r *Recorder) SnapshotWindowPricing(w Window, nicks map[string]string, curr
 	var calc *pricing.Calculator
 	var lifetime float64
 	unpriced := map[string]struct{}{}
+	// modelNote 模型 → 单价摘要（首次出现时查一次，键与 ByModel 的行 key 一致）。
+	modelNote := map[string]string{}
 	if prices != nil {
 		calc = prices.NewCalculator()
 	}
@@ -718,6 +723,11 @@ func (r *Recorder) SnapshotWindowPricing(w Window, nicks map[string]string, curr
 
 		if modelAgg[b.Model] == nil {
 			modelAgg[b.Model] = &aggAcc{}
+			if prices != nil {
+				if pr, ok := prices.Lookup(b.Realm, canonicalUsageModel(b.Model)); ok {
+					modelNote[b.Model] = pr.Summary()
+				}
+			}
 		}
 		modelAgg[b.Model].add(b)
 		if calc != nil {
@@ -794,6 +804,9 @@ func (r *Recorder) SnapshotWindowPricing(w Window, nicks map[string]string, curr
 	}
 	for i := range snap.ByAccount {
 		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
+	}
+	for i := range snap.ByModel {
+		snap.ByModel[i].PriceNote = modelNote[snap.ByModel[i].Key]
 	}
 
 	// 日点（升序）+ 小时点（升序）拼成一条连续时序。
