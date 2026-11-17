@@ -2342,6 +2342,15 @@ function fmtMoney(v) {
   const int = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   return (neg ? '-' : '') + '￥' + int + '.' + parts[1];
 }
+/* fmtCoverage 牌价覆盖率：正常一位小数；但有未定价 token 时不许四舍五入成 100.0%
+   （那会和旁边的「未定价 611.4k」自相矛盾），压到 99.99%。 */
+function fmtCoverage(cov, unpriced) {
+  const c = Math.max(0, Math.min(100, Number(cov) || 0));
+  const s = c.toFixed(1) + '%';
+  // 一位小数会把 99.95+ 进位成 100.0：还有未定价 token 时不能这么说。
+  if (Number(unpriced || 0) > 0 && s === '100.0%') return '99.99%';
+  return s;
+}
 
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
@@ -2415,8 +2424,14 @@ function saveRowHtml(r, total) {
 
 /* saveRowsHtml 行集合：有价行按金额降序（同额按 token），未定价行按 token 降序垫底。
    all=false 时只截断**有价行**，未定价行始终全显 —— 覆盖率缺口不能靠折叠藏起来。 */
+/* isEmptyUsageRow 只有请求、没有任何 token 的模型行（多为失败尝试）：
+   进表只占行没有信息，改为在页脚记数量。 */
+function isEmptyUsageRow(r) {
+  return !Number(r.total_tokens || 0) && !Number(r.saved_yuan || 0) && !Number(r.priced_tokens || 0);
+}
+
 function saveRowsHtml(rows, total, all) {
-  const list = Array.isArray(rows) ? rows.slice() : [];
+  const list = (Array.isArray(rows) ? rows.slice() : []).filter(r => !isEmptyUsageRow(r));
   const priced = list.filter(r => Number(r.priced_tokens || 0) > 0)
     .sort((a, b) => (Number(b.saved_yuan || 0) - Number(a.saved_yuan || 0)) ||
                     (Number(b.total_tokens || 0) - Number(a.total_tokens || 0)));
@@ -2451,7 +2466,7 @@ function renderSaveStats(d) {
     : '牌价表未启用，本区不折算金额';
   $('usSaveCovBar').style.width = (on ? Math.max(0, Math.min(100, cov)) : 0).toFixed(1) + '%';
   $('usSaveCovTxt').textContent = on
-    ? '牌价覆盖 ' + cov.toFixed(1) + '%' + (unpriced > 0 ? ' · 未定价 ' + fmtTok(unpriced) : '')
+    ? '牌价覆盖 ' + fmtCoverage(cov, unpriced) + (unpriced > 0 ? ' · 未定价 ' + fmtTok(unpriced) : '')
     : '—';
 
   const peak = p.peak_models || [];
@@ -2487,6 +2502,8 @@ function renderSaveStats(d) {
     bits.push('按厂商官网牌价（元/百万 tokens）折算，只统计不参与计费');
     if (peak.length) bits.push('峰谷价：工作日 9–12、14–18 高峰原价，其余时段与周末半价');
     bits.push('未上报缓存命中按未命中价计（偏高）');
+    const empties = rows.filter(isEmptyUsageRow).length;
+    if (empties > 0) bits.push('另有 ' + empties + ' 个模型无 token 记录（多为失败请求）');
   }
   $('usSaveFoot').textContent = bits.join(' · ');
   $('usSaveFoot').title = bits.join(' · ');

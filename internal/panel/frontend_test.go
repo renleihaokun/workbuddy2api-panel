@@ -2122,6 +2122,7 @@ const mk = (k, req, tok, yuan, priced, note) => ({ key: k, requests: req, total_
 const rows = [];
 for (let i = 0; i < 8; i++) rows.push(mk('m' + i, 2, 1000 * (i + 1), 10 * (i + 1), 1000 * (i + 1), '入 1 · 出 2 · 缓存 0.1'));
 rows.push(mk('fast-model', 3, 692000, 0, 0));
+rows.push(mk('gpt-6-astra', 3, 0, 0, 0));
 const collapsed = ctx.saveRowsHtml(rows, 360, false);
 const all = ctx.saveRowsHtml(rows, 360, true);
 const count = s => (s.match(/<tr>/g) || []).length;
@@ -2133,6 +2134,10 @@ process.stdout.write(JSON.stringify({
   unpricedTag: collapsed.indexOf('未定价') >= 0,
   unpricedDash: collapsed.indexOf('>—<') >= 0,
   topPct: collapsed.indexOf('22.2%') >= 0,
+  emptyRowHidden: collapsed.indexOf('gpt-6-astra') < 0,
+  covNearlyFull: ctx.fmtCoverage(99.994, 611415),
+  covFull: ctx.fmtCoverage(100, 0),
+  covNormal: ctx.fmtCoverage(98.24, 0),
   empty: ctx.saveRowsHtml([], 0, false),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "save-rows-*.cjs")
@@ -2155,6 +2160,10 @@ process.stdout.write(JSON.stringify({
 		UnpricedTag   bool   `json:"unpricedTag"`
 		UnpricedDash  bool   `json:"unpricedDash"`
 		TopPct        bool   `json:"topPct"`
+		EmptyRowHidden bool  `json:"emptyRowHidden"`
+		CovNearlyFull  string `json:"covNearlyFull"`
+		CovFull        string `json:"covFull"`
+		CovNormal      string `json:"covNormal"`
 		Empty         string `json:"empty"`
 	}
 	if err := json.Unmarshal(out, &got); err != nil {
@@ -2172,6 +2181,15 @@ process.stdout.write(JSON.stringify({
 	}
 	if !got.TopPct {
 		t.Fatalf("占比计算不对（80/360 应为 22.2%%）: %+v", got)
+	}
+	if !got.EmptyRowHidden {
+		t.Fatal("0 token 的模型行不该出现在明细表里（应只在页脚计数量）")
+	}
+	if got.CovNearlyFull != "99.99%" {
+		t.Fatalf("有未定价 token 时覆盖率=%q，应为 99.99%%（不能显示成 100.0%%）", got.CovNearlyFull)
+	}
+	if got.CovFull != "100.0%" || got.CovNormal != "98.2%" {
+		t.Fatalf("覆盖率格式化=%q/%q", got.CovFull, got.CovNormal)
 	}
 	if !strings.Contains(got.Empty, "暂无用量数据") {
 		t.Fatalf("空态文案不对: %q", got.Empty)
