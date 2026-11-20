@@ -62,7 +62,7 @@
      用 transform 而不是 left：left 每帧都要重排整页。 */
   .nav {
     position: fixed; top: 0; left: 0; bottom: 0; z-index: 70;
-    width: 244px; max-width: 84vw; height: 100%;
+    width: 264px; max-width: 86vw; height: 100%;
     flex-direction: column; align-items: stretch;
     overflow-x: hidden; overflow-y: auto;
     transform: translateX(-100%); transition: transform .22s ease;
@@ -80,8 +80,9 @@
   .nav-veil.on { opacity: 1; pointer-events: auto; }
 
   /* ── 2. 顶栏：紧凑换行，只隐藏分隔符与副标题（主题按钮保留可用）────── */
-  .topbar { flex-wrap: wrap; gap: 6px 8px; padding: 8px 10px; }
-  .topbar h2 { font-size: 15px; }
+  .topbar { flex-wrap: wrap; gap: 6px 8px; padding: 8px 10px; min-height: 0; }
+  .topbar h2 { font-size: 16px; }
+  .topbar .meta { font-size: 11px; padding: 1px 7px; }
   .topbar .sep, .topbar .meta { display: none; }
   .topbar button { padding: 5px 9px; font-size: 12.5px; border-radius: 8px; }
   .topbar button.icon { padding: 5px 8px; }
@@ -91,6 +92,7 @@
      关键一条：.tbl-wrap 必须覆盖桌面端的 overflow-x:auto，否则卡片列再好看，
      容器照样横向滚动。表头隐藏，单元格字段名由 JS 写入的 data-l 渲染。 */
   .tbl-wrap { overflow: visible; }
+  .tbl-wrap.tall { max-height: none; overflow: visible; }
   /* .acc 与 .acc.md 在桌面端都带 min-width（640px / 700px）：卡片模式必须一并清掉，
      否则模型表不是"卡片"而是"被裁掉右半边"。 */
   .acc, .acc.md { display: block; width: 100%; min-width: 0; }
@@ -134,6 +136,11 @@
   .acc .who .nm { font-size: 13.5px; line-height: 1.25; }
   .acc .who .id { font-size: 10px; line-height: 1.3; margin-top: 1px; }
   .acc .num { white-space: normal; }
+  /* 桌面端限流 chip 有 186px 下限；卡片里必须放开，否则会伸出卡片边界 */
+  .rate-limits { min-width: 0; max-width: 100%; }
+  .rate-limit { max-width: 100%; }
+  /* 桌面端数值列右对齐；卡片模式每格是「字段名 + 值」的行内组合，必须回左对齐 */
+  .acc th.num, .acc td.num, .acc td.num:not(.usage-cell) { text-align: left; }
   .acc .tag { font-size: 10px; padding: 1px 7px; }
   .acc .bar { flex: 1 1 auto; min-width: 18px; max-width: none; height: 2px; margin-top: 0; border-radius: 2px; }
   .acc .usage-line { flex-wrap: wrap; gap: 3px; white-space: normal; }
@@ -141,12 +148,15 @@
   .acc .usage-item b { font-size: 10px; }
   .acc .usage-item em { font-size: 8.5px; }
   /* ④ 操作按钮：固定占满一行并平分宽度 → 全部按钮永远一行（主按钮蓝） */
-  .acc .acts { grid-column: 1 / -1; display: flex; gap: 5px; }
-  .acc .acts button { flex: 1 1 0; min-width: 0; padding: 5px 2px; font-size: 11.5px; white-space: nowrap; border-radius: 8px; }
+  /* 操作按钮：6 个按钮在 350px 宽度里放成 3×2 等宽网格——比挤一行再掉一个好看得多 */
+  .acc .acts { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+  .acc .acts button { width: 100%; min-width: 0; height: 30px; padding: 0 4px; font-size: 11.5px; white-space: nowrap; border-radius: 8px; }
 
   /* 账号卡：① 标题/ID + 状态 ② 积分细条+积分+成功失败+在途 ③ 用量标签+最近成功 ④ 按钮 */
   #accBody tr > .who { grid-column: 1 / 9; }
-  #accBody tr > td:nth-child(3) { grid-column: 9 / 13; flex-direction: column; align-items: flex-end; gap: 1px; }
+  /* 状态列给宽一点：冷却态要同时放「限流冷却 · 30分40秒」和模型限流 chip，
+     只给 4 格会把标签顶到卡片外面去 */
+  #accBody tr > td:nth-child(3) { grid-column: 7 / 13; flex-direction: column; align-items: flex-end; gap: 2px; }
   #accBody tr > td:nth-child(3)::before { content: none; }
   #accBody tr > td:nth-child(3) .hint { font-size: 9.5px; margin-top: 0; text-align: right; }
   #accBody tr > .cred { grid-column: 1 / 7; gap: 5px; }
@@ -223,8 +233,11 @@
   .trange select, .trange input { padding: 4px 7px; font-size: 12px; }
   .vtabs { padding: 2px; flex-wrap: wrap; }
   .vtabs button { padding: 3px 9px; font-size: 12px; }
-  .kpis { gap: 8px; padding: 10px 11px 0; }
-  .kpi { padding: 8px 10px 9px 12px; border-radius: 10px; }
+  .kpis { gap: 8px; padding: 12px 12px 0; }
+  .kpi { padding: 9px 11px 10px; border-radius: 12px; }
+  .kpi:hover { transform: none; }
+  .kpi .v { font-size: 18px; }
+  .kpi .s { font-size: 10px; }
 
   /* ── 用量「Token 时序」：窄屏在 mobile.js 里重画成 440×230 ────────────
      上游那张固定 viewBox 1200×200、靠 width:100% 缩放的图，在 360px 宽下缩放比只有
@@ -275,7 +288,7 @@
   .dlg .body { padding: 11px; }
   .dlg footer { padding: 9px 11px; gap: 7px; }
   .dlg footer button { padding: 6px 10px; font-size: 12.5px; border-radius: 8px; }
-  .vc { margin-bottom: 8px; border-radius: 10px; }
+  .vc { margin-bottom: 8px; border-radius: 12px; }
   .vc .hd { padding: 9px 11px 3px; }
   .vc .meta { padding: 1px 11px 8px; }
   .vc .ft { padding: 8px 11px; }
@@ -283,8 +296,9 @@
   label.fld { margin-bottom: 9px; }
   label.fld > .lb { font-size: 11.5px; margin-bottom: 3px; }
   label.fld > .hint, .hint { font-size: 10px; margin-top: 2px; }
-  input, select { padding: 6px 9px; font-size: 12.5px; border-radius: 8px; }
-  button { padding: 6px 10px; font-size: 12.5px; border-radius: 8px; }
+  input, select { height: 32px; padding: 0 9px; font-size: 12.5px; border-radius: 8px; }
+  button { height: 30px; padding: 0 10px; font-size: 12.5px; border-radius: 8px; }
+  .switch input[type=checkbox] { height: 22px; width: 40px; }
   .switch { padding: 6px 0; }
   .switch .lb { font-size: 12.5px; }
   .hr { margin: 2px 0 11px; }
@@ -292,13 +306,21 @@
 
   /* ── 5. 其余栅格与列表：全部收紧间距，统一 12px 圆角卡片感 ──────── */
   .view { padding: 10px 10px 40px; }
-  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); border-radius: 12px; margin-bottom: 10px; }
-  .stat { padding: 7px 9px; min-width: 0; }
-  .stat .v { font-size: 15px; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
-  .stat .k { font-size: 9.5px; margin-top: 1px; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .stat { padding: 9px 11px 10px; min-width: 0; border-radius: 12px; }
+  .stat:hover { transform: none; }
+  .stat .v { font-size: 20px; line-height: 1.15; white-space: normal; overflow-wrap: anywhere; }
+  .stat .k { font-size: 10px; margin-top: 2px; }
+  /* 7 张卡排 2 列会剩下一张孤零零挂在左半边：让末张整行铺满，视觉上收口 */
+  .stats > .stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .box { border-radius: 12px; margin-bottom: 12px; }
-  .box > header { flex-wrap: wrap; gap: 6px 8px; padding: 9px 11px; }
-  .box > header h3 { font-size: 12.5px; white-space: normal; }
+  .box > header { flex-wrap: wrap; gap: 6px 8px; padding: 10px 12px; }
+  .box > header h3 { font-size: 13.5px; white-space: normal; flex: 1 1 100%; }
+  .box > header .note { flex: 1 1 100%; order: 2; font-size: 11px; }
+  .box > header > button, .box > header > .chips, .box > header > .vtabs, .box > header > .trange,
+  .box > header > .sel-note, .box > header > select { order: 3; }
+  .box > header > button { height: 26px; font-size: 12px; padding: 0 9px; }
+  .box > header .grow { display: none; }
   /* 上游 .box > header .note 也是 nowrap（L200）：v1.12.0 起 packages 页每个账号盒头部的
      余额口径文字变长，窄屏直接撑破整页（实测 563px）。用量页那条 id 限定的「单行截断」
      规则特异性更高，仍按上游保持省略号，不受这里影响。 */

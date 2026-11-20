@@ -2054,6 +2054,7 @@ process.stdout.write(box.innerHTML);`
 		t.Fatalf("账号名与徽标结构不对，长名会挤掉「国际版」；got=%s", html)
 	}
 }
+
 // 官方价折算的金额格式化：千分位 + 两位小数；非数字给 —（页面上不能出现 NaN）。
 func TestAppJSMoneyFormatting(t *testing.T) {
 	node, err := exec.LookPath("node")
@@ -2094,6 +2095,7 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("money formatting=%s want %s", out, want)
 	}
 }
+
 // 「已省」明细行：金额/占比/未定价标记/折叠规则都要对——这块是用户看钱的地方，
 // 一旦算错（比如把未定价行也按 0 元算进占比）就会误导。
 func TestAppJSSaveRows(t *testing.T) {
@@ -2153,18 +2155,18 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("save rows node test failed: %v\n%s", err, out)
 	}
 	var got struct {
-		CollapsedRows int    `json:"collapsedRows"`
-		AllRows       int    `json:"allRows"`
-		HasMoney      bool   `json:"hasMoney"`
-		HasUnit       bool   `json:"hasUnit"`
-		UnpricedTag   bool   `json:"unpricedTag"`
-		UnpricedDash  bool   `json:"unpricedDash"`
-		TopPct        bool   `json:"topPct"`
-		EmptyRowHidden bool  `json:"emptyRowHidden"`
+		CollapsedRows  int    `json:"collapsedRows"`
+		AllRows        int    `json:"allRows"`
+		HasMoney       bool   `json:"hasMoney"`
+		HasUnit        bool   `json:"hasUnit"`
+		UnpricedTag    bool   `json:"unpricedTag"`
+		UnpricedDash   bool   `json:"unpricedDash"`
+		TopPct         bool   `json:"topPct"`
+		EmptyRowHidden bool   `json:"emptyRowHidden"`
 		CovNearlyFull  string `json:"covNearlyFull"`
 		CovFull        string `json:"covFull"`
 		CovNormal      string `json:"covNormal"`
-		Empty         string `json:"empty"`
+		Empty          string `json:"empty"`
 	}
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("解析 node 输出失败: %v\n%s", err, out)
@@ -2196,3 +2198,90 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+/* ══ 设计系统 v2 护栏 ═══════════════════════════════════════════════════════
+   视觉改造最容易「改着改着就散了」：令牌被删、数值列忘了右对齐、原生 checkbox
+   又冒出来、导航少一项。以下四条把这几件事钉住，退化直接 go test 红。 */
+
+// TestIndexHTMLDesignTokensComplete 设计令牌骨架必须齐备：字号 / 间距 / 圆角 /
+// 阴影 / 动效 / 数字字体都定义在 :root。少一个不会报错，只会让某个组件悄悄退回
+// 浏览器默认值——这种退化肉眼几乎发现不了。
+func TestIndexHTMLDesignTokensComplete(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	m := darkPaletteRe.FindStringSubmatch(html)
+	if m == nil {
+		t.Fatal("找不到 :root 深色令牌块")
+	}
+	tokens := cssTokens(m[1])
+	want := []string{
+		"--fs-page", "--fs-title", "--fs-body", "--fs-table", "--fs-label", "--fs-num",
+		"--sp-3", "--sp-4", "--sp-5", "--r-sm", "--r-md", "--r-lg", "--r-xl",
+		"--sh-1", "--sh-2", "--sh-3", "--dur-1", "--dur-2", "--dur-3",
+		"--font-num", "--zebra",
+	}
+	for _, k := range want {
+		if _, ok := tokens[k]; !ok {
+			t.Fatalf("设计令牌 %s 缺失（会被浏览器默认值兜底，层级/间距会悄悄退化）", k)
+		}
+	}
+}
+
+// TestCSSNumericCellsRightAligned 表格数值列必须右对齐：数字左对齐时各行位数不同，
+// 视线要来回找小数点，是最显「没做完」的细节。
+func TestCSSNumericCellsRightAligned(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile("(?s)\\.acc\\s+th\\.num[^{]*\\{[^}]*text-align:\\s*right")
+	if !re.MatchString(string(b)) {
+		t.Fatal("缺少「.acc th.num … text-align: right」规则：表格数值列会退回左对齐")
+	}
+}
+
+// TestCSSSwitchIsCustom 配置页的开关必须是纯 CSS 开关（appearance:none）：
+// 一旦退回原生 <input type=checkbox>，14 个开关会变成一排系统小方块——
+// 这是整个面板里最「不像设计」的地方，且 DOM/name 不变，改回去不会报任何错。
+func TestCSSSwitchIsCustom(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	base := regexp.MustCompile("(?s)\\.switch input\\[type=checkbox\\]\\s*\\{[^}]*appearance:\\s*none")
+	if !base.MatchString(html) {
+		t.Fatal(".switch input[type=checkbox] 缺少 appearance:none：原生 checkbox 会重新出现")
+	}
+	if !strings.Contains(html, ".switch input[type=checkbox]:checked") {
+		t.Fatal("缺少开关的 :checked 态：打开后滑块不会变蓝")
+	}
+}
+
+// TestIndexHTMLNavGroups 导航分组标签与 7 个视图必须一一对应：
+// 分组标签丢了只是少一行小字；data-view 丢了则是「点了没反应」级别的故障。
+func TestIndexHTMLNavGroups(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	if got := strings.Count(html, "class=\"nav-sec\""); got < 3 {
+		t.Fatalf("导航分组标签只有 %d 个，至少要有观测/运行/系统 3 段", got)
+	}
+	// 只在 <nav> 里数：body/CSS 里也有 data-view="accounts"（上下文动作开关），
+	// 全文件计数会把它们一起数进去。
+	navStart := strings.Index(html, "id=\"navDrawer\"")
+	navEnd := strings.Index(html, "</nav>")
+	if navStart < 0 || navEnd < navStart {
+		t.Fatal("index.html 找不到导航容器 #navDrawer")
+	}
+	nav := html[navStart:navEnd]
+	for _, v := range []string{"accounts", "usage", "packages", "taskscenter", "models", "config", "logs"} {
+		if got := strings.Count(nav, "data-view=\""+v+"\""); got != 1 {
+			t.Fatalf("导航项 data-view=%q 在 <nav> 里出现 %d 次（应恰好 1 次）", v, got)
+		}
+	}
+}

@@ -426,7 +426,13 @@ const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
-  document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
+  document.querySelectorAll('.nav a').forEach(a => {
+    const on = a.dataset.view === v;
+    a.classList.toggle('on', on);
+    if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+  });
+  // 当前视图挂在 body 上：CSS 用它做「上下文动作」（如仅账号池显示「添加账号」）
+  document.body.dataset.view = v;
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
@@ -454,7 +460,12 @@ setTimeout(() => {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">' +
+      '<div class="ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg></div>' +
+      '<div class="big">账号池是空的</div>' +
+      '添加一个 WorkBuddy 账号后，这里会显示它的可用状态、积分与用量' +
+      '<div class="cta"><button class="primary" data-a="add">添加账号</button></div>' +
+      '</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -624,6 +635,7 @@ $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
+  if (a === 'add') { openAdd(); return; }
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   const done = setBusy(b);
