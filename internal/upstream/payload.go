@@ -29,12 +29,31 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	out, _ := PrepareBodyOptStats(src, sanitize, efforts, defaultEfforts)
+	return out
+}
+
+// RewriteStats 一次出站 body 准备的改写统计。
+//
+// 反代通道看板（internal/channelstat）用它回答「我们为了让请求过通道，改了多少东西」：
+// 这两个数字在 7 天日志里分别是 2,522（developer→system）与指纹清洗次数，是
+// 「上游在识别我们」的直接工作量指标——与请求最终成败无关。
+type RewriteStats struct {
+	// RoleNormalized developer→system 归一的消息条数（协议兼容，非脱敏）。
+	RoleNormalized int
+	// Sanitized 指纹清洗改写的消息条数（sanitize=false 时恒为 0）。
+	Sanitized int
+}
+
+// PrepareBodyOptStats 与 PrepareBodyOptWithEffortsAndDefault 同管线，额外返回改写统计。
+func PrepareBodyOptStats(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) ([]byte, RewriteStats) {
+	var stats RewriteStats
 	if len(src) == 0 {
-		return src
+		return src, stats
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
-		return src
+		return src, stats
 	}
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
@@ -51,7 +70,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
-	normalizeRoles(obj)
+	stats.RoleNormalized = normalizeRoles(obj)
 	normalizeImageURL(obj)
 	dropReasoningContentParts(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
@@ -83,14 +102,14 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	backfillReasoningContent(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
-			sanitizeMessages(msgs)
+			stats.Sanitized = sanitizeMessagesCount(msgs)
 		}
 	}
 	out, err := marshalBodyJSON(obj)
 	if err != nil {
-		return src
+		return src, stats
 	}
-	return out
+	return out, stats
 }
 
 // marshalBodyJSON 序列化出站 body，不做 HTML 转义：Go 的 json.Marshal 会把
@@ -238,7 +257,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 }
 
-// normalizeRoles 把 messages 里的 developer 角色归一为 system。
+// normalizeRoles 把 messages 里的 developer 角色归一为 system，返回改写的消息条数。
 //
 // 背景：上游对 messages 的 role 字段做白名单校验，developer 不在白名单内，
 // 命中即 HTTP 400 code=11128。developer 是 OpenAI 新规范里 system 的别名
@@ -249,11 +268,12 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 //
 // 只认 developer 这一个值：其余 role（system/user/assistant/tool/任意未知值）一律原样保留，
 // 不合并、不重排、不删除任何消息（上游对多 system 的行为尚未实测，合并会引入新变量）。
-func normalizeRoles(obj map[string]any) {
+func normalizeRoles(obj map[string]any) int {
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
-		return
+		return 0
 	}
+	n := 0
 	for i, m := range msgs {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -265,9 +285,11 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
+			n++
 			log.Printf("role normalized developer->system idx=%d", i)
 		}
 	}
+	return n
 }
 
 // normalizeImageURL 兼容 OpenAI chat 多模态内容的两种 image_url 写法。

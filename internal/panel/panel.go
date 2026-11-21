@@ -22,8 +22,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
@@ -74,6 +75,10 @@ type Config struct {
 	// 采样由 scheduler 的余额刷新/签到结束回调写入（见 main 的接线），面板只读。
 	CreditTrend *creditline.Ledger
 
+	// ChannelStats 反代通道事件计数器（nil = 看板只显示请求/失败率与归档部分）。
+	// 事件由网关决策点自增（见 internal/channelstat 的说明），面板只读。
+	ChannelStats *channelstat.Ledger
+
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
@@ -122,14 +127,22 @@ type Panel struct {
 	degradeState func() DegradeState
 }
 
-// DegradeState 反代通道劣化的当前状态（面板看板用；与请求路径同一口径）。
+// DegradeState 反代通道的当前状态（面板看板用；与请求路径同一口径）。
+//
+// 两类字段刻意分开命名：Active/Until/LearnedNow 是**进程内**状态（重启清零），
+// LearnedTotal/DegradeLastAt 是**跨重启**累计（channelstat 账本）。看板必须能
+// 区分二者，否则重启后的「0 条 / 未触发」会被读成「历史上从没发生过」。
 type DegradeState struct {
 	// Active 是否处于提示词降级期（内容拦截误报触发的 Degraded 中性提示词）。
 	Active bool `json:"active"`
 	// Until 降级期截止（次日 00:00 CST）；未触发时为零值。
 	Until time.Time `json:"until,omitempty"`
-	// Learned 已学习「必须伪装成 user 角色」的 system 指纹条数。
-	Learned int `json:"learned"`
+	// LearnedNow 当前生效的「必须伪装成 user」指纹条数（进程内表，24h TTL）。
+	LearnedNow int `json:"learned_now"`
+	// LearnedTotal 累计学习次数（跨重启）。
+	LearnedTotal int64 `json:"learned_total"`
+	// DegradeLastAt 提示词降级最近一次触发时刻（跨重启；从未触发为零值）。
+	DegradeLastAt time.Time `json:"degrade_last_at,omitempty"`
 	// Mode 当前系统提示词模式（passthrough / custom / append）。
 	Mode string `json:"mode"`
 }
@@ -575,7 +588,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 按 style 拼 realm 前缀
-//（调用值即显示值），context_length / max_output_tokens 走四级查找链，effort
+// （调用值即显示值），context_length / max_output_tokens 走四级查找链，effort
 // 档位按 realm 域取 EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models
 // 同一口径，两侧不再漂移。
 //

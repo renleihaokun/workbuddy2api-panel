@@ -237,7 +237,13 @@ func sanitizeToolCalls(v any) bool {
 // system / assistant 才拒。因此 user 与 tool 消息**逐字原样出站**：讨论被拦串、
 // 让模型读改含这些串的仓库文件、翻译原文都不会被改写。
 func sanitizeMessages(messages []any) bool {
-	changed := false
+	return sanitizeMessagesCount(messages) > 0
+}
+
+// sanitizeMessagesCount 与 sanitizeMessages 同逻辑，返回被改写的消息条数
+// （反代通道看板用它统计「指纹清洗工作量」，见 internal/channelstat）。
+func sanitizeMessagesCount(messages []any) int {
+	n := 0
 	for _, msg := range messages {
 		m, ok := msg.(map[string]any)
 		if !ok {
@@ -248,6 +254,7 @@ func sanitizeMessages(messages []any) bool {
 		default:
 			continue // user / tool / 未知角色：上游不读，原样出站
 		}
+		changed := false
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		if c, ok := m["content"]; ok {
@@ -279,6 +286,9 @@ func sanitizeMessages(messages []any) bool {
 				changed = true
 			}
 		}
+		if changed {
+			n++
+		}
 	}
-	return changed
+	return n
 }

@@ -18,8 +18,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -35,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.21.0-panel"
+const appVersion = "1.22.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -108,7 +109,7 @@ func main() {
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
-	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 裸名跨域回退（issue #135，默认关闭）
+	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)           // 裸名跨域回退（issue #135，默认关闭）
 	p.SetCrossDomainModelFallback(cfg.Pool.CrossDomainModelFallback) // 同名模型跨域回退（默认关闭）
 	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
@@ -337,6 +338,15 @@ func main() {
 	log.Printf("[creditline] 积分走势采样已启用: %s（余额刷新/签到结束后落点）",
 		stateSibling(cfg.StateFile, "credit-trend.json"))
 
+	// 反代通道事件计数器：把「上游拦了几次、我们用什么手段救回来」按小时累计，
+	// 落盘后跨重启保留。与请求归档的分工见 internal/channelstat 的包注释。
+	channelStats := channelstat.New(stateSibling(cfg.StateFile, "channel-stats.json"))
+	channelStats.Start()
+	defer channelStats.Stop()
+	// 上游改写（developer→system 归一、指纹清洗）经回调上报；未注入时零开销。
+	up.SetChannelEvents(channelStats.IncN)
+	log.Printf("[channelstat] 反代通道事件计数器已启用: %s", stateSibling(cfg.StateFile, "channel-stats.json"))
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -364,6 +374,8 @@ func main() {
 		CreditHistory: creditHist,
 		// 积分走势采样账本（只读展示；写入由上面的 scheduler 回调完成）。
 		CreditTrend: creditTrend,
+		// 反代通道事件计数器（只读展示；写入由网关决策点与上游改写回调完成）。
+		ChannelStats: channelStats,
 		// 列表 ID 风格与名称前缀：运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的测试路径。
 		ModelsIDStyle:         cfg.Models.IDStyle,
@@ -410,13 +422,23 @@ func main() {
 		// 同名模型跨域回退的目录判据：每域最近一次成功探测的模型名快照
 		// （upstream/catalog.go，只读、零上游调用）。
 		ModelCatalog: up.CatalogModelState,
+		// 反代通道事件计数器（11-128 / 搬移 / 限流 / 流中断…，与请求终态无关）。
+		ChannelStats: channelStats,
 	})
 
 	// 反代劣化看板的「当前状态」源：degradeGate / systemModeGate 都是 handler 的
 	// 进程内私有状态，面板在 handler 之前构造，故此处事后接线（同 SetGrowthHook 风格）。
+	// 进程内字段与跨重启累计字段一并给出，看板据此区分「本进程」与「历史累计」。
 	pn.SetDegradeState(func() panel.DegradeState {
-		active, until, learned, mode := h.DegradeState()
-		return panel.DegradeState{Active: active, Until: until, Learned: learned, Mode: mode}
+		st := h.ChannelState()
+		return panel.DegradeState{
+			Active:        st.Active,
+			Until:         st.Until,
+			LearnedNow:    st.LearnedNow,
+			LearnedTotal:  st.LearnedTotal,
+			DegradeLastAt: st.DegradeLastAt,
+			Mode:          st.Mode,
+		}
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -615,7 +637,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
-	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
+	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback)           // 裸名跨域回退热生效（issue #135）
 	p.SetCrossDomainModelFallback(newCfg.Pool.CrossDomainModelFallback) // 同名模型跨域回退热生效
 	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)

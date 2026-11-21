@@ -409,7 +409,7 @@ type requestTrace struct {
 	// model 非 chat 路径的模型标识（搜索写 "WorkBuddy搜索工具"）。chat 路径由
 	// chatStat.model 覆盖，二者不会同时生效。
 	model string
-	stat    *chatStat
+	stat  *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -669,31 +669,35 @@ var cacheMissWarnEvery = 10 * time.Minute
 
 // noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
 // 命中过 → 触发 WARN（冷却内不重复）。
-func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64) {
+//
+// 返回值表示本次是否真的触发了告警（冷却内/小前缀/未命中过都返回 false），
+// 调用方据此记一次通道事件（反代通道看板的「缓存未命中」）。
+func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64) bool {
 	if model == "" {
-		return
+		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if hit > 0 {
 		c.everHit[model] = true
-		return
+		return false
 	}
 	// hit==0 才可能是整段重算。小前缀（<1000 tok）的 miss 无告警价值；上游未回
 	// miss 字段时按 prompt 全量视为未命中。
 	if prompt < 1000 {
-		return
+		return false
 	}
 	if miss <= 0 {
 		miss = prompt
 	}
 	if !c.everHit[model] {
-		return
+		return false
 	}
 	now := time.Now()
 	if t, ok := c.last[model]; ok && now.Sub(t) < cacheMissWarnEvery {
-		return
+		return false
 	}
 	c.last[model] = now
 	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
+	return true
 }

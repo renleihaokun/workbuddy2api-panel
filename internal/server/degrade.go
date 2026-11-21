@@ -62,12 +62,43 @@ func nextMidnightCST(now time.Time) time.Time {
 	return midnight
 }
 
-// DegradeState 当前「反代通道劣化」的进程内状态快照（只读，面板看板用）：
-// 是否处于提示词降级期、降级期截止、已学习的 system 指纹条数、当前提示词模式。
+// ChannelState 反代通道的当前状态快照（只读，面板看板用）。
+//
+// 为什么要把「进程内」和「跨重启」两类字段分开命名：degradeGate / systemModeGate
+// 都是进程内存状态，重启即清零；如果只看 LearnedNow / Active，重启后的看板会
+// 显示「历史上什么都没发生」——那是错误陈述。LearnedTotal / DegradeLastAt 由
+// channelstat 账本持久化，回答的是「历史上发生过多少次」。
+type ChannelState struct {
+	// Active 当前是否处于提示词降级期（进程内）。
+	Active bool
+	// Until 降级期截止（进程内；未触发时为零值）。
+	Until time.Time
+	// LearnedNow 当前生效的「必须伪装成 user」指纹条数（进程内表，24h TTL）。
+	LearnedNow int
+	// LearnedTotal 累计学习次数（跨重启，来自 channelstat）。
+	LearnedTotal int64
+	// DegradeLastAt 提示词降级最近一次触发时刻（跨重启；从未触发为零值）。
+	DegradeLastAt time.Time
+	// Mode 当前系统提示词模式（passthrough / custom / append）。
+	Mode string
+}
+
+// ChannelState 返回当前反代通道状态快照。
 //
 // 为什么由 handler 暴露而不是放进 panel：degradeGate / systemModeGate 都是
 // handler 的进程内私有状态，面板只能经这条只读出口取值（main 事后接线）。
-func (h *Handler) DegradeState() (active bool, until time.Time, learned int, mode string) {
-	active, until = h.degrade.Status()
-	return active, until, h.sysMode.Len(), h.cfg.PromptMode
+func (h *Handler) ChannelState() ChannelState {
+	active, until := h.degrade.Status()
+	st := ChannelState{
+		Active:     active,
+		Until:      until,
+		LearnedNow: h.sysMode.Len(),
+		Mode:       h.cfg.PromptMode,
+	}
+	if h.cfg.ChannelStats != nil {
+		_, last, total := h.cfg.ChannelStats.Snapshot()
+		st.DegradeLastAt = last
+		st.LearnedTotal = total
+	}
+	return st
 }

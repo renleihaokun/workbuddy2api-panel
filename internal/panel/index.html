@@ -1733,7 +1733,7 @@ button.ghost.danger:hover:not(:disabled) {
     <section class="view" id="view-channel" hidden>
       <div class="box">
         <header>
-          <h3>反代通道健康<span class="hint" title="上游把非官方客户端判成风险时的表现：11-128 通道校验、内容审核、模型下线、限流、WAF、超时。数据来自请求归档（只含脱敏元数据，不含提示词/凭证）。">上游识别 / 拦截趋势</span></h3>
+          <h3>反代通道劣化<span class="hint" title="上游怎么对待我们：11-128 通道校验、内容拦截、模型下线、限流、WAF、流中断。事件计数来自网关决策点（含被救回的请求），失败率来自用量账本，分域来自请求归档。">上游拦截强度</span></h3>
           <span class="grow"></span>
           <span class="note" id="dgNote">—</span>
           <span class="trange" id="dgRange"></span>
@@ -1744,26 +1744,35 @@ button.ghost.danger:hover:not(:disabled) {
           <div class="dginfo" id="dgState"></div>
           <div class="uschart">
             <div class="uschart-hd">
-              <span class="lb">结果构成（100% 堆叠）</span>
-              <span class="note" id="dgChartNote">—</span>
+              <span class="lb">拦截事件</span>
+              <span class="note" id="dgEventNote">—</span>
               <span class="grow"></span>
               <span class="legend" id="dgLegend"></span>
             </div>
-            <div id="dgChart" class="uschart-body"></div>
+            <div id="dgEventChart" class="uschart-body"></div>
+          </div>
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">失败率</span>
+              <span class="note" id="dgRateNote">—</span>
+              <span class="grow"></span>
+              <span class="legend" id="dgRateLegend"></span>
+            </div>
+            <div id="dgRateChart" class="uschart-body"></div>
           </div>
         </div>
       </div>
 
       <div class="box">
         <header>
-          <h3>错误分类</h3>
+          <h3>事件分类</h3>
           <span class="grow"></span>
           <span class="note" id="dgKindNote">—</span>
         </header>
         <div class="tbl-wrap">
           <table class="acc zebra">
             <thead><tr>
-              <th>类型</th><th class="num">次数</th><th class="num">占请求</th><th>最近一次</th>
+              <th>类型</th><th class="num">次数</th><th class="num">每千请求</th><th>最近一次</th>
             </tr></thead>
             <tbody id="dgKindBody"></tbody>
           </table>
@@ -1774,14 +1783,13 @@ button.ghost.danger:hover:not(:disabled) {
         <header>
           <h3>分域对比</h3>
           <span class="grow"></span>
-          <span class="note">成功 = 上游读完且无 error 帧；「跨域回退」含裸名与同名模型两种回退</span>
+          <span class="note" id="dgRealmNote">—</span>
         </header>
         <div class="tbl-wrap">
           <table class="acc zebra">
             <thead><tr>
-              <th>域</th><th class="num">请求</th><th class="num">成功</th><th class="num">失败</th>
-              <th class="num">成功率</th><th class="num">平均耗时</th><th class="num">平均 TTFB</th>
-              <th class="num">跨域回退</th>
+              <th>域</th><th class="num">请求</th><th class="num">成功</th>
+              <th class="num">成功率</th><th class="num">跨域回退</th>
             </tr></thead>
             <tbody id="dgRealmBody"></tbody>
           </table>

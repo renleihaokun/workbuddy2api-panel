@@ -128,6 +128,9 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		c.globalModels.names = nil
 		c.globalModels.infos = nil
 		c.globalModels.Unlock()
+		// 通道事件（反代通道看板）：global 目录探测失败 = 通道可用性下降的信号，
+		// 与请求成败无关（不影响正在跑的对话，但会让跨域回退失去目录依据）。
+		c.noteChannelEvent("catalog_fail", 1)
 		return nil, nil
 	}
 	// global 域 effort 能力：探测下发的 supportedEfforts/defaultEffort 权威写入 global 桶

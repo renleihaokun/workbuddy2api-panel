@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
@@ -99,6 +100,52 @@ type Config struct {
 	// 探测到时不猜，这是「另一域确有同名模型」这条前提的兜底。
 	// 生产由 main 注入 upstream.Client.CatalogModelState；测试注入固定桩。
 	ModelCatalog func(realm, model string) upstream.CatalogState
+
+	// ChannelStats 反代通道事件计数器（internal/channelstat）。nil = 不统计。
+	//
+	// 与请求归档的分工：归档记**终态**（成功/失败），本计数器记**过程**
+	// （11-128 被拦、system→user 搬移、限流、流中断…）。11-128 被救回后终态是
+	// 200，归档里看不出上游拦过我们——那恰恰是反代通道劣化的核心信号。
+	ChannelStats *channelstat.Ledger
+}
+
+// noteEvent 记一次通道事件（未注入计数器时零开销）。
+func (h *Handler) noteEvent(kind string) {
+	if h.cfg.ChannelStats != nil && kind != "" {
+		h.cfg.ChannelStats.Inc(kind)
+	}
+}
+
+// noteKind 把上游分类映射成通道事件。
+// 只记与「通道 / 配额 / 容量」相关的类型：请求级错误（参数错、上下文超长、
+// 图片无效、账号故障）换任何账号都一样失败，与通道劣化无关，记了只会稀释信号。
+func (h *Handler) noteKind(kind upstream.ErrKind) {
+	switch kind {
+	case upstream.ErrChannelRefused, // 11-128 通道校验（核心信号）
+		upstream.ErrContentBlocked, // 内容策略拦截
+		upstream.ErrModelBusy,      // 14003 模型忙
+		upstream.ErrUpstreamBusy,   // 6021 渠道满载
+		upstream.ErrWafBlock,       // 403 WAF
+		upstream.ErrModelBlocked,   // 11102 模型不可用
+		upstream.ErrSoftRate,       // 429 软限流（含 6004 模型级限流）
+		upstream.ErrHardCredit:     // 402 余额不足
+		h.noteEvent(kind.String())
+	}
+}
+
+// rememberSystem 记住「必须伪装成 user」的 system 指纹，并累计**新学到的**条数。
+//
+// 只在首次学习时计数：成功路径的 Remember 同时承担「滑窗续期」职责，每次伪装
+// 请求都会调一次——按调用次数计会把「同一个指纹用了一百次」记成学习一百次。
+func (h *Handler) rememberSystem(key string) {
+	if key == "" {
+		return
+	}
+	known := h.sysMode.Known(key)
+	h.sysMode.Remember(key)
+	if !known && h.cfg.ChannelStats != nil {
+		h.cfg.ChannelStats.AddLearned(1)
+	}
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -1092,6 +1139,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				systemConverted = true
 				st.sysAsUser = true
+				// 通道事件：上游把请求判成「非官方客户端」→ 我们用 system→user 搬移救回。
+				// 这是反代通道劣化的核心信号，与本次请求最终成败无关（救回也是成功）。
+				h.noteEvent("channel_refused")
+				h.noteEvent("sys_as_user")
 				body = moved
 				log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(sysKey))
@@ -1119,6 +1170,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				st.fail("timeout")
+				h.noteEvent("timeout")
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
@@ -1148,11 +1200,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
+			// 通道事件：每次失败尝试按上游分类记一次（11-128 / 限流 / 容量 / WAF /
+			// 模型不可用…）。请求级错误（参数错、上下文超长、图片无效）不算通道劣化，
+			// 由 noteKind 过滤掉——它们换任何账号都会一样失败，与通道无关。
+			h.noteKind(kind)
 			// 学习（层 3）：伪装后通道校验不再被拒（任何非 11-128 的结果都说明
 			// 通道过了）→ 记住这段 system 原文。反向不学：伪装后仍是 11-128 说明
 			// 指纹在 assistant/tool 历史里搬不走，记下来只会让后续请求白走伪装。
 			if systemConverted && kind != upstream.ErrChannelRefused && sysKey != "" {
-				h.sysMode.Remember(sysKey)
+				h.rememberSystem(sysKey)
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
@@ -1161,6 +1217,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
 			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
+				// 降级触发时刻落盘：进程内状态重启清零，看板需要「上次触发」。
+				if h.cfg.ChannelStats != nil {
+					h.cfg.ChannelStats.MarkDegrade(time.Now())
+				}
+				h.noteEvent("degrade_trigger")
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
 				// system 已整段换成 Degraded → 学习键必须重算：否则 11-128 分支会拿
@@ -1311,7 +1372,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 学习（层 3，成功路径）：伪装后这一跳真的成功了 → 同样记住这段 system。
 		// 已学习的键在这里刷新 TTL（滑窗：还在用的提示词不因过期被重新撞一次 400）。
 		if systemConverted && sysKey != "" {
-			h.sysMode.Remember(sysKey)
+			h.rememberSystem(sysKey)
 		}
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
@@ -1346,6 +1407,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
 				st.fail("empty_stream")
+				h.noteEvent("empty_stream")
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1357,6 +1419,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
 				st.fail(kind.String())
+				// 通道事件：流内 11-128 / 限流 / 内容拦截同样计入——这类拒绝发生在
+				// 已经 200 之后，归档里是 stream_error，看板不数就永远看不见。
+				h.noteKind(kind)
+				h.noteEvent("stream_error")
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case sErr != nil:
@@ -1366,6 +1432,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					st.status = http.StatusBadGateway
 					st.outcome = reqlog.OutcomeStreamError
 					st.fail("stream_read_error")
+					h.noteEvent("stream_read_error")
 					log.Printf("WARN: [server] stream acct=%s model=%s: upstream read error: %v",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 					break
@@ -1399,7 +1466,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
-				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+				if cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss) {
+					h.noteEvent("cache_miss")
+				}
 			}
 			if n := repair.Converted(); n > 0 {
 				// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
@@ -1482,7 +1551,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		if st.hasCache {
-			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+			if cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss) {
+				h.noteEvent("cache_miss")
+			}
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK

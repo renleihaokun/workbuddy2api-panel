@@ -3998,214 +3998,81 @@ if ($('btnExpFold')) {
 applyExpFold();
 
 /* ══ 反代劣化看板 ═══════════════════════════════════════════════════════
-   上游对反代通道的识别与拦截（11-128 通道校验 / 内容拦截 / 11102 模型下线 /
-   限流 / WAF / 超时）是**随时间劣化**的：只看当前成功率回答不了「是不是越来越差」。
-   这里把请求归档按时间桶摊开，用 100% 堆叠柱看构成变化，配错误分类表与分域对比。
-   数据全部来自 /panel/api/channel_health（后端流式聚合归档，不触发上游调用）。 */
+   看的是「上游怎么对待我们」，不是「请求最终成功没有」。
+
+   11-128 被 system→user 搬移救回后终态是 200，用请求归档画成功率永远看不出劣化；
+   这里改用网关决策点上的事件计数（channel_health 的 events 段）：主图是拦截事件
+   堆叠柱，副图是失败率折线（量程固定小，0.3% 也看得见）。 */
 
 let channelData = null;
 
-/* DG_SERIES 结果构成的系列定义：kinds 命中的失败分类合并成一段；kinds=null 表示
-   「其余失败」= 总请求 − 成功 − 已列分类（后端不预先分组，前端只负责排版与配色）。 */
-const DG_SERIES = [
-  { key: 'success', label: '成功', color: 'var(--ok)' },
+/* CH_EVENT_SERIES 事件分组：只放「上游动作 + 本地观测」里量级相近的几类。
+   刻意不放两类：① sys_as_user 与 channel_refused 几乎一一对应（每次拦截都尝试搬移），
+   叠在一起等于把同一件事画两遍；② sanitize / role_normalized 是**按消息条数**计的工作量
+   （7 天 7k+），和「按请求计」的拦截事件差两个数量级，混进来会把柱子压平。
+   两者都在 KPI 与事件表里。kinds=null 表示「其余」= 桶内 total − 已列 kinds 之和。 */
+const CH_EVENT_SERIES = [
   { key: 'channel_refused', label: '通道拒绝', color: 'var(--bad)', kinds: ['channel_refused'] },
-  { key: 'content_blocked', label: '内容拦截', color: 'var(--warn)', kinds: ['content_blocked'] },
-  { key: 'model_blocked', label: '模型不可用', color: 'var(--chart-6)', kinds: ['model_blocked'] },
-  { key: 'throttled', label: '限流·拥塞', color: 'var(--chart-4)',
-    kinds: ['soft_rate', 'hard_credit', 'model_busy', 'upstream_busy'] },
-  { key: 'other', label: '其他失败', color: 'var(--ink-3)', kinds: null },
+  { key: 'throttled', label: '限流·容量', color: 'var(--chart-4)',
+    kinds: ['soft_rate', 'hard_credit', 'model_busy', 'upstream_busy', 'waf_block', 'model_blocked'] },
+  { key: 'stream', label: '流中断·超时', color: 'var(--chart-2)',
+    kinds: ['stream_error', 'stream_read_error', 'empty_stream', 'timeout'] },
+  { key: 'other', label: '其他', color: 'var(--ink-3)', kinds: null },
 ];
 
-/* dgSeriesCount 取某个桶里某系列的数量（other 走「剩余」口径）。 */
-function dgSeriesCount(b, s) {
-  const kinds = (b && b.kinds) || {};
-  if (s.key === 'success') return Number(b && b.success || 0);
+/* chOtherKinds 不进图的类型：由 KPI / 事件表单独呈现（见上面的取舍说明）。 */
+const CH_OFFCHART_KINDS = ['sys_as_user', 'sanitize', 'role_normalized'];
+
+/* chSeriesCount 取某个桶里某系列的数量（other 走「剩余」口径：桶内 total 减掉
+   所有已列 kinds 与不进图的 kinds，见 CH_OFFCHART_KINDS）。 */
+function chSeriesCount(pt, s) {
+  const kinds = (pt && pt.kinds) || {};
   if (s.kinds) {
     let n = 0;
     for (const k of s.kinds) n += Number(kinds[k] || 0);
     return n;
   }
   let listed = 0;
-  for (const x of DG_SERIES) {
+  for (const x of CH_EVENT_SERIES) {
     if (!x.kinds) continue;
     for (const k of x.kinds) listed += Number(kinds[k] || 0);
   }
-  return Math.max(0, Number(b && b.requests || 0) - Number(b && b.success || 0) - listed);
+  for (const k of CH_OFFCHART_KINDS) listed += Number(kinds[k] || 0);
+  return Math.max(0, Number(pt && pt.total || 0) - listed);
 }
 
-function dgPct(part, total) {
+/* chChartTotal 桶内「进图的事件数」合计（不含脱敏改写与搬移重试）。 */
+function chChartTotal(pt) {
+  let n = 0;
+  for (const s of CH_EVENT_SERIES) n += chSeriesCount(pt, s);
+  return n;
+}
+
+function chPct(part, total) {
   const t = Number(total || 0);
   if (!t) return '—';
   return (Number(part || 0) / t * 100).toFixed(1) + '%';
 }
 
-function dgRateChip(label, value, total, cls) {
-  const n = Number(value || 0);
-  return '<span class="dchip' + (n > 0 && cls ? ' ' + cls : '') + '">' + esc(label) +
-    ' <b>' + (total ? dgPct(n, total) : '—') + '</b></span>';
+function chNum(v) {
+  const n = Number(v || 0);
+  return n > 0 ? fmtTok(n) : '0';
 }
 
-/* renderChannelHealth 画整个看板：KPI、降级状态条、堆叠图、分类表、分域表。 */
-function renderChannelHealth(d) {
-  channelData = d || {};
-  const t = channelData.totals || {};
-  const reqs = Number(t.requests || 0);
-  const kinds = channelData.kinds || [];
-  const kindCount = k => {
-    const hit = kinds.find(x => x.kind === k);
-    return hit ? Number(hit.count || 0) : 0;
-  };
-  const throttled = kindCount('soft_rate') + kindCount('hard_credit') +
-    kindCount('model_busy') + kindCount('upstream_busy');
-
-  $('dgStats').innerHTML =
-    usKpi(fmtTok(reqs), '请求数', 'c-accent',
-      reqs ? (Number(t.success || 0) + ' 次成功 · ' + (reqs - Number(t.success || 0)) + ' 次失败') : '窗口内无请求') +
-    usKpi(reqs ? Number(t.success_rate || 0).toFixed(1) + '%' : '—', '成功率', 'c-ok',
-      '成功 = 上游读完且无 error 帧') +
-    usKpi(dgPct(kindCount('channel_refused'), reqs), '通道拒绝', kindCount('channel_refused') ? 'c-warn' : 'c-mute',
-      '11-128：上游认为请求不是官方客户端') +
-    usKpi(dgPct(kindCount('content_blocked'), reqs), '内容拦截', kindCount('content_blocked') ? 'c-warn' : 'c-mute',
-      'blocked by security policy（含指纹误报）') +
-    usKpi(dgPct(kindCount('model_blocked'), reqs), '模型不可用', kindCount('model_blocked') ? 'c-warn' : 'c-mute',
-      '11102 / 该模型整池冷却') +
-    usKpi(dgPct(throttled, reqs), '限流·拥塞', throttled ? 'c-warn' : 'c-mute',
-      '6004 / 14003 / 6021 / 402');
-
-  // 降级状态条：提示词模式、是否在降级期、已学习指纹、跨域回退。
-  const deg = channelData.degrade || {};
-  let state = '';
-  if (deg.available) {
-    state += '<span class="dchip">提示词模式 <b>' + esc(deg.mode || '—') + '</b></span>';
-    state += deg.active
-      ? '<span class="dchip warn">提示词降级中 <b>至 ' + esc(fmtStampShort(deg.until)) + '</b></span>'
-      : '<span class="dchip ok">提示词降级 <b>未触发</b></span>';
-    state += '<span class="dchip">已学习指纹 <b>' + Number(deg.learned || 0) + ' 条</b></span>';
-  } else {
-    state += '<span class="dchip">降级状态 <b>不可用</b></span>';
-  }
-  state += '<span class="dchip">跨域回退 <b>' + Number(t.fallbacks || 0) + ' 次</b></span>';
-  state += '<span class="dchip">降级提示词请求 <b>' + Number(t.degraded || 0) + ' 次</b></span>';
-  $('dgState').innerHTML = state;
-
-  // 口径说明：窗口 + 桶粒度 + 归档状态。
-  const win = channelData.window_from
-    ? String(channelData.window_from).replace('T', ' ').slice(0, 16) +
-      (channelData.window_to ? ' → ' + String(channelData.window_to).replace('T', ' ').slice(0, 16) : '')
-    : trangeLabel('dgRange');
-  const arc = channelData.archive || {};
-  $('dgNote').textContent = win + ' · ' + (channelData.bucket === 'day' ? '按日' : '按小时') +
-    (arc.enabled ? ' · 归档 ' + (arc.files || 0) + ' 个文件' : ' · 归档已关闭');
-  $('dgNote').title = $('dgNote').textContent;
-
-  // 图例：色块 + 名称。
-  $('dgLegend').innerHTML = DG_SERIES.map(s =>
-    '<i class="sw" style="background:' + s.color + '"></i>' + esc(s.label)).join('');
-  $('dgChartNote').textContent = (channelData.bucket === 'day' ? '按日' : '按小时') +
-    ' · ' + (channelData.buckets || []).length + ' 个桶';
-
-  renderChannelChart(channelData.buckets || []);
-
-  // 错误分类表。
-  if (!kinds.length) {
-    $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">' +
-      (reqs ? '窗口内没有失败请求。' : '该时间窗内没有请求记录。') + '</div></td></tr>';
-    $('dgKindNote').textContent = '—';
-  } else {
-    $('dgKindBody').innerHTML = kinds.map(k =>
-      '<tr><td>' + esc(k.label || k.kind) + '</td>' +
-      '<td class="num">' + fmtTok(k.count) + '</td>' +
-      '<td class="num">' + esc(dgPct(k.count, reqs)) + '</td>' +
-      '<td>' + esc(fmtStampShort(k.last_at)) + '</td></tr>').join('');
-    $('dgKindNote').textContent = kinds.length + ' 类失败 · 按次数降序';
-  }
-
-  // 分域对比表。
-  const realms = channelData.realms || {};
-  const rows = ['cn', 'global', 'unknown'].filter(r => realms[r]).map(r => {
-    const a = realms[r] || {};
-    const n = Number(a.requests || 0);
-    const failed = n - Number(a.success || 0);
-    return '<tr><td>' + esc(r === 'unknown' ? '未标注' : r) + '</td>' +
-      '<td class="num">' + fmtTok(n) + '</td>' +
-      '<td class="num">' + fmtTok(a.success) + '</td>' +
-      '<td class="num">' + fmtTok(failed) + '</td>' +
-      '<td class="num">' + (n ? Number(a.success_rate || 0).toFixed(1) + '%' : '—') + '</td>' +
-      '<td class="num">' + fmtMs(a.avg_duration_ms) + '</td>' +
-      '<td class="num">' + fmtMs(a.avg_ttfb_ms) + '</td>' +
-      '<td class="num">' + fmtTok(a.fallbacks) + '</td></tr>';
-  });
-  $('dgRealmBody').innerHTML = rows.length ? rows.join('') :
-    '<tr><td colspan="8"><div class="empty inline">该时间窗内没有请求记录。</div></td></tr>';
+/* chNarrow 窄屏判定：440 宽 viewBox + 更少刻度（与用量图同口径）。 */
+function chNarrow() {
+  return typeof matchMedia === 'function' && matchMedia('(max-width: 760px)').matches;
 }
 
-/* renderChannelChart 画 100% 堆叠柱：每根柱子按该桶请求数归一化，看的是「构成」，
-   绝对量在 KPI 与表格里（100% 图看趋势更直观，不会被流量高峰压扁）。 */
-function renderChannelChart(buckets) {
-  const host = $('dgChart');
-  if (!host) return;
-  const pts = [];
-  for (const b of buckets || []) {
-    const t = parsePointTime({ t: b.t, scope: b.scope });
-    if (t === null) continue;
-    pts.push({ t, raw: b.t, scope: b.scope, b });
-  }
-  if (!pts.length) {
-    host.innerHTML = '<div class="us-empty">该时间窗内没有请求记录。</div>';
-    return;
-  }
-  // 窄屏用 440 宽的 viewBox：1200 缩到 330px 宽时刻度只剩 ~3px（手机端 mobile.css
-  // 把 .tk 提到 13px，配 440 宽约 10px 有效字号，与用量图的手机版同口径）。
-  const narrow = typeof matchMedia === 'function' && matchMedia('(max-width: 760px)').matches;
-  const W = narrow ? 440 : 1200, H = narrow ? 230 : 220, PL = narrow ? 46 : 52, PR = narrow ? 10 : 14, PT = 16, PB = 30;
-  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
-  const t0 = pts[0].t, span = Math.max(1, pts[pts.length - 1].t - t0);
-
-  let minGap = Infinity;
-  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
-  if (!isFinite(minGap) || minGap <= 0) minGap = span;
-  const slot = iw * (minGap / span);
-  const bw = Math.max(2, Math.min(narrow ? 16 : 30, slot * 0.7));
-  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
-
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
-  // y 轴 0/25/50/75/100%
-  for (let i = 0; i <= 4; i++) {
-    const y = PT + ih - (ih * i / 4);
-    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
-           '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
-           '" text-anchor="end">' + (i * 25) + '%</text>';
-  }
-  for (const p of pts) {
-    const total = Number(p.b.requests || 0);
-    const x = xOf(p.t) - bw / 2;
-    out += '<g><title>' + esc(p.raw) + '  ' + total + ' 次请求 · 成功 ' +
-           Number(p.b.success || 0) + ' / 失败 ' + (total - Number(p.b.success || 0)) +
-           '</title>';
-    if (total > 0) {
-      let acc = 0; // 已堆叠的百分比（从顶往下画）
-      for (const s of DG_SERIES) {
-        const n = dgSeriesCount(p.b, s);
-        if (n <= 0) continue;
-        const h = ih * (n / total);
-        const y = yBase - ih * ((acc + n) / total);
-        out += '<rect class="dbar" x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
-               '" width="' + bw.toFixed(2) + '" height="' + Math.max(1, h).toFixed(2) +
-               '" fill="' + s.color + '"/>';
-        acc += n;
-      }
-    }
-    out += '</g>';
-  }
-  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
-         '" y2="' + yBase + '"/>';
-  // x 轴刻度：等距目标取最近的真实柱子（与用量图同口径）；窄屏只放 4 个。
-  const TICKS = Math.min(narrow ? 4 : 6, pts.length);
+/* chTicks 取等距目标最近的真实点（去重），用于 x 轴标签。 */
+function chTicks(pts, count) {
+  const out = [];
+  if (!pts.length) return out;
+  const t0 = pts[0].t;
+  const span = Math.max(1, pts[pts.length - 1].t - t0);
   const used = new Set();
-  for (let k = 0; k < TICKS; k++) {
-    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+  for (let k = 0; k < count; k++) {
+    const target = t0 + span * (count === 1 ? 0.5 : k / (count - 1));
     let bi = 0, best = Infinity;
     for (let i = 0; i < pts.length; i++) {
       const dd = Math.abs(pts[i].t - target);
@@ -4213,15 +4080,264 @@ function renderChannelChart(buckets) {
     }
     if (used.has(bi)) continue;
     used.add(bi);
-    const p = pts[bi];
+    out.push(pts[bi]);
+  }
+  return out;
+}
+
+/* chTimeLabel 轴标签：日桶 → MM-DD；小时桶跨多天 → MM-DD HH；单天内 → HH:00。
+   7 天窗口用小时桶时只写「22:00」会在图上重复 7 次，读不出是哪一天。
+   注意用 raw（原始字符串）而不是 t（parsePointTime 之后的毫秒数）。 */
+function chTimeLabel(p, spanMs) {
+  const t = String((p && (p.raw || p.t)) || '');
+  if (p && p.scope === 'day') return t.slice(5);
+  if (spanMs > 48 * 3600 * 1000 && t.length >= 13) return t.slice(5, 13).replace('T', ' ');
+  return fmtTokTimeLabel({ t: t, scope: p && p.scope });
+}
+
+/* chXLabels 画 x 轴刻度标签（首尾贴边时改锚点，避免被裁）。 */
+function chXLabels(pts, xOf, W, PL, PR, y) {
+  let out = '';
+  const span = pts.length > 1 ? Math.max(1, pts[pts.length - 1].t - pts[0].t) : 1;
+  for (const p of chTicks(pts, chNarrow() ? 4 : 6)) {
     const cx = xOf(p.t);
     const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
     out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
-           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' +
-           esc(fmtTokTimeLabel(p)) + '</text>';
+      '" y="' + y + '" text-anchor="' + anchor + '">' + esc(chTimeLabel(p, span)) + '</text>';
   }
+  return out;
+}
+
+/* renderChannelEventChart 拦截事件堆叠柱（按次数，不归一化——归一化会让「一天 3 次」
+   和「一天 300 次」长得一样）。 */
+function renderChannelEventChart(points) {
+  const host = $('dgEventChart');
+  if (!host) return;
+  const pts = [];
+  for (const p of points || []) {
+    const t = parsePointTime({ t: p.t, scope: p.scope });
+    if (t === null) continue;
+    pts.push({ t, raw: p.t, scope: p.scope, p });
+  }
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">该时间窗内没有事件数据。</div>';
+    return;
+  }
+  let max = 0;
+  for (const p of pts) max = Math.max(max, chChartTotal(p.p));
+  if (!max) {
+    host.innerHTML = '<div class="us-empty">该时间窗内没有拦截事件（请求全部一次通过）。</div>';
+    return;
+  }
+  const narrow = chNarrow();
+  const W = narrow ? 440 : 1200, H = narrow ? 230 : 220;
+  const PL = narrow ? 46 : 56, PR = narrow ? 10 : 14, PT = 16, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const t0 = pts[0].t, span = Math.max(1, pts[pts.length - 1].t - t0);
+
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const bw = Math.max(2, Math.min(narrow ? 16 : 30, iw * (minGap / span) * 0.7));
+  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
+  const yOf = v => yBase - ih * (v / max);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
+  for (let i = 0; i <= 4; i++) {
+    const y = yBase - ih * i / 4;
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+      '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+      '" text-anchor="end">' + fmtTok(Math.round(max * i / 4)) + '</text>';
+  }
+  for (const p of pts) {
+    const total = chChartTotal(p.p);
+    const x = xOf(p.t) - bw / 2;
+    out += '<g><title>' + esc(p.raw) + '  ' + total + ' 次拦截事件' + '</title>';
+    if (total > 0) {
+      let acc = 0;
+      for (const s of CH_EVENT_SERIES) {
+        const n = chSeriesCount(p.p, s);
+        if (n <= 0) continue;
+        const y = yBase - ih * ((acc + n) / max);
+        out += '<rect class="dbar" x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
+          '" width="' + bw.toFixed(2) + '" height="' + Math.max(1, ih * n / max).toFixed(2) +
+          '" fill="' + s.color + '"/>';
+        acc += n;
+      }
+    }
+    out += '</g>';
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) + '" y2="' + yBase + '"/>';
+  out += chXLabels(pts, xOf, W, PL, PR, PT + ih + 15);
   out += '</svg>';
   host.innerHTML = out;
+}
+
+/* renderChannelRateChart 失败率折线：y 轴固定小量程（默认 0–2%），99.7% 成功率下
+   那 0.3% 也看得见；峰值超量程时抬到峰值 ×1.2。没有请求的桶不画点（避免 0/0 假谷）。 */
+function renderChannelRateChart(points) {
+  const host = $('dgRateChart');
+  if (!host) return;
+  const pts = [];
+  for (const p of points || []) {
+    const req = Number(p.req || 0);
+    if (!req) continue;
+    const t = parsePointTime({ t: p.t, scope: p.scope });
+    if (t === null) continue;
+    pts.push({ t, raw: p.t, scope: p.scope, req, err: Number(p.err || 0),
+               rate: Number(p.err || 0) / req * 100 });
+  }
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">该时间窗内没有请求记录（失败率需要用量账本）。</div>';
+    return;
+  }
+  let peak = 0;
+  for (const p of pts) peak = Math.max(peak, p.rate);
+  const top = Math.max(2, peak * 1.2);
+  const narrow = chNarrow();
+  const W = narrow ? 440 : 1200, H = narrow ? 200 : 190;
+  const PL = narrow ? 40 : 50, PR = narrow ? 10 : 14, PT = 14, PB = 28;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const t0 = pts[0].t;
+  const span = Math.max(1, pts[pts.length - 1].t - t0);
+  const xOf = t => pts.length === 1 ? PL + iw / 2 : PL + (t - t0) / span * iw;
+  const yOf = v => yBase - ih * Math.min(1, v / top);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
+  for (let i = 0; i <= 2; i++) {
+    const y = yBase - ih * i / 2;
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+      '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+      '" text-anchor="end">' + (top * i / 2).toFixed(top < 10 ? 1 : 0) + '%</text>';
+  }
+  if (pts.length > 1) {
+    let area = 'M' + xOf(pts[0].t).toFixed(1) + ',' + yBase.toFixed(1);
+    for (const p of pts) area += ' L' + xOf(p.t).toFixed(1) + ',' + yOf(p.rate).toFixed(1);
+    area += ' L' + xOf(pts[pts.length - 1].t).toFixed(1) + ',' + yBase.toFixed(1) + ' Z';
+    out += '<path class="ctarea" d="' + area + '"/>';
+    const line = pts.map(p => xOf(p.t).toFixed(1) + ',' + yOf(p.rate).toFixed(1)).join(' ');
+    out += '<polyline class="ctl ctl-total" points="' + line + '"/>';
+  }
+  if (pts.length <= 80) {
+    for (const p of pts) {
+      out += '<g><title>' + esc(p.raw) + '  ' + p.err + '/' + p.req + ' 失败（' +
+        p.rate.toFixed(2) + '%）</title>' +
+        '<circle class="ctdot" cx="' + xOf(p.t).toFixed(1) + '" cy="' + yOf(p.rate).toFixed(1) +
+        '" r="2.6"/></g>';
+    }
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) + '" y2="' + yBase + '"/>';
+  out += chXLabels(pts, xOf, W, PL, PR, PT + ih + 15);
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
+/* renderChannelHealth 画整个看板：KPI、状态条、两张图、事件表、分域表。 */
+function renderChannelHealth(d) {
+  channelData = d || {};
+  const t = channelData.totals || {};
+  const kinds = t.kinds || {};
+  const reqs = Number(t.requests || 0);
+  const refused = Number(kinds.channel_refused || 0);
+  const moved = Number(kinds.sys_as_user || 0);
+  const rewrite = Number(kinds.sanitize || 0) + Number(kinds.role_normalized || 0);
+  const throttled = ['soft_rate', 'hard_credit', 'model_busy', 'upstream_busy', 'waf_block', 'model_blocked']
+    .reduce((a, k) => a + Number(kinds[k] || 0), 0);
+  const st = channelData.state || {};
+  const src = channelData.sources || {};
+
+  $('dgStats').innerHTML =
+    usKpi(fmtTok(reqs), '请求数', 'c-accent',
+      reqs ? (Number(t.errors || 0) + ' 次失败') : '窗口内无请求') +
+    usKpi(reqs ? Number(t.failure_rate || 0).toFixed(1) + '%' : '—', '失败率', 'c-ok',
+      '终态失败 / 全部请求') +
+    usKpi(chNum(refused), '11-128 拦截', refused ? 'c-warn' : 'c-mute',
+      reqs ? chPct(refused, reqs) + ' 的请求被拦（含已救回）' : '上游通道校验') +
+    usKpi(chNum(moved), '搬移重试', moved ? 'c-warn' : 'c-mute',
+      refused ? '救回率 ' + chPct(moved, refused) + '（按拦截次数）' : 'system→user 救回次数') +
+    usKpi(chNum(rewrite), '脱敏改写', rewrite ? 'c-accent' : 'c-mute',
+      'developer→system 归一 + 指纹清洗') +
+    usKpi(chNum(throttled), '限流·容量', throttled ? 'c-warn' : 'c-mute',
+      '6004 / 14003 / 6021 / 402 / WAF');
+
+  // 状态条：进程内状态与跨重启累计分开标注，避免把「刚重启」读成「从没发生过」。
+  let chips = '';
+  chips += '<span class="dchip">提示词模式 <b>' + esc(st.mode || '—') + '</b></span>';
+  if (st.active) {
+    chips += '<span class="dchip warn">提示词降级中 <b>至 ' + esc(fmtStampShort(st.until)) + '</b></span>';
+  } else {
+    chips += '<span class="dchip ok">降级 <b>本进程未触发</b></span>';
+  }
+  chips += '<span class="dchip">上次触发 <b>' +
+    (st.degrade_last_at ? esc(fmtStampShort(st.degrade_last_at)) : '从未') + '</b></span>';
+  chips += '<span class="dchip">已学习指纹 <b>本进程 ' + Number(st.learned_now || 0) +
+    ' 条 / 累计 ' + Number(st.learned_total || 0) + ' 次</b></span>';
+  let fallbacks = 0;
+  for (const r of Object.values(channelData.realms || {})) fallbacks += Number(r.fallbacks || 0);
+  chips += '<span class="dchip">跨域回退 <b>' + fallbacks + ' 次</b></span>';
+  $('dgState').innerHTML = chips;
+
+  // 口径说明：窗口 + 桶粒度 + 事件数据的起点（1.22.0 才开始累计）。
+  const win = (channelData.window_from || '').replace('T', ' ').slice(0, 16) + ' → ' +
+    (channelData.window_to || '').replace('T', ' ').slice(0, 16);
+  $('dgNote').textContent = win + ' · ' + (channelData.bucket === 'day' ? '按日' : '按小时');
+  $('dgNote').title = $('dgNote').textContent;
+
+  const evSince = (src.events && src.events.since) ? fmtStampShort(src.events.since) : '';
+  $('dgEventNote').textContent = (evSince
+    ? '事件数据自 ' + evSince + ' 起累计'
+    : '事件数据从本版本开始累计') + ' · ' + (channelData.bucket === 'day' ? '按日' : '按小时');
+  $('dgLegend').innerHTML = CH_EVENT_SERIES.map(s =>
+    '<i class="sw" style="background:' + s.color + '"></i>' + esc(s.label)).join('');
+
+  const reqCount = (channelData.requests || []).length;
+  $('dgRateNote').textContent = reqCount
+    ? reqCount + ' 个时间片 · 来自用量账本（90 天）'
+    : '用量账本里没有这段时间的请求';
+  $('dgRateLegend').innerHTML = '<i class="sw" style="background:var(--accent)"></i>失败率';
+
+  renderChannelEventChart(channelData.events || []);
+  renderChannelRateChart(channelData.requests || []);
+
+  // 事件表：类型 / 次数 / 每千请求 / 最近一次。
+  const rows = channelData.kinds || [];
+  if (!rows.length) {
+    $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">' +
+      (src.events && src.events.available ? '该时间窗内没有拦截事件。' : '事件数据从本版本开始累计，稍后即可看到。') +
+      '</div></td></tr>';
+    $('dgKindNote').textContent = '—';
+  } else {
+    $('dgKindBody').innerHTML = rows.map(k =>
+      '<tr><td>' + esc(k.label || k.kind) + '</td>' +
+      '<td class="num">' + fmtTok(k.count) + '</td>' +
+      '<td class="num">' + (Number(k.per_1k || 0) ? Number(k.per_1k).toFixed(2) : '—') + '</td>' +
+      '<td>' + esc(k.last_at ? fmtStampShort(k.last_at) : '—') + '</td></tr>').join('');
+    $('dgKindNote').textContent = rows.length + ' 类 · 每千请求 = 次数 / 请求数 × 1000';
+  }
+
+  // 分域表：只有 1.21.0+ 的事件带 realm，不足 100 条时显示「积累中」而不是把历史全算进未标注。
+  const labeled = Number(channelData.realm_labeled || 0);
+  const realmRows = ['cn', 'global', 'unknown'].filter(r => channelData.realms && channelData.realms[r]);
+  if (labeled < 100 || !realmRows.length) {
+    $('dgRealmBody').innerHTML = '<tr><td colspan="5"><div class="empty inline">' +
+      (realmRows.length
+        ? '数据积累中：1.22.0 之前的事件没有域字段，已有域标记 ' + labeled + ' 条。'
+        : '该时间窗内没有带域标记的请求记录。') + '</div></td></tr>';
+    $('dgRealmNote').textContent = '仅统计带域标记的事件（1.22.0 起）';
+  } else {
+    $('dgRealmBody').innerHTML = realmRows.map(r => {
+      const a = channelData.realms[r] || {};
+      const n = Number(a.requests || 0);
+      return '<tr><td>' + esc(r === 'unknown' ? '未标注' : r) + '</td>' +
+        '<td class="num">' + fmtTok(n) + '</td>' +
+        '<td class="num">' + fmtTok(a.success) + '</td>' +
+        '<td class="num">' + (n ? Number(a.success_rate || 0).toFixed(1) + '%' : '—') + '</td>' +
+        '<td class="num">' + fmtTok(a.fallbacks) + '</td></tr>';
+    }).join('');
+    $('dgRealmNote').textContent = '仅统计带域标记的事件（1.22.0 起）';
+  }
 }
 
 async function loadChannelHealth() {
@@ -4234,12 +4350,15 @@ async function loadChannelHealth() {
     $('dgStats').innerHTML = '';
     $('dgState').innerHTML = '';
     $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">读取失败</div></td></tr>';
-    $('dgRealmBody').innerHTML = '<tr><td colspan="8"><div class="empty inline">读取失败</div></td></tr>';
-    $('dgChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
+    $('dgRealmBody').innerHTML = '<tr><td colspan="5"><div class="empty inline">读取失败</div></td></tr>';
+    $('dgEventChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
+    $('dgRateChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
     $('dgNote').textContent = '读取失败';
-    $('dgChartNote').textContent = '—';
+    $('dgEventNote').textContent = '—';
+    $('dgRateNote').textContent = '—';
     $('dgKindNote').textContent = '—';
     $('dgLegend').innerHTML = '';
+    $('dgRateLegend').innerHTML = '';
   }
 }
 if ($('btnDg')) $('btnDg').onclick = loadChannelHealth;
