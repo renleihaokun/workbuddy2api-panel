@@ -1069,6 +1069,7 @@ http://127.0.0.1:7863/panel/
 | 行内危险操作 | 账号表每行 | 禁用/移除收进 `⋯` 菜单（fixed 挂 body，不被 `.tbl-wrap` 裁切），行宽少 80px |
 | `title` tooltip | 43 处 | 启动时搬进 `data-tip` 并移除 `title`；380ms 延迟、focusin 也触发、滚动即隐藏；`<tr title>` 直接丢弃 |
 | 文件 / 数字 / 搜索框 / 单选 | 1 / 14 / 2 / 2 | 去掉 UA 的「选择文件」灰按钮、数字上下箭头、搜索清除 X；realm 单选改胶囊分段控件；自动填充黄底覆盖 |
+| 日期时间 | 2（用量/日志自定义范围） | 自绘月历弹层：周一开头、今天/现在快捷键、时分输入、Esc/外点关闭；原生 `datetime-local` 保留值同步，`change` 事件照旧 |
 | 弹层 | 5 个 `.veil` + 密钥门 | `role="dialog"` / `aria-modal` / `aria-labelledby`；焦点陷阱、Esc、点遮罩、`html.lock` 滚动锁；密钥门 `data-lock` 不可关闭；关闭后焦点归还触发元素 |
 | toast | — | 错误 8s / 成功 3.2s、hover 暂停、可手动关闭、同文案合并 `×N`、最多 3 条、`role=alert/status` |
 | 手机抽屉 | — | 关闭态 `visibility:hidden + inert + aria-hidden`（Tab 不再落到屏幕外导航）；打开时焦点进第一个导航项、`.main` inert；Esc 关闭后焦点回汉堡 |

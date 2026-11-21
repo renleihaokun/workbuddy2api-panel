@@ -318,9 +318,10 @@
   document.addEventListener('focusout', function () { clearTimeout(tipTimer); hideTip(); }, true);
   window.addEventListener('scroll', function () { clearTimeout(tipTimer); hideTip(); }, true);
   upgradeTitles(document);
+  upgradeDateTimes(document);
   new MutationObserver(function (muts) {
     for (var i = 0; i < muts.length; i++) {
-      if (muts[i].type === 'attributes' || (muts[i].addedNodes && muts[i].addedNodes.length)) { scheduleTipUpgrade(); return; }
+      if (muts[i].type === 'attributes' || (muts[i].addedNodes && muts[i].addedNodes.length)) { scheduleTipUpgrade(); scheduleDTUpgrade(); return; }
     }
   }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['title'] });
 
@@ -387,6 +388,148 @@
     document.addEventListener('pointerdown', onMenuAway, true);
     window.addEventListener('resize', closeMenu, true);
     window.addEventListener('scroll', closeMenu, true);
+  }
+
+  /* ══ 自绘日期时间（datetime-local） ═════════════════════════════════ */
+  var activeDT = null;
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function parseDT(v) { if (!v) return null; var d = new Date(v); return isNaN(d.getTime()) ? null : d; }
+  function dtValue(d) {
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + 'T' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+  function closeDT() {
+    if (!activeDT) return;
+    var inp = activeDT.input;
+    activeDT.pop.remove();
+    activeDT = null;
+    document.removeEventListener('keydown', onDTKey, true);
+    document.removeEventListener('pointerdown', onDTAway, true);
+    window.removeEventListener('resize', closeDT, true);
+    window.removeEventListener('scroll', closeDT, true);
+    if (inp) { try { inp.focus({ preventScroll: true }); } catch (e) { inp.focus(); } }
+  }
+  function onDTKey(e) { if (activeDT && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeDT(); } }
+  function onDTAway(e) {
+    if (!activeDT) return;
+    if (activeDT.pop.contains(e.target) || e.target === activeDT.input) return;
+    closeDT();
+  }
+  function openDT(input) {
+    closePop(); closeMenu(); closeDT();
+    var base = parseDT(input.value) || new Date();
+    var sel = new Date(base.getFullYear(), base.getMonth(), base.getDate(), base.getHours(), base.getMinutes());
+    var viewMonth = new Date(base.getFullYear(), base.getMonth(), 1);
+    var pop = document.createElement('div');
+    pop.className = 'dt-pop';
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', '选择日期时间');
+    document.body.appendChild(pop);
+    var hours = sel.getHours(), minutes = sel.getMinutes();
+
+    function render() {
+      pop.innerHTML =
+        '<div class="dt-head"><button type="button" data-nav="-1" aria-label="上个月">‹</button>' +
+        '<span class="dt-title"></span><button type="button" data-nav="1" aria-label="下个月">›</button></div>' +
+        '<div class="dt-week"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>' +
+        '<div class="dt-grid"></div>' +
+        '<div class="dt-time"><input class="dt-h" type="text" inputmode="numeric" aria-label="小时">' +
+        '<span>:</span><input class="dt-m" type="text" inputmode="numeric" aria-label="分钟"></div>' +
+        '<div class="dt-foot"><button type="button" class="ghost" data-act="today">今天</button>' +
+        '<button type="button" class="ghost" data-act="now">现在</button><span class="grow"></span>' +
+        '<button type="button" data-act="cancel">取消</button>' +
+        '<button type="button" class="primary" data-act="ok">确定</button></div>';
+      pop.querySelector('.dt-title').textContent = viewMonth.getFullYear() + ' 年 ' + (viewMonth.getMonth() + 1) + ' 月';
+      var hv = pop.querySelector('.dt-h'), mv = pop.querySelector('.dt-m');
+      hv.value = pad2(hours); mv.value = pad2(minutes);
+      hv.addEventListener('change', function () { hours = Math.max(0, Math.min(23, parseInt(hv.value, 10) || 0)); hv.value = pad2(hours); });
+      mv.addEventListener('change', function () { minutes = Math.max(0, Math.min(59, parseInt(mv.value, 10) || 0)); mv.value = pad2(minutes); });
+      var grid = pop.querySelector('.dt-grid');
+      var first = new Date(viewMonth.getFullYear(), viewMonth.getMonth(), 1);
+      var offset = (first.getDay() + 6) % 7; // 周一开头
+      var start = new Date(first); start.setDate(1 - offset);
+      var today = new Date();
+      for (var i = 0; i < 42; i++) {
+        var day = new Date(start); day.setDate(start.getDate() + i);
+        var b = document.createElement('button');
+        b.type = 'button'; b.className = 'dt-day'; b.textContent = String(day.getDate());
+        if (day.getMonth() !== viewMonth.getMonth()) b.classList.add('out');
+        if (day.toDateString() === today.toDateString()) b.classList.add('today');
+        if (day.getFullYear() === sel.getFullYear() && day.getMonth() === sel.getMonth() && day.getDate() === sel.getDate()) b.classList.add('sel');
+        b.dataset.y = day.getFullYear(); b.dataset.m = day.getMonth(); b.dataset.d = day.getDate();
+        b.setAttribute('aria-label', day.getFullYear() + '-' + pad2(day.getMonth() + 1) + '-' + pad2(day.getDate()));
+        b.addEventListener('click', function (ev) {
+          var t = ev.currentTarget;
+          sel = new Date(Number(t.dataset.y), Number(t.dataset.m), Number(t.dataset.d), hours, minutes);
+          render();
+        });
+        grid.appendChild(b);
+      }
+    }
+    render();
+    // 定位：默认贴输入框下方，空间不够翻到上方
+    var r = input.getBoundingClientRect();
+    var w = pop.offsetWidth || 288, h = pop.offsetHeight || 320;
+    pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+    pop.style.top = (r.bottom + 6 + h > window.innerHeight - 8 ? Math.max(8, r.top - h - 6) : r.bottom + 6) + 'px';
+    pop.addEventListener('click', function (e) {
+      var nav = e.target.closest('[data-nav]');
+      if (nav) {
+        viewMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth() + Number(nav.dataset.nav), 1);
+        render();
+        return;
+      }
+      var act = e.target.closest('[data-act]');
+      if (!act) return;
+      var a = act.dataset.act;
+      if (a === 'cancel') { closeDT(); return; }
+      if (a === 'today') {
+        var t = new Date();
+        sel = new Date(t.getFullYear(), t.getMonth(), t.getDate(), hours, minutes);
+        viewMonth = new Date(sel.getFullYear(), sel.getMonth(), 1);
+        render(); return;
+      }
+      if (a === 'now') {
+        var n = new Date();
+        hours = n.getHours(); minutes = n.getMinutes();
+        sel = new Date(n.getFullYear(), n.getMonth(), n.getDate(), hours, minutes);
+        viewMonth = new Date(sel.getFullYear(), sel.getMonth(), 1);
+        render(); return;
+      }
+      if (a === 'ok') {
+        var out = new Date(sel.getFullYear(), sel.getMonth(), sel.getDate(), hours, minutes);
+        input.value = dtValue(out);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        closeDT();
+      }
+    });
+    activeDT = { input: input, pop: pop };
+    document.addEventListener('keydown', onDTKey, true);
+    document.addEventListener('pointerdown', onDTAway, true);
+    window.addEventListener('resize', closeDT, true);
+    window.addEventListener('scroll', closeDT, true);
+    var firstBtn = pop.querySelector('.dt-day.sel') || pop.querySelector('.dt-day');
+    if (firstBtn) firstBtn.focus({ preventScroll: true });
+  }
+
+  function upgradeDateTimes(root) {
+    var list = root && root.querySelectorAll ? root.querySelectorAll('input[type=datetime-local]:not([data-dt])') : [];
+    for (var i = 0; i < list.length; i++) {
+      (function (inp) {
+        inp.setAttribute('data-dt', '1');
+        inp.addEventListener('pointerdown', function (e) { e.preventDefault(); openDT(inp); });
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDT(inp); }
+        });
+      })(list[i]);
+    }
+  }
+  var dtPending = false;
+  function scheduleDTUpgrade() {
+    if (dtPending) return;
+    dtPending = true;
+    setTimeout(function () { dtPending = false; upgradeDateTimes(document); }, 60);
   }
 
   /* ══ 确认框 ════════════════════════════════════════════════════════ */
