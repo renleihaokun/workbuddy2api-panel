@@ -244,6 +244,71 @@
     closePop();
   }, true);
 
+  /* ══ 行内「更多」菜单 ═══════════════════════════════════════════════
+     表格最后一列的空间很贵：把低频且危险的操作收进这里，行宽能少 80px。
+     与候选层一样用 fixed 定位挂 body，避免被 .tbl-wrap 的 overflow 裁掉。 */
+  var activeMenu = null;
+
+  function closeMenu() {
+    if (!activeMenu) return;
+    activeMenu.pop.remove();
+    activeMenu.anchor.setAttribute('aria-expanded', 'false');
+    activeMenu = null;
+    document.removeEventListener('keydown', onMenuKey, true);
+    document.removeEventListener('pointerdown', onMenuAway, true);
+    window.removeEventListener('resize', closeMenu, true);
+    window.removeEventListener('scroll', closeMenu, true);
+  }
+  function onMenuKey(e) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault(); e.stopPropagation();
+    var a = activeMenu && activeMenu.anchor;
+    closeMenu();
+    if (a) { try { a.focus({ preventScroll: true }); } catch (err) { a.focus(); } }
+  }
+  function onMenuAway(e) {
+    if (!activeMenu) return;
+    if (activeMenu.pop.contains(e.target) || e.target === activeMenu.anchor) return;
+    closeMenu();
+  }
+
+  function openMenu(anchor, items) {
+    closePop();
+    closeMenu();
+    if (!anchor || !items || !items.length) return;
+    var pop = document.createElement('div');
+    pop.className = 'sel-pop ctx-pop';
+    pop.setAttribute('role', 'menu');
+    items.forEach(function (it) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ctx-item' + (it.danger ? ' danger' : '');
+      b.setAttribute('role', 'menuitem');
+      b.textContent = it.label;
+      b.disabled = !!it.disabled;
+      b.addEventListener('click', function () {
+        if (b.disabled) return;
+        closeMenu();
+        if (it.onPick) it.onPick();
+      });
+      pop.appendChild(b);
+    });
+    document.body.appendChild(pop);
+    var r = anchor.getBoundingClientRect();
+    var w = pop.offsetWidth || 132;
+    pop.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + 'px';
+    var h = pop.offsetHeight || 0;
+    pop.style.top = (r.bottom + 4 + h > window.innerHeight - 8 ? r.top - h - 4 : r.bottom + 4) + 'px';
+    anchor.setAttribute('aria-expanded', 'true');
+    activeMenu = { anchor: anchor, pop: pop };
+    var first = pop.querySelector('.ctx-item');
+    if (first) setTimeout(function () { first.focus(); }, 0);
+    document.addEventListener('keydown', onMenuKey, true);
+    document.addEventListener('pointerdown', onMenuAway, true);
+    window.addEventListener('resize', closeMenu, true);
+    window.addEventListener('scroll', closeMenu, true);
+  }
+
   /* ══ 确认框 ════════════════════════════════════════════════════════ */
   function confirmBox(opts) {
     opts = opts || {};
@@ -294,5 +359,5 @@
     });
   }
 
-  window.WBControls = { confirm: confirmBox, close: closePop };
+  window.WBControls = { confirm: confirmBox, close: closePop, menu: openMenu };
 })();

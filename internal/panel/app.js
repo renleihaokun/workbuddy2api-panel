@@ -556,8 +556,7 @@ function renderAccounts(list) {
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '" title="解冻，恢复参与选号">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '" title="恢复选号">恢复</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '暂停选号：退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停</button>')) +
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
+        '<button class="xs ghost more-btn" data-a="more" data-u="' + esc(s.uid) + '" aria-haspopup="menu" aria-expanded="false" title="更多操作：禁用 / 移除">⋯</button>' +
       '</td></tr>';
   }).join('');
 }
@@ -665,11 +664,9 @@ async function loadOverview(quiet) {
   }
 }
 
-$('accBody').addEventListener('click', async ev => {
-  const b = ev.target.closest('button[data-a]');
-  if (!b) return;
-  const u = b.dataset.u, a = b.dataset.a;
-  if (a === 'add') { openAdd(); return; }
+/* runAccountAction 统一执行单个账号的操作：确认 → busy → 请求 → toast → 刷新。
+   行内按钮与「⋯」菜单共用这一条路径，避免两套 confirm / busy 逻辑分叉。 */
+async function runAccountAction(a, u, triggerBtn) {
   if (a === 'remove' && !(await askConfirm({
     title: '移除账号', confirmText: '移除', danger: true,
     body: '移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。\n确认移除？'
@@ -678,7 +675,7 @@ $('accBody').addEventListener('click', async ev => {
     title: '禁用账号', confirmText: '禁用', danger: true,
     body: '禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。\n若只是想临时让位、仍要保号，请改用「暂停选号」。'
   }))) return;
-  const done = setBusy(b);
+  const done = setBusy(triggerBtn);
   try {
     if (a === 'checkin') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
@@ -706,6 +703,31 @@ $('accBody').addEventListener('click', async ev => {
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { done(); loadOverview(true); }
+}
+
+/* openAccountMenu 行内「更多」：把禁用/移除从 6 个按钮压成 1 个，账号表在最窄的
+   桌面档也能不横滚。controls.js 不可用时退回原生 confirm，功能不丢。 */
+function openAccountMenu(btn, uid) {
+  const s = ((overviewData && overviewData.accounts) || []).find(x => x.uid === uid) || {};
+  if (window.WBControls && typeof WBControls.menu === 'function') {
+    const items = [];
+    if (!s.disabled) items.push({ label: '禁用账号', danger: true, onPick: () => runAccountAction('disable', uid, btn) });
+    items.push({ label: '移除账号', danger: true, onPick: () => runAccountAction('remove', uid, btn) });
+    WBControls.menu(btn, items);
+    return;
+  }
+  if (window.confirm('移除账号将删除池状态与凭证文件，且不可恢复。确认移除？')) {
+    runAccountAction('remove', uid, btn);
+  }
+}
+
+$('accBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-a]');
+  if (!b) return;
+  const u = b.dataset.u, a = b.dataset.a;
+  if (a === 'add') { openAdd(); return; }
+  if (a === 'more') { openAccountMenu(b, u); return; }
+  await runAccountAction(a, u, b);
 });
 
 $('btnCheckinAll').onclick = async () => {

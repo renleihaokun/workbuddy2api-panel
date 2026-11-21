@@ -188,6 +188,20 @@ textarea:-webkit-autofill {
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
+/* ── 行内「更多」菜单（账号表的禁用/移除） ──────────────────────────── */
+.ctx-pop { min-width: 132px; padding: 4px; }
+.ctx-item {
+  display: block; width: 100%; text-align: left;
+  padding: 8px 10px; border: 0; border-radius: var(--r-sm);
+  background: none; color: var(--ink-2);
+  font: inherit; font-size: var(--fs-ctl); line-height: 1.4;
+  cursor: pointer; white-space: nowrap;
+}
+.ctx-item:hover:not(:disabled), .ctx-item:focus-visible { background: var(--surface-2); color: var(--ink); outline: none; }
+.ctx-item.danger { color: var(--bad); }
+.ctx-item.danger:hover:not(:disabled) { background: var(--bad-soft); }
+.ctx-item:disabled { opacity: .45; cursor: not-allowed; }
+
 /* ── 自绘确认框 ────────────────────────────────────────────────────── */
 .conf-body {
   margin: 0;
