@@ -634,7 +634,7 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 /* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 9px var(--pad-cell-x); }
-.who { min-width: 118px; max-width: 200px; }
+.who { min-width: 118px; width: 180px; max-width: 180px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; }
@@ -659,7 +659,7 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .acc td.cred .n { text-align: right; }
 .acc td.cred .bar { margin-left: auto; }
 /* 用量列：四枚 chip 排 2×2，行高从 115px 收到 62–65px（列宽够两个 chip 并排） */
-.usage-cell { min-width: 168px; }
+.usage-cell { min-width: 150px; width: 150px; }
 .usage-line {
   display: grid; grid-template-columns: repeat(2, minmax(0, max-content));
   align-items: center; gap: 4px 6px; max-width: 100%;
@@ -696,17 +696,22 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .tag.bad { background: var(--bad-soft); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 24%, transparent); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border-color: var(--line); }
 .md-avail { flex: none; padding: 0 6px; font-size: var(--fs-kicker); line-height: 16px; }
-.rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 186px; }
+/* 限流芯片：宽度必须封顶。td 在 auto 布局下会按 max-content 撑列，一条 36 字符的
+   模型名能把「状态」列顶到 354px、把整张表推出卡片（1440 下实测溢出 207px）。
+   这里给 200px 上限并让模型名/说明各自省略，完整内容仍在 title 里。 */
+.rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 0; max-width: 200px; }
 .rate-limit {
-  display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
+  display: flex; align-items: baseline; gap: 6px; padding: 4px 7px; min-width: 0;
   border: 1px solid color-mix(in srgb, var(--warn) 24%, var(--line));
   border-radius: var(--r-sm); background: var(--warn-soft); font-size: var(--fs-label); line-height: 1.35;
 }
 .rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-2); color: var(--ink-3); }
-.rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-.rate-limit span { color: var(--ink-2); }
+.rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; min-width: 0; }
+.rate-limit span { color: var(--ink-2); min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acts { display: flex; gap: 4px; justify-content: flex-end; white-space: nowrap; }
-.acts button { padding: 0 7px; height: var(--h-xs); font-size: var(--fs-ctl); white-space: nowrap; flex: none; }
+.acts button { padding: 0 6px; height: var(--h-xs); font-size: var(--fs-ctl); white-space: nowrap; flex: none; }
+/* 状态列封顶：限流芯片再长也不能把整张表推出卡片（见 .rate-limits 注释） */
+.acc.pool th:nth-child(3), .acc.pool td:nth-child(3) { width: 200px; max-width: 200px; }
 
 /* 空态：图标 + 标题 + 说明的三段式（任务中心、账号池共用）。表格单元格里的
    空态用 .empty.inline（不装图标、上下 22px），避免一张表里出现一个 44px 大图标。 */
