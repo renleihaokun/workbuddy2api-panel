@@ -27,7 +27,7 @@ func TestAppJSSyntax(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available; skipping JS syntax check")
 	}
-	for _, name := range []string{"app.js", "mobile.js"} {
+	for _, name := range []string{"app.js", "mobile.js", "controls.js"} {
 		path, err := filepath.Abs(name)
 		if err != nil {
 			t.Fatal(err)
@@ -1924,7 +1924,7 @@ process.stdout.write(JSON.stringify({
 // 表现为「后端已更新，页面按钮还是老行为 / 接口 404」，且清缓存才好。
 func TestPanelAssetsCacheNegotiation(t *testing.T) {
 	p := newTestPanel()
-	for _, path := range []string{"/panel/", "/panel/app.js", "/panel/mobile.css", "/panel/mobile.js"} {
+	for _, path := range []string{"/panel/", "/panel/app.js", "/panel/controls.css", "/panel/controls.js", "/panel/mobile.css", "/panel/mobile.js"} {
 		rec := httptest.NewRecorder()
 		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
 		if rec.Code != 200 {
@@ -1950,6 +1950,25 @@ func TestPanelAssetsCacheNegotiation(t *testing.T) {
 		}
 		if rec2.Body.Len() != 0 {
 			t.Fatalf("%s 304 响应不应带 body，实际 %d 字节", path, rec2.Body.Len())
+		}
+	}
+}
+
+// TestPanelControlsAssetsLinked 原生控件接管层必须被页面真正引用：
+// 少了 controls.css 只剩 UA 外观，少了 controls.js 点击 select 会回到系统弹层。
+func TestPanelControlsAssetsLinked(t *testing.T) {
+	html := string(indexHTML)
+	for _, want := range []string{`href="controls.css"`, `src="controls.js"`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("index.html 缺少 %s（原生控件接管层未接线）", want)
+		}
+	}
+	p := newTestPanel()
+	for _, path := range []string{"/panel/controls.css", "/panel/controls.js"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != 200 || rec.Body.Len() == 0 {
+			t.Fatalf("%s 状态=%d 长度=%d，期望 200 且非空", path, rec.Code, rec.Body.Len())
 		}
 	}
 }

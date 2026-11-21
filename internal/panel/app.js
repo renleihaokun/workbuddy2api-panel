@@ -7,6 +7,10 @@ let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
+/* 配置是否已成功从服务端回填。为 false 时整张表单禁用、保存按钮禁用：
+   未回填就提交会把 checkbox 的 HTML 默认值（false）写回服务端，等于用空表单
+   覆盖真实配置（历史事故，plan P0-A1）。 */
+let cfgReady = false;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
@@ -138,6 +142,14 @@ function shortErr(msg, max) {
     .trim();
   const n = max || 140;
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+/* askConfirm 优先使用 controls.js 的自绘确认框（同一套视觉、可键盘操作）；
+   极端情况下 controls.js 没加载成功就退回原生 confirm，保证危险操作仍有确认。 */
+async function askConfirm(opts) {
+  if (window.WBControls && typeof window.WBControls.confirm === 'function') {
+    return window.WBControls.confirm(opts);
+  }
+  return window.confirm((opts && (opts.body || opts.title)) || '确认操作');
 }
 function ago(iso) {
   if (!iso || iso.startsWith('0001-')) return '—';
@@ -592,10 +604,17 @@ function renderModelLocks(rows) {
 function setStat(id, v) {
   const el = $(id);
   if (!el) return;
-  el.textContent = v;
-  const head = String(v == null ? '' : v).split('/')[0].trim();
+  // 缺字段 / NaN 一律显示破折号：以前 undefined 会渲染成字面量 "undefined"、
+  // NaN 会渲染成 "NaN"，再被当成真实统计读（plan P0-A3）。
+  let shown = v;
+  if (v == null || v === '') shown = '—';
+  else if (typeof v === 'number' && !Number.isFinite(v)) shown = '—';
+  el.textContent = shown;
+  const head = String(shown).split('/')[0].trim();
   const n = Number(head);
-  el.classList.toggle('zero', head !== '-' && head !== '' && Number.isFinite(n) && n === 0);
+  el.classList.toggle('zero', head !== '—' && head !== '-' && head !== '' && Number.isFinite(n) && n === 0);
+  // 零值时连顶部语义色轨一起退成中性，否则数字灰了、轨道还在亮绿/亮红。
+  el.closest('.stat, .kpi')?.classList.toggle('zero', head !== '—' && head !== '-' && head !== '' && Number.isFinite(n) && n === 0);
 }
 
 async function loadOverview(quiet) {
@@ -607,19 +626,30 @@ async function loadOverview(quiet) {
     setStat('sCooling', d.cooling);
     setStat('sDisabled', d.disabled);
     // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
-    if ($('sPaused')) setStat('sPaused', d.paused == null ? '-' : d.paused);
-    const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-    const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-    setStat('sCredits', totSum > 0 ? creditNum(remSum) + ' / ' + creditNum(totSum) : creditNum(remSum));
+    if ($('sPaused')) setStat('sPaused', d.paused);
+    // 企业版不限量账号的 credits_total = -1（上游 limitNum=-1），不是真实额度：
+    // 算进「总积分」会把分母做小、剩余率算错（plan P0-A3）。
+    const accts = d.accounts || [];
+    const remSum = accts.reduce((a, s) => a + (Number(s.credits) || 0), 0);
+    const totSum = accts.reduce((a, s) => a + (Number(s.credits_total) > 0 ? Number(s.credits_total) : 0), 0);
+    setStat('sCredits', totSum > 0 ? creditNum(remSum) + ' / ' + creditNum(totSum) : (accts.length ? creditNum(remSum) : '—'));
     setStat('sSticky', d.sticky_sessions);
-    $('navSub').textContent = 'v' + d.version;
+    $('navSub').textContent = d.version ? 'v' + d.version : 'v—';
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
-    $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
+    // 缺 total 说明响应不完整（旧版本/代理截断）：不要当成「待添加账号」去误导用户。
+    const known = Number.isFinite(Number(d.total));
+    $('navState').textContent = !known ? '数据异常' : (d.healthy > 0 ? '服务正常' : (Number(d.total) > 0 ? '无可用账号' : '待添加账号'));
     const p = $('navPulse');
-    p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
+    p.className = 'pulse' + (!known ? ' bad' : (d.healthy > 0 ? '' : (Number(d.total) > 0 ? ' warn' : ' bad')));
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
-    const up = Math.floor(d.uptime_sec);
-    $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+    const up = Number(d.uptime_sec);
+    const metaText = Number.isFinite(up)
+      ? '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分'
+      : '';
+    $('subMeta').textContent = metaText;
+    // 没有副标题时把前面的「/」分隔符一起收掉，别在标题右边留一个孤零零的斜杠。
+    const sep = $('subMeta').previousElementSibling;
+    if (sep && sep.classList.contains('sep')) sep.hidden = !metaText;
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的按日批次，不额外发请求）。
@@ -627,7 +657,12 @@ async function loadOverview(quiet) {
     // 「检查」之后卡片永远停在那一刻的旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+  } catch (e) {
+    // 轮询失败不能装没事：顶栏状态切到「连接中断」，下一次成功会自动恢复。
+    $('navState').textContent = '连接中断';
+    $('navPulse').className = 'pulse warn';
+    if (!quiet) toast(e.message, 'err');
+  }
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -635,8 +670,14 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'add') { openAdd(); return; }
-  if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
+  if (a === 'remove' && !(await askConfirm({
+    title: '移除账号', confirmText: '移除', danger: true,
+    body: '移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。\n确认移除？'
+  }))) return;
+  if (a === 'disable' && !(await askConfirm({
+    title: '禁用账号', confirmText: '禁用', danger: true,
+    body: '禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。\n若只是想临时让位、仍要保号，请改用「暂停选号」。'
+  }))) return;
   const done = setBusy(b);
   try {
     if (a === 'checkin') {
@@ -1322,7 +1363,34 @@ function put(obj, path, val) {
   o[path[path.length - 1]] = val;
 }
 
+/* setConfigReady 切换配置表单的「可编辑/可提交」状态。
+   加载期与失败期一律禁用，只留「放弃修改」= 重试入口可用；cfgNote 常驻说明原因。 */
+function setConfigReady(ready, note, retryLabel) {
+  cfgReady = !!ready;
+  const f = $('cfgForm');
+  if (f) {
+    // 真实表单：DOM 查询；测试里的迷你表单桩只有 elements 映射，两条路径都支持。
+    let fields = [];
+    if (typeof f.querySelectorAll === 'function') {
+      fields = [...f.querySelectorAll('input, select, textarea'),
+                ...f.querySelectorAll('button:not(#btnCfgReload)')];
+    } else if (f.elements) {
+      fields = Object.values(f.elements).filter(Boolean);
+    }
+    fields.forEach(el => { el.disabled = !ready; });
+    if (f.classList && f.classList.toggle) f.classList.toggle('cfg-loading', !ready);
+    if (f.setAttribute) f.setAttribute('aria-busy', ready ? 'false' : 'true');
+  }
+  const save = $('btnCfgSave');
+  if (save) save.disabled = !ready;
+  const reload = $('btnCfgReload');
+  if (reload) reload.textContent = (ready || !retryLabel) ? '放弃修改' : retryLabel;
+  const noteEl = $('cfgNote');
+  if (noteEl) noteEl.textContent = note || '';
+}
+
 async function loadConfig() {
+  setConfigReady(false, '正在读取配置…');
   try {
     const d = await api('config');
     cfgLoaded = d.config;
@@ -1337,8 +1405,14 @@ async function loadConfig() {
       else el.value = v == null ? (name.startsWith('strategy_') ? 'weighted_random' : '') : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
-    $('cfgNote').textContent = '';
-  } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
+    setConfigReady(true, '');
+  } catch (e) {
+    // 读不到配置绝不能保持"可编辑"：此时表单里全是 HTML 默认值，一提交就会把它们
+    // 当成用户修改写回服务端。锁死表单，并把「放弃修改」变成重试入口。
+    cfgLoaded = null;
+    setConfigReady(false, '读取配置失败：' + shortErr(e.message), '重试读取');
+    toast('读取配置失败：' + e.message, 'err');
+  }
 }
 /* cfgChangedPaths 对比「表单将要提交的值」与「上次从服务端读到的值」，
    返回真正发生变化的字段路径（"listen" / "upstream.timeout_seconds" 这类）。
@@ -1410,6 +1484,9 @@ $('btnEye').onclick = () => {
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
+  /* 硬门禁：配置没回填成功时，表单里的值全是 HTML 默认值，提交等于清空线上配置。
+     按钮已 disabled，这里再兜一层（回车隐式提交 / 脚本触发都能拦住）。 */
+  if (!cfgReady) { toast('配置尚未加载完成，请稍候', 'err'); return; }
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
   markDurationFields();
   const firstBad = DURATION_FIELDS.find(durationBad);
@@ -1505,7 +1582,7 @@ function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remo
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
-$('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
+$('btnCopyUrl').onclick = () => copyText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 $('importFile').onchange = async () => {
   const file = $('importFile').files[0];
@@ -1812,7 +1889,10 @@ $('btnTaskAcceptAll').onclick = async () => {
 $('btnTaskAutoAll').onclick = async () => {
   if (!taskUID) return;
   const btn = $('btnTaskAutoAll');
-  if (!confirm('将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？')) return;
+  if (!(await askConfirm({
+    title: '一键完成可自动任务', confirmText: '开始执行',
+    body: '将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1–2 分钟（含真实对话），确认继续？'
+  }))) return;
   const done = setBusy(btn, '执行中…');
   try {
     const r = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks/auto_all', { method: 'POST' });
@@ -2191,7 +2271,10 @@ $('btnScanAll').onclick = async () => {
 };
 $('btnRunQueue').onclick = async () => {
   const conc = Number($('qcConc').value) || 1;
-  if (!confirm('扫描全部账号待办并排队执行（账号并发 ' + conc + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？')) return;
+  if (!(await askConfirm({
+    title: '执行全部待办', confirmText: '开始执行',
+    body: '扫描全部账号待办并排队执行（账号并发 ' + conc + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？'
+  }))) return;
   const b = $('btnRunQueue');
   const done = setBusy(b, '启动中…');
   try {
@@ -2234,7 +2317,10 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   const empty = $('tcEmpty'), list = $('qcList');
   if (!groups.length) {
     empty.style.display = '';
-    if (emptyTitle) empty.querySelector('.t').textContent = emptyTitle;
+    // v3 把空态标题从 .t 换成了 .big，这里漏改会让「扫描完没有待办」直接抛
+    // TypeError（用户看到错误 toast，而不是「没有待办任务 🎉」）。
+    const titleEl = empty.querySelector('.big');
+    if (emptyTitle && titleEl) titleEl.textContent = emptyTitle;
     if (emptyDesc) empty.querySelector('.d').textContent = emptyDesc;
     list.innerHTML = '';
     $('qProg').hidden = true; $('qcSummary').textContent = '';
@@ -3744,7 +3830,15 @@ function saveRemarkForm() {
 }
 if ($('btnRemarks')) $('btnRemarks').onclick = openRemarks;
 if ($('btnRemarkClose')) $('btnRemarkClose').onclick = closeRemarks;
-if ($('btnRemarkClear')) $('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+if ($('btnRemarkClear')) $('btnRemarkClear').onclick = async () => {
+  const n = Object.keys(remarksAll()).length;
+  if (!n) { toast('没有可清空的备注'); return; }
+  if (!(await askConfirm({
+    title: '清空全部备注', confirmText: '清空', danger: true,
+    body: '将清空本机 ' + n + ' 条备注（仅影响当前浏览器），不可恢复。'
+  }))) return;
+  storeRemarks({}); renderRemarkBody(); toast('已清空本机备注');
+};
 if ($('btnRemarkSave')) $('btnRemarkSave').onclick = saveRemarkForm;
 
 /* ══ 首页「积分到期提醒」折叠（选择记在本机，默认展开）═════════════════════

@@ -1,0 +1,220 @@
+/* ── 原生控件接管层 ─────────────────────────────────────────────────────
+   目标：把浏览器/系统绘制的控件外壳换成设计系统自己的。DOM 里的原生元素
+   全部保留（值、name、change 事件、读屏语义都不动），只换外观与弹层。
+
+   为什么必须单独一层：
+   - `<select>` 的候选列表是系统弹层，CSS 无法触及；只有把「展开」这件事
+     接管成自绘 listbox，才能保证深色/浅色/移动端都长一样。
+   - 闭合态的原生箭头、数字框上下箭头、搜索框的清除 X、文件框的灰按钮，
+     都是 UA 画出来的，`appearance:none` 才能去掉。
+   本文件在 index.html 的主 <style> 之后、mobile.css 之前加载，手机端规则
+   仍可覆盖。 */
+
+:root {
+  /* 下拉箭头：用 mask 的话无法上色，这里直接两套 data URI（深/浅各一份），
+     颜色取 --ink-3 的实际值，保证两种主题下都清晰。 */
+  --sel-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%238e98ac' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --sel-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%235d6675' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
+  }
+}
+[data-theme="light"] {
+  --sel-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%235d6675' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
+}
+
+/* ── select：闭合态 ────────────────────────────────────────────────── */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: var(--sel-chevron);
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 12px 12px;
+  padding-right: 30px;
+  cursor: pointer;
+}
+select:disabled { cursor: not-allowed; opacity: .55; }
+/* Firefox 的 select 内边距规则不同，单独补右内边距（不改高度） */
+@supports (-moz-appearance: none) {
+  select { padding-right: 30px; }
+}
+
+/* ── 数字框：去掉 UA 上下箭头 ──────────────────────────────────────── */
+input[type=number] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* ── 搜索框：去掉 UA 清除 X（自绘清除按钮后续接入） ─────────────────── */
+input[type=search]::-webkit-search-decoration,
+input[type=search]::-webkit-search-cancel-button,
+input[type=search]::-webkit-search-results-button,
+input[type=search]::-webkit-search-results-decoration {
+  -webkit-appearance: none;
+  display: none;
+}
+
+/* ── 文件框：把「选择文件」按钮换成同款按钮 ─────────────────────────── */
+input[type=file] {
+  padding: 0;
+  border: 0;
+  background: none;
+  height: auto;
+  font-size: var(--fs-meta);
+  color: var(--ink-3);
+}
+input[type=file]::file-selector-button {
+  font: inherit;
+  font-size: var(--fs-ctl);
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  height: var(--h-ctl);
+  padding: 0 12px;
+  margin-right: 10px;
+  cursor: pointer;
+  transition: background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease);
+}
+input[type=file]::file-selector-button:hover {
+  background: var(--raise);
+  border-color: var(--ink-3);
+}
+
+/* ── 自动填充：Chrome 的黄底在深色下像贴了张便签 ───────────────────── */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill {
+  -webkit-box-shadow: 0 0 0 1000px var(--surface) inset;
+  -webkit-text-fill-color: var(--ink);
+  caret-color: var(--ink);
+  transition: background-color 9999s ease-out 0s;
+}
+
+/* ── 自绘候选列表 ──────────────────────────────────────────────────── */
+.sel-pop {
+  position: fixed;
+  z-index: 100;
+  box-sizing: border-box;
+  min-width: 160px;
+  max-width: min(420px, calc(100vw - 16px));
+  max-height: 320px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 5px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid var(--glass-brd);
+  border-radius: var(--r-lg);
+  box-shadow: var(--sh-3);
+  animation: selIn var(--dur-1) var(--ease);
+}
+@keyframes selIn {
+  from { opacity: 0; transform: translateY(-4px) scale(.99); }
+  to { opacity: 1; transform: none; }
+}
+.sel-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 9px;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-ctl);
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  user-select: none;
+}
+.sel-opt .ck {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  visibility: hidden;
+  color: var(--accent);
+}
+.sel-opt .txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sel-opt.on { color: var(--accent); font-weight: 550; background: var(--accent-soft); }
+.sel-opt.on .ck { visibility: visible; }
+.sel-opt.act { background: var(--surface-2); color: var(--ink); }
+.sel-opt.on.act { background: var(--accent-soft); color: var(--accent); }
+.sel-opt[aria-disabled="true"] { opacity: .42; cursor: not-allowed; }
+.sel-opt .sub { color: var(--ink-3); font-size: var(--fs-label); margin-left: auto; padding-left: 10px; }
+
+/* 移动端：候选列表改成底部 sheet，避免系统滚轮与悬浮层被键盘顶飞 */
+.sel-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  box-sizing: border-box;
+  max-height: 70dvh;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 8px 12px calc(12px + env(safe-area-inset-bottom));
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  backdrop-filter: blur(24px) saturate(150%);
+  border-top: 1px solid var(--glass-brd);
+  border-radius: 16px 16px 0 0;
+  box-shadow: var(--sh-3);
+  animation: selSheetIn var(--dur-2) var(--ease);
+}
+@keyframes selSheetIn {
+  from { transform: translateY(18px); opacity: .6; }
+  to { transform: none; opacity: 1; }
+}
+.sel-sheet .grab {
+  width: 36px; height: 4px; margin: 2px auto 8px;
+  border-radius: 999px; background: var(--line);
+}
+.sel-sheet .sel-opt { min-height: 46px; font-size: var(--fs-body); border-radius: var(--r-md); }
+.sel-veil {
+  position: fixed; inset: 0; z-index: 99;
+  background: rgba(0, 0, 0, .38);
+  animation: fadeIn var(--dur-2) var(--ease);
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* ── 自绘确认框 ────────────────────────────────────────────────────── */
+.conf-body {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 1.7;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}
+.veil .dlg .conf-foot { gap: 8px; }
+/* 危险操作实心红按钮：ghost.danger 是表格行内的弱化样式，确认框需要强提醒。
+   底色用 --bad 压暗 38%（而不是直接用 --bad）：深色主题的 --bad 是亮红，
+   白字压上去只有 ~2.6:1；压暗后深/浅两套都能到 4.5:1 以上。 */
+.btn-danger {
+  background: color-mix(in srgb, var(--bad) 62%, #000);
+  border-color: color-mix(in srgb, var(--bad) 62%, #000);
+  color: #fff;
+}
+.btn-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--bad) 55%, #000);
+  border-color: color-mix(in srgb, var(--bad) 55%, #000);
+  color: #fff;
+}
+
+/* 减少动效：候选列表与确认框的进出场一起压掉 */
+@media (prefers-reduced-motion: reduce) {
+  .sel-pop, .sel-sheet, .sel-veil { animation: none !important; }
+}
+
+/* 弹层/抽屉打开时的滚动锁（controls.js 与 app.js 共用这个类） */
+html.lock, html.lock body { overflow: hidden; }

@@ -232,7 +232,7 @@ html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *
 .brand .logo svg { width: 17px; height: 17px; display: block; }
 .brand .name { font-weight: 650; letter-spacing: -.01em; font-size: var(--fs-dialog); }
 .brand .sub {
-  display: inline-flex; align-items: center; margin-top: 9px;
+  display: inline-flex; align-items: center; justify-content: center; min-width: 62px; margin-top: 9px;
   padding: 1px 8px; border: 1px solid var(--line); border-radius: var(--r-pill);
   color: var(--ink-3); font-size: var(--fs-kicker); font-family: var(--mono);
 }
@@ -543,6 +543,10 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .kpi.c-accent .v { color: var(--accent); }
 /* 零值退成中性灰：一排彩色的 0 会盖住真正需要看的数字（"0 个已禁用"不是警报）。 */
 .stat .v.zero, .kpi .v.zero { color: var(--ink-3); }
+/* 零值卡：数字退灰之外，顶部语义色轨也要一起退成中性——
+   否则「0 个已禁用」旁边仍横着一条亮红色，视觉上还在报警。 */
+.stat.zero::before, .kpi.zero::before { background: var(--line); }
+.stat.zero, .kpi.zero { --metric-c: var(--line); }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 /* 卡片是页面唯一的"浮起层"：surface 提亮 + 单层柔和阴影 + 1px 描边。
@@ -880,9 +884,13 @@ legend { font-size: var(--fs-meta); color: var(--ink-3); font-weight: 600; paddi
 .vc.expired .hd, .vc.expired .meta { opacity: .55; }
 
 /* ── Toast ───────────────────────────────────────────────────────── */
-#toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+#toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; pointer-events: none; }
+/* 配置页底部有 56px 的 sticky 保存条：toast 默认 bottom:20 会正好压在「保存配置」上，
+   还会拦截点击。按视图把容器抬高一个保存条的高度。 */
+body[data-view="config"] #toasts { bottom: 84px; }
 /* toast：滑入 → 停留 → 在 app.js 的 3.6s 移除前自行淡出（两段动画，无需 JS 配合） */
 .tst {
+  pointer-events: auto;
   background: var(--glass-strong);
   -webkit-backdrop-filter: blur(14px) saturate(150%);
   backdrop-filter: blur(14px) saturate(150%);
@@ -1213,6 +1221,8 @@ button.ghost.danger:hover:not(:disabled) {
   border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
 }
 </style>
+<!-- 原生控件接管层：必须排在主 <style> 之后（覆盖 UA 外观），mobile.css 之前（手机端还能改） -->
+<link rel="stylesheet" href="controls.css">
 <!-- 移动端适配：独立文件，必须在主 <style> 之后（@media 覆盖依赖层叠顺序） -->
 <link rel="stylesheet" href="mobile.css">
 </head>
@@ -1226,7 +1236,7 @@ button.ghost.danger:hover:not(:disabled) {
         </span>
         <div class="name">WorkBuddy2API</div>
       </div>
-      <div class="sub" id="navSub">控制台</div>
+      <div class="sub" id="navSub">v—</div>
     </div>
     <ul>
       <li class="nav-sec" aria-hidden="true">观测</li>
@@ -2052,6 +2062,7 @@ button.ghost.danger:hover:not(:disabled) {
 <div id="toasts" role="status" aria-live="polite"></div>
 
 <script src="app.js"></script>
+<script src="controls.js"></script>
 <script src="mobile.js"></script>
 </body>
 </html>

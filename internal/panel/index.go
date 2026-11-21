@@ -1,10 +1,12 @@
 // index.go 面板静态资源与安全响应头。
 //
 // 资源经 go:embed 打进二进制（随服务部署，无外部构建步骤）：
-//   - index.html  页面骨架
-//   - app.js      全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
-//   - mobile.css  手机端（≤760px）适配样式（本仓库自有，上游不维护 → 同步上游不冲突）
-//   - mobile.js   手机端联动逻辑（抽屉开合、宽表卡片化字段名），须在 app.js 之后加载
+//   - index.html   页面骨架
+//   - app.js       全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
+//   - controls.css 原生控件接管层样式（select 候选层、确认框、文件/数字/搜索框）
+//   - controls.js  原生控件接管层逻辑（自绘 select 弹层、confirm 对话框）
+//   - mobile.css   手机端（≤760px）适配样式（本仓库自有，上游不维护 → 同步上游不冲突）
+//   - mobile.js    手机端联动逻辑（抽屉开合、宽表卡片化字段名），须在 app.js 之后加载
 //
 // 安全头对"面板页面与全部 /panel/api/* 响应"统一生效：CSP 限制脚本只能来自本服务，
 // 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露 Referer 出去。
@@ -29,6 +31,12 @@ var mobileCSS []byte
 
 //go:embed mobile.js
 var mobileJS []byte
+
+//go:embed controls.css
+var controlsCSS []byte
+
+//go:embed controls.js
+var controlsJS []byte
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
@@ -62,10 +70,12 @@ func setSecurityHeaders(w http.ResponseWriter) {
 // app.js，表现为「后端已经改了，页面上的按钮还是老行为 / 接口 404」。
 // 用 no-cache（每次回源校验）+ ETag（命中 304）兼顾正确性与开销。
 var (
-	indexETag  = assetETag(indexHTML)
-	appETag    = assetETag(appJS)
-	cssETag    = assetETag(mobileCSS)
-	mobileETag = assetETag(mobileJS)
+	indexETag       = assetETag(indexHTML)
+	appETag         = assetETag(appJS)
+	cssETag         = assetETag(mobileCSS)
+	mobileETag      = assetETag(mobileJS)
+	controlsCSSETag = assetETag(controlsCSS)
+	controlsJSETag  = assetETag(controlsJS)
 )
 
 func assetETag(b []byte) string {
@@ -110,4 +120,14 @@ func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
 	serveAsset(w, r, "text/javascript; charset=utf-8", mobileJS, mobileETag)
+}
+
+// controlsStyle 输原生控件接管层样式（select 候选层 / 确认框 / 文件与数字框）。
+func (p *Panel) controlsStyle(w http.ResponseWriter, r *http.Request) {
+	serveAsset(w, r, "text/css; charset=utf-8", controlsCSS, controlsCSSETag)
+}
+
+// controlsScript 输出原生控件接管层逻辑（自绘 select 弹层、confirm 对话框）。
+func (p *Panel) controlsScript(w http.ResponseWriter, r *http.Request) {
+	serveAsset(w, r, "text/javascript; charset=utf-8", controlsJS, controlsJSETag)
 }
