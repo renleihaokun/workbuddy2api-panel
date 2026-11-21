@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.19.1-panel`（视觉打磨 v3：指标卡/表格/空态/弹层规格收敛、18px 网格对齐、密度与细节修复），与 Release `v1.19.1` 同源。
+> 当前版本 `1.20.0-panel`（原生控件接管层 + 布局/交互/可访问性批次：自绘 select/confirm/tooltip、账号表列宽预算、弹层 dialog 语义、手机账号卡重排），与 Release `v1.20.0` 同源。
 
 ## 核心能力
 
@@ -1057,6 +1057,29 @@ http://127.0.0.1:7863/panel/
 - 网格对齐：顶栏标题、卡片标题、表格首列统一 18px 纵轴；`.view` 侧边距 24px；桌面端 `scrollbar-gutter: stable` 防切页横跳。
 - 密度：账号表用量 chip 2×2（行高 115→62–65px）；模型表能力标签并入第二行（行高 ~64px）；筛选/卡片头控件统一 30px。
 - 细节：吸顶表头改实色、保存条去毛玻璃、危险按钮 hover 才红、图表移除与刻度重叠的「峰值/均值」内联文字（顶部说明保留）、长说明改短句 + `title`。
+
+**v1.20.0 原生控件与交互层**
+
+面板里凡是「浏览器/系统自己画」的控件都收了回来。原生元素仍保留在 DOM 里做值与语义的兜底，只换外观与弹层——这样 `collectConfig()`、`change` 事件、读屏语义都不受影响。
+
+| 控件 | 数量 | 做法 |
+|---|---|---|
+| `<select>` | 17（模型筛选 6 / 排序 3 / 结果与条数 2 / 并发 1 / 时间范围 2 / 配置 4） | 新增 `controls.css` + `controls.js`：`appearance:none` + 自绘箭头；展开层是自绘 listbox（桌面玻璃浮层、`(pointer:coarse)` 底部 sheet），↑↓/Home/End/Enter/Esc/首字母跳转，外点关闭；原生 select 仍是唯一值源 |
+| `confirm()` | 4 | `WBControls.confirm()` 自绘确认框：危险操作实心红按钮、默认焦点在「取消」、Esc/遮罩取消 |
+| 行内危险操作 | 账号表每行 | 禁用/移除收进 `⋯` 菜单（fixed 挂 body，不被 `.tbl-wrap` 裁切），行宽少 80px |
+| `title` tooltip | 43 处 | 启动时搬进 `data-tip` 并移除 `title`；380ms 延迟、focusin 也触发、滚动即隐藏；`<tr title>` 直接丢弃 |
+| 文件 / 数字 / 搜索框 | 1 / 14 / 2 | 去掉 UA 的「选择文件」灰按钮、数字上下箭头、搜索清除 X；自动填充黄底覆盖 |
+| 弹层 | 5 个 `.veil` + 密钥门 | `role="dialog"` / `aria-modal` / `aria-labelledby`；焦点陷阱、Esc、点遮罩、`html.lock` 滚动锁；密钥门 `data-lock` 不可关闭；关闭后焦点归还触发元素 |
+| toast | — | 错误 8s / 成功 3.2s、hover 暂停、可手动关闭、同文案合并 `×N`、最多 3 条、`role=alert/status` |
+| 手机抽屉 | — | 关闭态 `visibility:hidden + inert + aria-hidden`（Tab 不再落到屏幕外导航）；打开时焦点进第一个导航项、`.main` inert；Esc 关闭后焦点回汉堡 |
+
+配套细节：`viewport-fit=cover` + `env(safe-area-inset-*)`、`100dvh`、仅 iOS 把输入控件抬到 16px（防聚焦自动放大）、账号名手机端两行、手机操作按钮 40px 触摸目标。
+
+**v1.20.0 布局修复**
+
+- 账号表列宽预算：状态列封顶 200px、账号列 170px、用量列 140px、限流芯片省略号；「禁用/移除」进 `⋯` 菜单。实测 1440/1366/1280/1200 四档 `.tbl-wrap` 的 `scrollWidth` 与 `clientWidth` 相等，不再横向溢出。
+- 手机账号卡重排：名称/ID 与状态同行，积分独占一行（数字+进度条），成功/失败与在途一行，用量与最近成功各一行，操作按钮 5 列自适应。
+- 配置页加载门禁：`cfgReady` 未就绪时整表禁用、保存按钮禁用、失败显示原因并可「重试读取」；响应缺少 `config` 字段也按失败处理，杜绝空表单覆盖线上配置。
 
 ### 手机端（≤760px）
 
