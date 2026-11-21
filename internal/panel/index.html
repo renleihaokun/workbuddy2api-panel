@@ -671,7 +671,9 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 }
 .usage-item b { font-weight: 650; }
 .usage-item em { margin-left: 2px; font: 500 var(--fs-kicker)/1 var(--sans); font-style: normal; }
-.usage-count { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 18%, transparent); }
+/* 用量 chip 默认中性：延迟/速率本身不是告警，只有越过阈值才上色。
+   以前「有值就上色」导致每行四个彩色胶囊，真正需要看的失败数反而被淹没。 */
+.usage-count { color: var(--ink-2); background: var(--surface-2); border-color: var(--line-soft); }
 .usage-total {
   color: var(--accent); background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 24%, transparent);
@@ -679,8 +681,11 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 }
 .usage-total b { font-size: var(--fs-meta); letter-spacing: -.02em; }
 .usage-total em { color: var(--ink-2); }
-.usage-latency { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
-.usage-rate { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 18%, transparent); }
+.usage-latency { color: var(--ink-2); background: var(--surface-2); border-color: var(--line-soft); }
+.usage-rate { color: var(--ink-2); background: var(--surface-2); border-color: var(--line-soft); }
+/* 只在越界时上色：延迟 >2s、吐字速度 <10 tok/s */
+.usage-latency.slow { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
+.usage-rate.slow { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
 .cred { min-width: 84px; }
 .cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: var(--fs-table); white-space: nowrap; }
 .cred .n .of { color: var(--ink-3); font-size: var(--fs-label); }
@@ -903,20 +908,40 @@ legend { font-size: var(--fs-meta); color: var(--ink-3); font-weight: 600; paddi
 /* 配置页底部有 56px 的 sticky 保存条：toast 默认 bottom:20 会正好压在「保存配置」上，
    还会拦截点击。按视图把容器抬高一个保存条的高度。 */
 body[data-view="config"] #toasts { bottom: 84px; }
-/* toast：滑入 → 停留 → 在 app.js 的 3.6s 移除前自行淡出（两段动画，无需 JS 配合） */
+/* toast：滑入 → 停留 → 由 app.js 定时移除（不再用 CSS 定时淡出，
+   否则鼠标悬停想读完也留不住） */
 .tst {
   pointer-events: auto;
+  display: flex; align-items: flex-start; gap: 9px;
   background: var(--glass-strong);
   -webkit-backdrop-filter: blur(14px) saturate(150%);
   backdrop-filter: blur(14px) saturate(150%);
   border: 1px solid var(--glass-brd); border-left: 3px solid var(--ink-3);
-  border-radius: var(--r-lg); padding: 11px 15px; font-size: var(--fs-ctl); line-height: 1.5;
-  box-shadow: var(--sh-3); max-width: 400px;
-  animation: tstIn var(--dur-2) var(--ease), tstOut var(--dur-3) var(--ease) 3.3s forwards;
+  border-radius: var(--r-lg); padding: 10px 12px 10px 13px; font-size: var(--fs-ctl); line-height: 1.5;
+  box-shadow: var(--sh-3); max-width: min(420px, calc(100vw - 40px));
+  animation: tstIn var(--dur-2) var(--ease);
+  transition: opacity var(--dur-2) var(--ease), transform var(--dur-2) var(--ease);
+}
+.tst::before {
+  content: ''; flex: none; width: 6px; height: 6px; margin-top: 7px;
+  border-radius: 50%; background: var(--ink-3);
 }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
+.tst.ok::before { background: var(--ok); }
+.tst.err::before { background: var(--bad); }
+.tst-msg { min-width: 0; word-break: break-word; }
+.tst-x {
+  flex: none; width: 20px; height: 20px; margin: -1px -3px 0 0; padding: 0;
+  border: 0; border-radius: var(--r-xs); background: none; color: var(--ink-3);
+  font-size: var(--fs-title); line-height: 18px; cursor: pointer;
+}
+.tst-x:hover { background: var(--surface-2); color: var(--ink); }
+.tst-n {
+  flex: none; margin-left: auto; align-self: center;
+  font: 600 var(--fs-label)/1 var(--mono); color: var(--ink-3);
+}
+.tst.out { opacity: 0; transform: translateY(6px); }
 @keyframes tstIn { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: none; } }
-@keyframes tstOut { to { opacity: 0; transform: translateY(6px) scale(.98); } }
 
 /* 窄屏兜底：把两列壳层收成一列。真正的手机样式在 mobile.css（抽屉 / 卡片化表），
    这里只保留一条"侧栏不占位"的底线——mobile.css 加载失败时页面也不会被挤成一条窄柱。 */

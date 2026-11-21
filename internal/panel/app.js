@@ -95,12 +95,50 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
+/* toast：分级 + 可关闭 + 合并重复 + 最多 3 条。
+   以前是「3.6 秒后无条件 remove」：长错误读不完、配置页会盖住保存按钮、
+   连续报错叠成一片、色弱用户只能靠左边框颜色分辨。 */
+const TST_MAX = 3;
 function toast(msg, cls) {
+  const host = $('toasts');
+  if (!host) return;
+  const text = shortErr(msg, 240);
+  const kind = cls === 'err' ? 'err' : (cls === 'ok' ? 'ok' : '');
+  const now = Date.now();
+  // 2 秒内同文案合并成「×N」，避免一次 401 触发多条一模一样的错误。
+  const dup = [...host.children].find(el => el.dataset.text === text && now - Number(el.dataset.at || 0) < 2000);
+  if (dup) {
+    const n = (Number(dup.dataset.count) || 1) + 1;
+    dup.dataset.count = n; dup.dataset.at = now;
+    let badge = dup.querySelector('.tst-n');
+    if (!badge) { badge = document.createElement('span'); badge.className = 'tst-n'; dup.appendChild(badge); }
+    badge.textContent = '×' + n;
+    return;
+  }
   const el = document.createElement('div');
-  el.className = 'tst ' + (cls || '');
-  el.textContent = shortErr(msg, 200);
-  $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 3600);
+  el.className = 'tst ' + kind;
+  el.dataset.text = text; el.dataset.at = now; el.dataset.count = '1';
+  el.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+  const textEl = document.createElement('span');
+  textEl.className = 'tst-msg';
+  textEl.textContent = text;
+  const close = document.createElement('button');
+  close.type = 'button'; close.className = 'tst-x'; close.setAttribute('aria-label', '关闭提示');
+  close.textContent = '×';
+  el.append(textEl, close);
+  let timer = null;
+  const kill = () => {
+    if (!el.isConnected) return;
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 180);
+  };
+  const arm = ms => { clearTimeout(timer); timer = setTimeout(kill, ms); };
+  close.addEventListener('click', kill);
+  el.addEventListener('mouseenter', () => clearTimeout(timer));
+  el.addEventListener('mouseleave', () => arm(1800));
+  arm(kind === 'err' ? 8000 : 3200);
+  host.appendChild(el);
+  while (host.children.length > TST_MAX) host.firstElementChild.remove();
 }
 /* setBusy 统一异步按钮的「进行中」外观：禁用 + aria-busy + 可选文案替换。
    转圈由 CSS 的 button[aria-busy="true"]::after 负责，这里只管状态与文案。
@@ -617,13 +655,13 @@ function renderAccounts(list) {
       '<td class="who"><div class="nm"><span class="nm-text" title="' + esc(s.nickname || '') + '">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span class="muted">未命名</span>') + '</span>' + (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '') + (s.enterprise ? '<span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span class="sep-dim">/</span> <span class="txt-bad">' + (s.err_total || 0) + '</span></td>' +
+      '<td class="num">' + (s.success_count || 0) + ' <span class="sep-dim">/</span> ' + (Number(s.err_total) > 0 ? '<span class="txt-bad">' + s.err_total + '</span>' : '<span class="muted">0</span>') + '</td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
-        '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
-        '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+        '<span class="usage-item usage-latency' + (Number(tu.last_latency_ms) > 2000 ? ' slow' : '') + '"><b>' + latency + '</b></span>' +
+        '<span class="usage-item usage-rate' + (Number(tu.last_tokens_per_second) > 0 && Number(tu.last_tokens_per_second) < 10 ? ' slow' : '') + '"><b>' + rate + '</b></span>' +
       '</span></td>' +
       '<td class="num muted">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
