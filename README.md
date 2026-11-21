@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.19.1-panel`（视觉打磨 v3：指标卡/表格/空态/弹层规格收敛、18px 网格对齐、密度与细节修复），与 Release `v1.19.0` 同源。
+> 当前版本 `1.19.1-panel`（视觉打磨 v3：指标卡/表格/空态/弹层规格收敛、18px 网格对齐、密度与细节修复），与 Release `v1.19.1` 同源。
 
 ## 核心能力
 
