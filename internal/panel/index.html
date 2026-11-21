@@ -595,6 +595,14 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
    v3：首列缩进与卡片标题共用 --pad-x；健康色条改成不占列宽的 3px 导轨；
    表头改实色（吸顶时不透出下面的行）；数值列右对齐。 */
 .tbl-wrap { overflow-x: auto; }
+/* 横向滚动提示：只在 JS 判定内容确实溢出时出现（.scroll-x），
+   sticky 左侧保证横向滚动时提示不会跟着跑出视口。 */
+.tbl-wrap.scroll-x::before {
+  content: '左右滑动查看全部列 →';
+  position: sticky; left: 0; display: block; width: max-content;
+  padding: 5px var(--pad-x) 0;
+  font-size: var(--fs-label); color: var(--ink-3); letter-spacing: .01em;
+}
 /* 长表（模型目录 50+ 行）：限高 + 表头吸顶，滚动时不丢列名 */
 .tbl-wrap.tall { max-height: calc(100vh - 250px); overflow: auto; }
 .tbl-wrap.tall thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); }

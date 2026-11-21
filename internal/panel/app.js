@@ -551,6 +551,8 @@ function go(v) {
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
   if (v === 'taskscenter') reattachQueueView();
+  // 视图从 hidden 变可见后才有真实宽度：此时再判定一次表格是否溢出。
+  setTimeout(markScrollables, 30);
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 /* 首次进入延到本轮脚本求值之后再 go()。
@@ -752,6 +754,7 @@ async function loadOverview(quiet) {
     // 「检查」之后卡片永远停在那一刻的旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
+    markScrollables();
   } catch (e) {
     // 轮询失败不能装没事：顶栏状态切到「连接中断」，下一次成功会自动恢复。
     $('navState').textContent = '连接中断';
@@ -1922,6 +1925,19 @@ if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+/* markScrollables 给「内容比容器宽」的表格加一条 sticky 提示：
+   1025–1199 这类窄桌面档仍然需要横向滚动，但滚动条在触控板/隐藏滚动条下不可见，
+   用户会以为最右边的操作列不存在。提示用 ::before 渲染，不额外造 DOM。 */
+function markScrollables() {
+  document.querySelectorAll('.tbl-wrap').forEach(w => {
+    w.classList.toggle('scroll-x', w.scrollWidth > w.clientWidth + 4);
+  });
+}
+addEventListener('resize', () => {
+  clearTimeout(markScrollables._t);
+  markScrollables._t = setTimeout(markScrollables, 150);
+});
+
 function refreshVisible() {
   if (view === 'accounts') { loadOverview(true); renderCachedCompensation(); }
   else if (view === 'logs') loadLogs();

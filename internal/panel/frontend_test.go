@@ -1977,6 +1977,37 @@ func TestPanelControlsAssetsLinked(t *testing.T) {
 	}
 }
 
+// TestPanelControlsLayerContract 原生控件接管层的静态契约：
+// 1) 页面必须引用 controls.css / controls.js；
+// 2) 两个文件必须包含关键组件（自绘 select、sheet、更多菜单、tooltip、confirm）；
+// 3) app.js 不得回退到旧的格式化三件套或裸 confirm。
+func TestPanelControlsLayerContract(t *testing.T) {
+	html := string(indexHTML)
+	css := string(controlsCSS)
+	js := string(controlsJS)
+	app := string(appJS)
+	for _, want := range []string{"controls.css", "controls.js"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("index.html 未引用 %s", want)
+		}
+	}
+	for _, sel := range []string{"appearance: none", ".sel-pop", ".sel-sheet", ".ctx-pop", ".wb-tip", ".btn-danger"} {
+		if !strings.Contains(css, sel) {
+			t.Fatalf("controls.css 缺少 %q", sel)
+		}
+	}
+	for _, fn := range []string{"window.WBControls", "function openPop", "function openMenu", "function confirmBox", "function upgradeTitles"} {
+		if !strings.Contains(js, fn) {
+			t.Fatalf("controls.js 缺少 %q", fn)
+		}
+	}
+	for _, legacy := range []string{"formatTokenCount", "formatLatency", "formatRate"} {
+		if strings.Contains(app, legacy) {
+			t.Fatalf("app.js 仍残留旧格式化函数 %s（应统一走 fmt*）", legacy)
+		}
+	}
+}
+
 // TestAppJSModelIDSeparators 模型 ID 的两种分隔符在筛选、可用性、探测键归一化上等价。
 func TestAppJSModelIDSeparators(t *testing.T) {
 	node, err := exec.LookPath("node")
