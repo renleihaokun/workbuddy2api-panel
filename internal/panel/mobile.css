@@ -398,3 +398,34 @@
   /* 标签类（限流冷却 · 1时02分 / 模型档位）窄列里换行，而不是 nowrap 撑着容器溢出 */
   .tag { max-width: 100%; min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 }
+
+/* ══ 安全区 / 动态视口 / iOS 输入 ═══════════════════════════════════════
+   这一段放在最后：不参与上面的密度规则，只补设备级细节。 */
+@media (max-width: 760px) {
+  /* iPhone 刘海与 Home 条：不要让保存条、toast、抽屉底部状态压在手势区上 */
+  .nav { padding-bottom: env(safe-area-inset-bottom); }
+  .topbar { padding-top: env(safe-area-inset-top); }
+  .savebar { padding-bottom: calc(11px + env(safe-area-inset-bottom)); }
+  #toasts { bottom: calc(12px + env(safe-area-inset-bottom)); }
+
+  /* 账号名允许两行：手机卡片上 180px 一行放不下邮箱，截断后无法辨认 */
+  .acc.pool .who .nm > .nm-text {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    white-space: normal;
+    overflow: hidden;
+    text-overflow: clip;
+  }
+}
+@supports (height: 100dvh) {
+  .shell { min-height: 100dvh; }
+  @media (max-width: 760px) { .dlg { max-height: 92dvh; } }
+}
+/* iOS Safari 对 font-size < 16px 的输入控件会强制放大页面，只对 iOS 抬高字号；
+   安卓保持 12.5px 的密度，不被这条影响。 */
+@supports (-webkit-touch-callout: none) {
+  @media (max-width: 760px) {
+    input, select, textarea { font-size: 16px; }
+  }
+}
