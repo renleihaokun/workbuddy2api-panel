@@ -1281,6 +1281,37 @@ button.ghost.danger:hover:not(:disabled) {
   color: var(--bad); background: var(--bad-soft);
   border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
 }
+
+/* 空表骨架：首屏/慢请求时表体不是一块空白。只在 tbody 真的没有节点时出现；
+   有 <tr><td colspan> 空态文案时不会触发。 */
+.tbl-wrap:has(tbody:empty)::after {
+  content: '';
+  display: block; height: 56px; margin: 10px var(--pad-x);
+  border-radius: var(--r-md);
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--raise) 37%, var(--surface-2) 63%);
+  background-size: 400% 100%;
+  animation: tblSk 1.4s ease-in-out infinite;
+}
+@keyframes tblSk { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+/* 打印：白纸黑字、去掉一切操作与浮层，表格不再限高/最小宽度。 */
+@media print {
+  html {
+    --bg: #fff !important; --surface: #fff !important; --surface-2: #fff !important;
+    --raise: #fff !important; --ink: #000 !important; --ink-2: #222 !important;
+    --ink-3: #555 !important; --line: #bbb !important; --line-soft: #ddd !important;
+    --glass: #fff !important; --glass-strong: #fff !important; --glass-brd: #ddd !important;
+  }
+  body { background: #fff !important; color: #000 !important; }
+  .nav, .topbar, .fbar, .acts, .savebar, #toasts, .nav-veil, .nav-btn,
+  .vtabs, .trange, .more-btn, .scroll-x::before { display: none !important; }
+  .shell { display: block; }
+  .view { max-width: none; padding: 0; }
+  .box { box-shadow: none !important; break-inside: avoid; }
+  .tbl-wrap, .req-wrap, .tbl-wrap.tall { max-height: none !important; overflow: visible !important; }
+  .acc, .acc.md, .acc.req, .sav-tbl { min-width: 0 !important; }
+}
+@page { margin: 12mm; }
 </style>
 <!-- 原生控件接管层：必须排在主 <style> 之后（覆盖 UA 外观），mobile.css 之前（手机端还能改） -->
 <link rel="stylesheet" href="controls.css">
