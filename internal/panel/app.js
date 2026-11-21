@@ -2132,18 +2132,6 @@ $('taskBody').addEventListener('click', async ev => {
 });
 
 /* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
-// 开学季任务单元：✓ 已领（绿）｜◐ x/y 进行中（琥珀）｜○ 未做（灰）
-function staskHTML(t) {
-  if (!t) return '<span class="stask todo"><span class="mark">·</span>—</span>';
-  if (t.status === 'claimed') return '<span class="stask ok"><span class="mark">✓</span>已领</span>';
-  if (t.status === 'completed') return '<span class="stask warn"><span class="mark">◆</span>可领</span>';
-  if (t.status === 'in_progress') {
-    const fr = t.target_count ? '<span class="fr">' + t.progress + '/' + t.target_count + '</span>' : '';
-    return '<span class="stask warn"><span class="mark">◐</span>' + fr + '</span>';
-  }
-  return '<span class="stask todo"><span class="mark">○</span>未做</span>';
-}
-const LUCK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.2 5.2 5 1.8l3 2.4 3-2.4 1.8 3.4-1.4 2.6 1.4 2.6-3.4 2.2H6l-3.4-2.2 1.4-2.6z" opacity=".9"/><circle cx="8" cy="9" r="1.1" fill="currentColor" stroke="none"/></svg>';
 const SCHOOL_TITLES = {
   share_invite: '分享活动 +100c', desktop_chat_1_time: '桌面端体验 +100c（单次）',
   chat_3_times: '和 AI 对话 3 次 +50c', expert_use: '召唤开学季专家 +50c',

@@ -104,14 +104,25 @@ const SHORT_LABEL = {
   '最近成功': '最近',
 };
 function labelTable(table) {
+  // 卡片模式把 table/tr/td 改成 block/grid 后，Chrome/Firefox 会丢掉原生表格角色。
+  // 显式补 role 与 th scope，读屏仍能按「行/列」导航（表头本体在 CSS 里做视觉隐藏）。
+  table.setAttribute('role', 'table');
   const head = table.tHead;
   if (!head || !head.rows.length) return;
+  head.setAttribute('role', 'rowgroup');
   const labels = [];
-  for (const th of head.rows[head.rows.length - 1].cells) labels.push(thLabel(th));
+  for (const th of head.rows[head.rows.length - 1].cells) {
+    labels.push(thLabel(th));
+    th.setAttribute('scope', 'col');
+    th.setAttribute('role', 'columnheader');
+  }
   for (const body of table.tBodies) {
+    body.setAttribute('role', 'rowgroup');
     for (const tr of body.rows) {
+      tr.setAttribute('role', 'row');
       let col = 0;
       for (const td of tr.cells) {
+        td.setAttribute('role', 'cell');
         const span = td.colSpan > 1 ? td.colSpan : 1;
         const full = span === 1 ? (labels[col] || '') : '';
         const label = SHORT_LABEL[full] || full;

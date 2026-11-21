@@ -335,26 +335,7 @@ html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *
 @keyframes qpulse { 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .qdot.run { animation: none; } }
 
-/* ── 连续打卡（成长任务页的账号行）──────────────────────────────────── */
-.srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 12px 18px; }
-.srow + .srow { border-top: 1px solid var(--line-soft); }
-.srow .who .nm { font-weight: 600; font-size: var(--fs-emph); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.srow .who .id { font: var(--fs-kicker) var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.shead {
-  display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto;
-  gap: 14px; align-items: center; padding: 9px 18px 7px;
-  font-size: var(--fs-label); color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
-}
-.shead .stasks span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stasks { display: grid; grid-template-columns: repeat(5, minmax(64px, 1fr)); gap: 6px 10px; }
-.stask { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-ctl); color: var(--ink-2); }
-.stask .mark { font-size: var(--fs-table); line-height: 1; width: 14px; text-align: center; flex: none; }
-.stask.ok .mark { color: var(--ok); }
-.stask.warn .mark { color: var(--warn); } .stask.warn .fr { color: var(--warn); font-variant-numeric: tabular-nums; }
-.stask.todo { color: var(--ink-3); }
-.srow .luck { display: flex; align-items: center; gap: 5px; font-size: var(--fs-ctl); color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.srow .luck svg { width: 14px; height: 14px; opacity: .7; }
-.srow .err { grid-column: 1 / -1; font-size: var(--fs-meta); color: var(--bad); margin-top: -4px; }
+/* ── 连续打卡样式已随功能下线移除 ─────────────────────────────────── */
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
 .pulse.bad { background: var(--bad); }
 .pulse.warn { background: var(--warn); }
