@@ -476,14 +476,14 @@ function renderAccounts(list) {
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
-    else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
+    else if (s.paused) { cls = 'cool'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const note = s.reason ? '<div class="sub-note">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
@@ -520,10 +520,10 @@ function renderAccounts(list) {
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       // 名字单独包一层 .nm-text：省略号只作用于名字，realm 徽标固定不收缩——
       // 否则长邮箱名会把徽标一起裁掉（2026-11-06 面板截图反馈）。
-      '<td class="who"><div class="nm"><span class="nm-text" title="' + esc(s.nickname || '') + '">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</span>' + (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '') + (s.enterprise ? '<span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm"><span class="nm-text" title="' + esc(s.nickname || '') + '">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span class="muted">未命名</span>') + '</span>' + (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '') + (s.enterprise ? '<span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
+      '<td class="num">' + (s.success_count || 0) + ' <span class="sep-dim">/</span> <span class="txt-bad">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
@@ -531,7 +531,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
-      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
+      '<td class="num muted">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
@@ -557,7 +557,7 @@ function renderModelLocks(rows) {
   if (!tb) return;
   const note = $('mlNote');
   if (!rows || !rows.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty inline">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
     if (note) note.textContent = '';
     return;
   }
@@ -610,10 +610,9 @@ async function loadOverview(quiet) {
     if ($('sPaused')) setStat('sPaused', d.paused == null ? '-' : d.paused);
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
     const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-    setStat('sCredits', totSum > 0 ? remSum + ' / ' + totSum : remSum);
+    setStat('sCredits', totSum > 0 ? creditNum(remSum) + ' / ' + creditNum(totSum) : creditNum(remSum));
     setStat('sSticky', d.sticky_sessions);
     $('navSub').textContent = 'v' + d.version;
-    $('navVer').textContent = 'v' + d.version;
     $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
@@ -722,15 +721,15 @@ function outCell(m, pr) {
     if (pr.claimed && pr.measured < pr.claimed) {
       const x = pr.claimed / pr.measured;
       const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
-      return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
+      return '<td class="num" title="' + esc(tip) + '"><span class="txt-warn fw-600">' +
         fmtK(pr.measured) + ' ⚠</span><div class="note">钳制 ' + xs + stale + '</div></td>';
     }
-    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
+    return '<td class="num" title="' + esc(tip) + '"><span class="txt-ok">' + fmtK(pr.measured) +
       (pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓') + '</span></td>';
   }
   if (pr.verdict === 'at_least' && pr.measured)
-    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
-  return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
+    return '<td class="num" title="' + esc(tip) + '"><span class="muted">≥' + fmtK(pr.measured) + '</span></td>';
+  return '<td class="num" title="' + esc(tip) + '"><span class="muted">?</span><div class="note">未测出' + stale + '</div></td>';
 }
 
 /* rateCell 倍率列：牌价 vs 生效价。上游 credits 是牌价（转正后基准倍率），
@@ -741,20 +740,20 @@ function rateCell(m) {
   const tipText = m.promo_note || (m.credits_reference ? '上游未下发实时倍率，显示 2026-11-05 官方快照参考价' : '');
   const tip = tipText ? ' title="' + esc(tipText) + '"' : '';
   if (m.promo_factor != null && m.promo_credits) {
-    const base = m.credits ? ' <s style="color:var(--ink-3);font-size:11.5px">' + esc(m.credits) + '</s>' : '';
+    const base = m.credits ? ' <s class="price-was">' + esc(m.credits) + '</s>' : '';
     const label = m.promo_label ? ' <span class="tag ok">' + esc(m.promo_label) + '</span>' : '';
-    return '<span' + tip + ' style="cursor:help"><b>' + esc(m.promo_credits) + '</b>' + label + base + '</span>';
+    return '<span class="help"' + tip + '><b>' + esc(m.promo_credits) + '</b>' + label + base + '</span>';
   }
   if (m.promo_label) {
-    return '<span' + tip + ' style="cursor:help">' + (m.credits ? esc(m.credits) : '—') +
+    return '<span class="help"' + tip + '>' + (m.credits ? esc(m.credits) : '—') +
       ' <span class="tag warn">' + esc(m.promo_label) + '</span></span>';
   }
-  return m.credits ? '<span' + tip + ' style="cursor:help">' + esc(m.credits) + '</span>' : '—';
+  return m.credits ? '<span class="help"' + tip + '>' + esc(m.credits) + '</span>' : '—';
 }
 
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">正在向上游查询…</div></td></tr>';
   try {
     // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
     // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
@@ -771,7 +770,7 @@ async function loadModels() {
     mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
     mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
       $('mdNote').textContent = '上游未返回模型';
       return;
@@ -785,11 +784,11 @@ async function loadModels() {
     }
     mdProbeOf = m => mdProbeByKey[mdProbeKey(m)] || mdProbes[mdModelBare(m)] || undefined;
     const hit = mdAll.filter(m => mdProbeOf(m)).length;
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    $('mdNote').textContent = mdAll.length + ' 个模型 · 目录已缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
     renderModels();
   } catch (e) {
     mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(shortErr(e.message)) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">' + esc(shortErr(e.message)) + '</div></td></tr>';
     $('mdCount').textContent = '';
     // 头部说明也要改：否则表格里写着失败，标题还挂着"实时查询上游"，读起来像在查。
     $('mdNote').textContent = '查询失败';
@@ -935,19 +934,20 @@ function mdRowHtml(m, pr) {
   // 档位胶囊用中性色：50 行 × 每行 2-4 个 amber 会把整张表染成一片黄，
   // 反而看不出重点。真正需要跳出来的是"默认档"（绿）与"思考常开"（琥珀）。
   const effs = eff.length ? eff.map(e => '<span class="tag mute">' + esc(e) + '</span>').join(' ')
-    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+    : '<span class="muted">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
   // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
   const caps = [];
   if (m.is_default) caps.push('<span class="tag ok">默认</span>');
   if (m.supports_tool_call) caps.push('<span class="tag mute">工具</span>');
   if (m.supports_images) caps.push('<span class="tag mute">视觉</span>');
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
-  const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  const capHtml = caps.length ? caps.join(' ') : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div>' +
+    '<div class="model-sub"><span class="id">' + esc(m.name || '') + '</span>' + capHtml + '</div></td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
-    '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
-    '<td class="efs" style="white-space:normal">' + effs + '</td>' +
+    '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+    '<td class="efs">' + effs + '</td>' +
     '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
     outCell(m, pr) + '</tr>';
 }
@@ -956,7 +956,7 @@ function renderModels() {
   const tb = $('mdBody');
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
     tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m))).join('');
   }
@@ -1026,7 +1026,7 @@ async function loadLogs() {
         const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
         return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
+      : '<span class="muted">暂无日志</span>';
     if (logPin && atEnd) box.scrollTop = box.scrollHeight;
     const counts = {};
     for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
@@ -1104,7 +1104,7 @@ function renderCreditHistory(d) {
   if (!body) return;
   if (!d) {
     if (note) note.textContent = '积分历史不可用';
-    body.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3)">积分历史不可用</td></tr>';
+    body.innerHTML = '<tr><td colspan="5"><div class="empty inline">积分历史不可用</div></td></tr>';
     return;
   }
   const entries = d.entries || [];
@@ -1117,7 +1117,7 @@ function renderCreditHistory(d) {
       '<td class="num">' + esc(creditBalanceText(e)) + '</td>' +
       '<td>' + esc(creditDescText(e)) + '</td>' +
       '</tr>').join('')
-    : '<tr><td colspan="5" style="color:var(--ink-3)">暂无积分变动记录</td></tr>';
+    : '<tr><td colspan="5"><div class="empty inline">暂无积分变动记录</div></td></tr>';
 }
 function creditLimitValue() {
   const el = $('creditLimit');
@@ -1189,8 +1189,8 @@ function renderRequestTable() {
       '<td class="num">' + reqCreditCell(e) + '</td>' +
       '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '</tr>';
-  }).join('') || '<tr><td colspan="10" class="empty">' +
-      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
+  }).join('') || '<tr><td colspan="10"><div class="empty inline">' +
+      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</div></td></tr>';
 
   const filtered = list.length !== reqEntries.length;
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
@@ -1619,7 +1619,7 @@ function renderCompensation(d) {
     const done = !!s.claimed;
     const dl = compDeadlineText(s.end_time, now);
     const name = esc(r.nickname || String(r.uid).slice(0, 8));
-    return '<div class="comp-row"><span>' + name + '</span>' +
+    return '<div class="comp-row"><span title="' + name + '">' + name + '</span>' +
       (done
         ? '<span class="tag ok">已领取</span>'
         : '<span class="tag warn">待领取</span>' +
@@ -2140,7 +2140,7 @@ async function loadSchoolVouchers() {
     $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
     const errs = arr.filter(a => a.error);
     if (errs.length) {
-      body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
+      body.insertAdjacentHTML('beforeend', '<div class="note txt-warn mt-2">查询失败：' +
         errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(shortErr(a.error)) + '）').join('、') + '</div>');
     }
     body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
@@ -2365,8 +2365,10 @@ function fmtCoverage(cov, unpriced) {
 }
 
 function usStat(v, k, cls) {
-  return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
-         '</div><div class="k">' + esc(k) + '</div></div>';
+  // v3：与 usKpi 同序（标签在上、数值在下）。当前没有调用点，但保留函数名——
+  // 前端测试按它切分 app.js，删掉会让 TestAppJSSaveRows 找不到边界。
+  return '<div class="stat ' + (cls || '') + '"><div class="k">' + esc(k) +
+         '</div><div class="v">' + esc(v) + '</div></div>';
 }
 
 /* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
@@ -2451,7 +2453,7 @@ function saveRowsHtml(rows, total, all) {
     .sort((a, b) => Number(b.total_tokens || 0) - Number(a.total_tokens || 0));
   const shown = all ? priced : priced.slice(0, SAVE_ROWS);
   const out = shown.concat(unpriced);
-  if (!out.length) return '<tr><td colspan="5" class="empty">暂无用量数据</td></tr>';
+  if (!out.length) return '<tr><td colspan="5"><div class="empty inline">暂无用量数据</div></td></tr>';
   return out.map(r => saveRowHtml(r, total)).join('');
 }
 
@@ -2531,7 +2533,7 @@ function usRow(name, sub, a, mid, withPerf, nameHtml) {
     '<td>' + (nameHtml || esc(name)) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
     (mid || '') +
     '<td class="num">' + fmtTok(a.requests) + '</td>' +
-    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num">' + (a.errors ? '<span class="txt-warn">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) +
@@ -2613,7 +2615,7 @@ function renderUsageDim() {
       isAcct ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
       m.withPerf,
       isAcct ? remarkName(x.key, esc(primary)) : '');
-  }).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+  }).join('') || '<tr><td colspan="' + m.span + '"><div class="empty inline">暂无数据</div></td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试 · 官方价按牌价折算';
 }
 
@@ -2634,9 +2636,9 @@ function cacheRateCell(hit, miss) {
   const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
   if (!total) return '<span class="muted">—</span>';
   const pct = h / total * 100;
-  const color = pct >= 90 ? 'var(--ok)' : (pct >= 80 ? 'var(--warn)' : 'var(--bad)');
+  const cls = pct >= 90 ? 'cache-hi' : (pct >= 80 ? 'cache-mid' : 'cache-lo');
   const txt = trimFixed(pct.toFixed(1)) + '%';
-  return '<span style="color:' + color + '" title="命中 ' + fmtTok(h) + ' / 未命中 ' + fmtTok(m) + ' tok">' + txt + '</span>';
+  return '<span class="' + cls + '" title="命中 ' + fmtTok(h) + ' / 未命中 ' + fmtTok(m) + ' tok">' + txt + '</span>';
 }
 
 function renderCreditDim() {
@@ -2656,7 +2658,7 @@ function renderCreditDim() {
         '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
         '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
       '</tr>'
-    ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
+    ).join('') || '<tr><td colspan="8"><div class="empty inline">' + empty + '</div></td></tr>';
   } else {
     const accounts = d.credit_by_account || [];
     $('usCreditBody').innerHTML = accounts.map(row => {
@@ -2671,7 +2673,7 @@ function renderCreditDim() {
         '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
         '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
+    }).join('') || '<tr><td colspan="7"><div class="empty inline">' + empty + '</div></td></tr>';
   }
   $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
     account: (d.credit_by_account || []).length,
@@ -2697,8 +2699,8 @@ function renderUsage(d) {
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
     usKpi(fmtTok(total), '总 token', 'c-accent',
       'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
-      '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
-      '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
+      '<div class="kbar"><i class="p" style="width:' + pctW(pt) + '"></i>' +
+      '<i class="c" style="width:' + pctW(ct) + '"></i></div>') +
     usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
     usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
@@ -2867,13 +2869,12 @@ function renderUsageChart(series) {
   }
 
   // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
-  // 标签放左侧：右侧常被峰值柱占用（峰值柱往往就是最后一根），贴左不会被压住。
+  // v3：图内不再写"均值/峰值"文字——usChartNote 已经给出两者，图内文字在
+  // 峰值贴顶时还会和 y 轴刻度重叠。只留虚线，数值看顶部说明。
   if (avg > 0 && avg < max) {
     const y = yOf(avg);
     out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
            '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk-avg" x="' + (PL + 5) + '" y="' + (y - 4).toFixed(1) +
-           '" text-anchor="start">均值 ' + fmtTok(avg) + '</text>';
   }
 
   // 柱子
@@ -2902,16 +2903,6 @@ function renderUsageChart(series) {
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="url(#usGradC)" rx="1.5"/>';
     out += '</g>';
-  }
-
-  // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
-  {
-    const px = xOf(peak.t);
-    const py = yOf(peak.tt);
-    const anchor = px > W - PR - 90 ? 'end' : 'middle';
-    out += '<text class="tk-peak" x="' + Math.max(PL, Math.min(W - PR, px)).toFixed(1) +
-           '" y="' + Math.max(10, py - 5).toFixed(1) + '" text-anchor="' + anchor + '">' +
-           '峰值 ' + fmtTok(peak.tt) + '</text>';
   }
 
   // x 轴基线画在柱子之后，避免压在柱底
@@ -2988,8 +2979,8 @@ async function loadUsage() {
     $('usCreditHead').innerHTML = '';
     $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
     $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
-    $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
-    $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
+    $('usDimBody').innerHTML = '<tr><td colspan="10"><div class="empty inline">读取用量失败</div></td></tr>';
+    $('usCreditBody').innerHTML = '<tr><td colspan="7"><div class="empty inline">读取用量失败</div></td></tr>';
   }
 }
 
@@ -3003,11 +2994,14 @@ if ($('usRange')) trangeBind('usRange', loadUsage);
    完全一致的账号，余额可能差上千——差别只在包里。这里把逐包明细摊开，并给每个
    包名一个稳定配色，跨账号对比时同色即同类。 */
 
-const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
-                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
-const PK_ACCOUNT_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6',
-                           '#e2607a', '#20a4a4', '#8fbf3f', '#d4785c',
-                           '#7c83db', '#c48a2f', '#b45f8c', '#5aa9e6'];
+/* v3：色板走 CSS 令牌，深/浅主题各一套（浅色在白底上对比更足）。
+   返回 var(...) 字符串，可直接塞进 background / --seg-color 等内联属性。 */
+const PK_COLORS = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)',
+                   'var(--chart-5)', 'var(--chart-6)', 'var(--chart-7)', 'var(--chart-8)',
+                   'var(--chart-9)', 'var(--chart-10)'];
+const PK_ACCOUNT_COLORS = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)',
+                           'var(--chart-5)', 'var(--chart-11)', 'var(--chart-7)', 'var(--chart-10)',
+                           'var(--chart-12)', 'var(--chart-8)', 'var(--chart-9)', 'var(--chart-6)'];
 
 function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
 
@@ -3227,7 +3221,7 @@ function renderExpiryDistribution(list, now) {
     a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
   ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
     '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
-  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
+  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span class="pk-expiry-mid">各账号该批剩余</span><b>剩余积分</b></div>';
   $('pkExpiry').innerHTML = (rows
     ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
     : '<div class="pk-expiry-empty">暂无可汇总积分</div>') +
@@ -3350,8 +3344,7 @@ function renderPackages(d, detailLimit) {
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
       ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
       (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
-      ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条（' +
-      esc(PK_SORT_LABELS[pkSortMode] || '') + '）</span>' +
+      ' · 最早到期前 ' + pkDetailLimitValue(detailLimit) + ' 条</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
       '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
@@ -3506,13 +3499,13 @@ function expiryRowsHtml(list) {
   return keyed.map(({ a }) => {
     const name = a.nickname || String(a.uid || '').slice(0, 8);
     if (a.error) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
+      return '<div class="exp-row"><span class="exp-dot mute"></span>' +
         '<span class="exp-nm">' + esc(name) + '</span>' +
         '<span class="exp-main err">查询失败：' + esc(shortErr(a.error)) + '</span></div>';
     }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
     if (!bs.length) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+      return '<div class="exp-row"><span class="exp-dot ok"></span>' +
         '<span class="exp-nm">' + esc(name) + '</span>' +
         '<span class="exp-main">7 天内无到期积分</span></div>';
     }
@@ -3524,13 +3517,13 @@ function expiryRowsHtml(list) {
     // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
     // 上游扣包是 FEFO（按失效时刻升序，实测两号口径一致）：这些快过期批次正是
     // 被消耗得最快的，日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const cls = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
     const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
     const rest = bs.slice(1, 4).map(b =>
       '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + esc(name) + '</span>' +
+    return '<div class="exp-row"><span class="exp-dot ' + cls + '"></span>' +
+      '<span class="exp-nm" title="' + esc(name) + '">' + esc(name) + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' +
@@ -3547,8 +3540,9 @@ function renderExpiry(d) {
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
   $('expNote').textContent = (lastPackagesAt && ageMin > 0)
-    ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，可点「检查」刷新'
+    ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据'
     : list.length + ' 个账号 · 实时查询上游';
+  $('expNote').title = '逐个账号实时查询上游的积分包明细；点「检查」刷新。';
   $('expBox').hidden = false;
 }
 
@@ -3612,8 +3606,8 @@ function renderExpirySnapshot(d) {
   const rows = keyed.map(({ a, ms }) => {
     const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
     if (!ms || !a.credits_earliest_remaining) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
-        '<span class="exp-nm">' + nm + '</span>' +
+      return '<div class="exp-row"><span class="exp-dot ok"></span>' +
+        '<span class="exp-nm" title="' + nm + '">' + nm + '</span>' +
         '<span class="exp-main">无近期到期批次</span></div>';
     }
     // 与 expDaysLeft 同口径：按本地自然日算，而不是对精确时间戳 ceil（后者会把
@@ -3624,10 +3618,10 @@ function renderExpirySnapshot(d) {
     const days = Math.max(0, Math.round((new Date(when + 'T00:00:00') - today) / 86400000));
     const remain = Number(a.credits_earliest_remaining || 0);
     const daily = Math.ceil(remain / Math.max(1, days));
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const cls = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
     const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
-      '<span class="exp-nm">' + nm + '</span>' +
+    return '<div class="exp-row"><span class="exp-dot ' + cls + '"></span>' +
+      '<span class="exp-nm" title="' + nm + '">' + nm + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
       fmtTok(daily) + '</b>' +
@@ -3636,6 +3630,7 @@ function renderExpirySnapshot(d) {
   }).join('');
   $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
   $('expNote').textContent = snapshotNoteText(list.length, d);
+  $('expNote').title = '快照来自本地状态，随后台余额刷新更新；点「检查」拉取逐包实时明细。';
   $('expBox').hidden = false;
 }
 
@@ -3647,7 +3642,7 @@ function snapshotNoteText(count, d) {
   const iv = Number(d && d.balance_refresh_sec) || 0;
   const at = d && d.balance_refreshed_at ? new Date(d.balance_refreshed_at).getTime() : 0;
   if (iv <= 0) {
-    return count + ' 个账号 · 快照（来自本地状态 · 未开启后台刷新，点「检查」拉实时明细）';
+    return count + ' 个账号 · 本地快照（未开启后台刷新）';
   }
   const every = iv % 60 === 0 ? iv / 60 + ' 分钟' : iv + ' 秒';
   let tail = '每 ' + every + '后台刷新';
@@ -3655,7 +3650,7 @@ function snapshotNoteText(count, d) {
     const min = Math.floor((Date.now() - at) / 60000);
     tail += '，' + (min < 1 ? '刚刚更新' : min + ' 分钟前更新');
   }
-  return count + ' 个账号 · 快照（' + tail + '，点「检查」拉实时明细）';
+  return count + ' 个账号 · ' + tail;
 }
 
 async function loadExpiry(force) {

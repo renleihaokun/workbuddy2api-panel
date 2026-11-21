@@ -562,7 +562,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("usage chart node test failed: %v\n%s", err, out)
 	}
-	const want = `{"hasUsbar":true,"hasBareBar":false,"hasGradient":true,"barCount":6,"hasPeak":true,"hasAvg":true,"emptyState":true}`
+	const want = `{"hasUsbar":true,"hasBareBar":false,"hasGradient":true,"barCount":6,"hasPeak":false,"hasAvg":false,"emptyState":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("usage chart=%s\nwant %s", out, want)
 	}
@@ -815,7 +815,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry summary node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
+	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"var(--chart-1)","colorB":"var(--chart-2)"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
 	}
@@ -931,7 +931,7 @@ const d = { accounts: [
   { uid: 'e', nickname: 'broken',   realm: 'cn',     error: 'offline' },
 ] };
 ctx.renderExpiry(d);
-const names = [...sink.innerHTML.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+const names = [...sink.innerHTML.matchAll(/<span class="exp-nm"[^>]*>([^<]*)<\/span>/g)].map(m => m[1]);
 process.stdout.write(JSON.stringify(names));`
 	f, err := os.CreateTemp(t.TempDir(), "expsort-*.cjs")
 	if err != nil {
@@ -999,7 +999,7 @@ const d = { accounts: [
 ] };
 ctx.renderExpirySnapshot(d);
 const html = sinks['expList'] ? sinks['expList'].innerHTML : '';
-const names = [...html.matchAll(/<span class="exp-nm">([^<]*)<\/span>/g)].map(m => m[1]);
+const names = [...html.matchAll(/<span class="exp-nm"[^>]*>([^<]*)<\/span>/g)].map(m => m[1]);
 // 2 天到期的应排最前（红），30 天其次，无到期信息的排最后。
 const wantNames = JSON.stringify(['秋', '秋千易', '长期包']);
 const gotNames = JSON.stringify(names);
@@ -2218,9 +2218,10 @@ func TestIndexHTMLDesignTokensComplete(t *testing.T) {
 	tokens := cssTokens(m[1])
 	want := []string{
 		"--fs-page", "--fs-title", "--fs-body", "--fs-table", "--fs-label", "--fs-num",
+		"--fs-ctl", "--fs-emph", "--fs-dialog",
 		"--sp-3", "--sp-4", "--sp-5", "--r-sm", "--r-md", "--r-lg", "--r-xl",
 		"--sh-1", "--sh-2", "--sh-3", "--dur-1", "--dur-2", "--dur-3",
-		"--font-num", "--zebra",
+		"--font-num", "--zebra", "--h-ctl", "--h-btn", "--pad-x", "--btn-pri-1", "--chart-1",
 	}
 	for _, k := range want {
 		if _, ok := tokens[k]; !ok {
@@ -2283,5 +2284,93 @@ func TestIndexHTMLNavGroups(t *testing.T) {
 		if got := strings.Count(nav, "data-view=\""+v+"\""); got != 1 {
 			t.Fatalf("导航项 data-view=%q 在 <nav> 里出现 %d 次（应恰好 1 次）", v, got)
 		}
+	}
+}
+
+/* ══ 视觉打磨 v3 护栏 ═══════════════════════════════════════════════════
+   这轮把「两套指标卡 / 四种表格缩进 / 三种控件高度」收敛成一套。以下用例只钉
+   最容易悄悄退化的三件事：字号令牌、吸顶表头实色、指标卡共享规格。 */
+
+// TestCSSNoLiteralFontSizes 组件规则里不允许再出现裸 px 字号：
+// 12.5/13.5/16 这类游离值一旦散落，两套组件就会慢慢长回不同的字号。
+// 令牌定义本身（:root 与浅色色板）里当然有 px，故从 "* { box-sizing" 之后开始检查。
+func TestCSSNoLiteralFontSizes(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	styleStart := strings.Index(html, "<style>")
+	styleEnd := strings.Index(html, "</style>")
+	if styleStart < 0 || styleEnd < styleStart {
+		t.Fatal("index.html 找不到内联 <style>")
+	}
+	css := html[styleStart:styleEnd]
+	bodyStart := strings.Index(css, "* { box-sizing")
+	if bodyStart < 0 {
+		t.Fatal("找不到组件 CSS 起点")
+	}
+	body := css[bodyStart:]
+	sizeRe := regexp.MustCompile(`font-size:\s*[\d.]+px`)
+	fontRe := regexp.MustCompile(`font:\s*[^;]*[\d.]+px`)
+	for i, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, "clamp(") {
+			continue // 流式字号 clamp(18px, 1.3vw, …) 是刻意的响应式取值
+		}
+		if sizeRe.MatchString(line) || fontRe.MatchString(line) {
+			t.Fatalf("组件 CSS 仍有裸 px 字号（应改用 --fs-* 令牌）：第 %d 行 %s", i+1, strings.TrimSpace(line))
+		}
+	}
+}
+
+// TestCSSStickyTableHeaderOpaque 吸顶表头必须是实色：半透明表头在滚动时会把
+// 下面的行透出来，看起来像表头没吸住、文字重影。
+func TestCSSStickyTableHeaderOpaque(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	for _, sel := range []string{".tbl-wrap.tall thead th", ".req-wrap thead th"} {
+		idx := strings.Index(html, sel)
+		if idx < 0 {
+			t.Fatalf("缺少吸顶表头规则 %s", sel)
+		}
+		block := html[idx:]
+		if end := strings.Index(block, "}"); end >= 0 {
+			block = block[:end]
+		}
+		if !strings.Contains(block, "background: var(--surface-2)") {
+			t.Fatalf("%s 的表头不是实色（滚动时会透出下面的行）：%s", sel, strings.TrimSpace(block))
+		}
+	}
+}
+
+// TestCSSMetricCardsShared 统计卡与 KPI 卡必须共用同一组基础选择器，
+// 否则「数值在上 / 标签在上」「26px / 24px」这类双规格会再次分叉。
+func TestCSSMetricCardsShared(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	if !regexp.MustCompile(`(?s)\.stat,\s*\.kpi\s*\{`).MatchString(html) {
+		t.Fatal("缺少 '.stat, .kpi { … }' 共享规格：两套指标卡会重新分叉")
+	}
+	if !regexp.MustCompile(`(?s)\.stat::before,\s*\.kpi::before\s*\{`).MatchString(html) {
+		t.Fatal("缺少 '.stat::before, .kpi::before' 共享语义色轨")
+	}
+}
+
+// TestCSSUsageLineGrid 账号表用量列必须是 2×2 网格（v3 的密度修复）：
+// 退回 inline-flex + wrap 会让四枚 chip 竖排，行高从 62px 涨回 115px。
+func TestCSSUsageLineGrid(t *testing.T) {
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(b)
+	if !regexp.MustCompile(`(?s)\.usage-line\s*\{[^}]*display:\s*grid`).MatchString(html) {
+		t.Fatal(".usage-line 不再使用 grid：四枚 chip 会竖排，账号表行高翻倍")
 	}
 }

@@ -172,8 +172,7 @@ function drawMobileUsageChart(series) {
   }
   if (avg > 0 && avg < max) {
     const y = yOf(avg);
-    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>' +
-      '<text class="tk-avg" x="' + (PL + 4) + '" y="' + (y - 5).toFixed(1) + '" text-anchor="start">均值 ' + fmtTok(avg) + '</text>';
+    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
   }
   for (const p of pts) {
     const x = xOf(p.t) - bw / 2;
@@ -188,12 +187,6 @@ function drawMobileUsageChart(series) {
     if (hC > 0) out += '<rect class="usbar usbar-c" x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) + '" rx="1.5"/>';
     out += '</g>';
-  }
-  {
-    const px = xOf(peak.t), py = yOf(peak.tt);
-    const anchor = px > W - PR - 84 ? 'end' : 'middle';
-    out += '<text class="tk-peak" x="' + Math.max(PL, Math.min(W - PR, px)).toFixed(1) + '" y="' +
-      Math.max(12, py - 6).toFixed(1) + '" text-anchor="' + anchor + '">峰值 ' + fmtTok(peak.tt) + '</text>';
   }
   out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) + '" y2="' + yBase + '"/>';
   // x 刻度抽到 4 个（上游 6 个），且取"离目标最近的真实柱子"，标签永远落在有数据的点上

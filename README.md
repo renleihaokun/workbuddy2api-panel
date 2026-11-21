@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.19.0-panel`（面板视觉重构：设计令牌 v2、表格数值右对齐、纯 CSS 开关、移动端卡片流），与 Release `v1.19.0` 同源。
+> 当前版本 `1.19.1-panel`（视觉打磨 v3：指标卡/表格/空态/弹层规格收敛、18px 网格对齐、密度与细节修复），与 Release `v1.19.0` 同源。
 
 ## 核心能力
 
@@ -984,15 +984,16 @@ http://127.0.0.1:7863/panel/
 - 浅色色板在 CSS 里写了两份（媒体查询 + 显式锁定），`TestIndexHTMLLightPaletteConsistent` 保证两份逐字一致。
 - 原生控件（滚动条 / 日期选择器 / 下拉）跟着 `color-scheme` 走；手机端额外用 `color-scheme: only light|dark` 退出安卓的「自动暗化」。
 
-**设计令牌 v2**（全部定义在 `:root`，由 `TestIndexHTMLDesignTokensComplete` 守住完整性）：
+**设计令牌 v3**（全部定义在 `:root`，由 `TestIndexHTMLDesignTokensComplete` 守住完整性）：
 
 | 类别 | 令牌 | 说明 |
 |---|---|---|
 | 表面 | `--bg → --surface → --surface-2 → --raise` | 页面 → 卡片 → 内嵌 → 浮起，四级分层 |
 | 描边 | `--line / --line-soft` | 语义边界 / 同级分隔 |
 | 语义 | `--ok / --warn / --bad`（各带 `-soft`） | 只用于状态，不做装饰 |
-| 字号 | `--fs-kicker 10.5` · `--fs-label 11.5` · `--fs-meta 12` · `--fs-table 13` · `--fs-body 14` · `--fs-title 15` · `--fs-page 18` · `--fs-num 26` · `--fs-hero 32` | 页标题 > 卡片标题 > 正文 > 表格 > 标签 > 徽标 |
-| 间距 | `--sp-1…7` = 4 / 6 / 8 / 12 / 16 / 20 / 28 | 4px 基准 |
+| 字号 | `--fs-kicker 10.5` · `--fs-label 11.5` · `--fs-meta 12` · `--fs-ctl 12.5` · `--fs-table 13` · `--fs-emph 13.5` · `--fs-body 14` · `--fs-title 15` · `--fs-dialog 16` · `--fs-page 18` · `--fs-num 26` · `--fs-hero 32` | 组件规则里不再出现裸 px 字号（`TestCSSNoLiteralFontSizes`） |
+| 控件高度 | `--h-xs 26` · `--h-ctl 30` · `--h-btn 32` | 表格行内 / 卡片头与筛选栏 / 顶栏与弹层 |
+| 间距 | `--sp-1…7` = 4 / 6 / 8 / 12 / 16 / 20 / 28；`--pad-x 18` · `--pad-cell-x 12` · `--gap-box 18` | 4px 基准；所有卡片头/卡片体/首列共用 18px 网格 |
 | 圆角 | `--r-xs 4` · `--r-sm 6` · `--r-md 9` · `--r-lg 12` · `--r-xl 16` · `--r-pill 999` | 五档 + 胶囊，不再一个组件一种圆角 |
 | 阴影 | `--sh-1` 发丝 · `--sh-2` 卡片 · `--sh-3` 弹层 · `--sh-accent` 主按钮光晕 | 深色偏黑、浅色偏蓝灰 |
 | 动效 | `--dur-1/2/3` = 140 / 200 / 280ms，统一 `--ease` | 所有交互态复用同一套 |
@@ -1022,13 +1023,12 @@ http://127.0.0.1:7863/panel/
 **组件规格**
 
 - **壳层**：侧栏 232px + 分组标签（观测 / 运行 / 系统）；品牌标记 32px 渐变块 + 版本胶囊；侧栏底部状态卡（`--surface-2` 内嵌块）。
-- **顶栏**：58px、标题 18px/650、运行时长做成 `--mono` 胶囊；**上下文动作**——`go()` 把当前视图写到 `body[data-view]`，CSS 让「添加账号」只在账号池出现。
-- **统计条**：7 张独立卡片（顶部 2px 语义色轨 + 26px 数字），窄屏按 4 / 3 / 2 列收口，绝不留下行尾空洞。
-- **KPI**：`repeat(auto-fit, minmax(168px, 1fr))`——5 张卡不会再被塞进 6 列网格留下一个空格子。
-- **表格**：表头 11.5px + 淡底色；`th.num/td.num` 右对齐 + `tabular-nums`；行高 ≤44px；模型目录用 `.tbl-wrap.tall` 限高 + 表头吸顶；请求记录同款吸顶。
+- **顶栏**：58px、标题 18px/650、运行时长做成 `--mono` 胶囊；`.topbar-inner` 与 `.view` 共用 1520px 纵轴（宽屏下标题与卡片同一条左边线）；**上下文动作**——`go()` 把当前视图写到 `body[data-view]`，CSS 让「添加账号」只在账号池出现。
+- **指标卡**：`.stat` 与 `.kpi` 共用一套规格（标签 → 数值 → 副文案 → 构成条），统计条 7 张卡在 ≤1599px 改排 4+3、积分额度卡跨两格；KPI 仍 `repeat(auto-fit, minmax(168px, 1fr))`。
+- **表格**：表头实色 + 11.5px；健康色条改为单元格内绝对定位的 3px 导轨（不占列宽），首列与卡片标题同用 18px 缩进；`th.num/td.num` 右对齐 + `tabular-nums`；模型目录 `.tbl-wrap.tall` 限高 + 吸顶表头（实色，滚动不透行）；请求记录同款。
 - **开关**：配置页 14 个原生 `input[type=checkbox]` 改成纯 CSS 开关（40×22 胶囊 + 18px 滑块），**DOM 与 `name` 不变**，`collectConfig()` 零改动；`TestCSSSwitchIsCustom` 防原生方块回归。
-- **空态**：圆形图标底座 + 标题 + 说明 + 可选 CTA；账号池空态直接给「添加账号」按钮（`data-a="add"`，走同一套事件委托）。
-- **弹层**：16px 圆角、近不透明玻璃、分段式 tabs；密钥门是有 `api_key` 时的「第一屏」，带品牌区与 40px 输入框。
+- **空态**：`.empty` 一套（40px 圆形图标 + 标题 + 说明 + 可选 CTA），表格内用 `.empty.inline`；账号池空态直接给「添加账号」按钮（`data-a="add"`，走同一套事件委托）。
+- **弹层**：`.dlg.sm/.md/.lg` 三种宽度（不再写内联 width）、16px 圆角、近不透明玻璃、分段式 tabs 与 `.vtabs` 同规格；密钥门是有 `api_key` 时的「第一屏」，带品牌区与 40px 输入框。
 
 **动效**
 
@@ -1049,7 +1049,14 @@ http://127.0.0.1:7863/panel/
 - 主题切换、弹层、toast 都有进出场过渡；`prefers-reduced-motion: reduce` 下全部压到 0.01ms。
 - toast 容器带 `role="status" aria-live="polite"`，操作结果读屏软件也能播报；当前导航项带 `aria-current="page"`。
 
-**空态与加载**：数据未到时不再是一块空白——KPI 网格用微光骨架（`.kpis:empty::after`），空表用 `.tbl-wrap:has(tbody:empty)::after` 微光条，列表与表格用统一的「图标 + 标题 + 说明」空态。
+**空态与加载**：数据未到时不再是一块空白——KPI 网格用微光骨架（`.kpis:empty::after`），空表用 `.tbl-wrap:has(tbody:empty)::after` 微光条；列表用统一的 `.empty`（图标 + 标题 + 说明），表格内用 `.empty.inline` 单行空态。
+
+**v1.19.1 视觉打磨（v3）**
+
+- 组件收敛：两套指标卡合成一套；`.empty`/`.tc-empty`、`.vtabs`/`.dlg .tabs` 各自合并；主按钮渐变与图表色板收进令牌（`--btn-pri-*` / `--chart-1…12`，浅色单独一套）。
+- 网格对齐：顶栏标题、卡片标题、表格首列统一 18px 纵轴；`.view` 侧边距 24px；桌面端 `scrollbar-gutter: stable` 防切页横跳。
+- 密度：账号表用量 chip 2×2（行高 115→62–65px）；模型表能力标签并入第二行（行高 ~64px）；筛选/卡片头控件统一 30px。
+- 细节：吸顶表头改实色、保存条去毛玻璃、危险按钮 hover 才红、图表移除与刻度重叠的「峰值/均值」内联文字（顶部说明保留）、长说明改短句 + `title`。
 
 ### 手机端（≤760px）
 
