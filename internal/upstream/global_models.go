@@ -156,6 +156,8 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	c.globalModels.fetched = time.Now()
 	c.globalModels.lastFail = time.Time{}
 	c.globalModels.Unlock()
+	// 名字快照（catalog.go）：同名模型跨域回退的目录判据（与 CN 侧同口径）。
+	c.storeCatalogNames("global", merged)
 	return merged, infos
 }
 

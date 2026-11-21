@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.20.0-panel`（原生控件接管层 + 布局/交互/可访问性批次：自绘 select/confirm/tooltip、账号表列宽预算、弹层 dialog 语义、手机账号卡重排），与 Release `v1.20.0` 同源。
+> 当前版本 `1.21.0-panel`（反代劣化看板 + 剩余积分走势 + 同名模型跨域回退：把上游对反代通道的识别/拦截按时间摊开、给积分余额一条采样时间线、并允许「本域整池不可服务时改用另一域的同名模型」），与 Release `v1.21.0` 同源。
 
 ## 核心能力
 
@@ -177,6 +177,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 🔄 **多账号池** | 快过期积分加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 分型处置：普通限流软冷却 600s 起指数退避（封顶 `soft_rate_max`）；`6004` / `6000` 模型级冷却到上游重置；`14003` / `6021` 不罚号；`429 + 14018` 硬冷却。404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
+| 🔀 **跨域回退** | 裸名回退（`pool.cross_domain_fallback`）+ 同名模型回退（`pool.cross_domain_model_fallback`，显式 `cn:` / `global:` 也参与）：本域目录明确没有该模型或整池不可服务时，改用另一域的同名模型，cn↔global 双向，目录未知不猜 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点）+ 夜猫子（23 点）+ 成长任务队列（01 点），六类独立开关；另有分钟级余额刷新与补领清扫 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧭 **Responses API** | 原生 `POST /v1/responses`（Codex CLI 直连）：入站改写成 chat 请求、出站翻译成语义事件/Response 对象，复用全部选号与处置管线；无服务端会话存储（`store` 恒 false） |
@@ -187,7 +188,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹**整句**清洗（Claude Code / Codex / DSH 身份句 / 审查插件提示词）；**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / 账号标签 / rid / 结果 / 积分）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
-| 🖥️ **Web 管理面板** | 内嵌单页面板（**默认跟随系统明暗**，可三态循环锁定；毛玻璃侧栏/顶栏/弹层 + 入场动效；七个视图）：账号运维 / 用量与积分分析 / 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🖥️ **Web 管理面板** | 内嵌单页面板（**默认跟随系统明暗**，可三态循环锁定；毛玻璃侧栏/顶栏/弹层 + 入场动效；八个视图）：账号运维 / 用量与积分分析（含**剩余积分走势**折线）/ **反代劣化看板**（上游识别与拦截趋势）/ 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
 | 💰 **「已省」折算** | 用量页按厂商**官网牌价**（人民币 / 百万 tokens）把 token 折成钱：左边大字「已省 ￥ + 历史累计」，右边按模型列出折算金额与占比（每行带「入/出/缓存」单价摘要），覆盖率细条与未定价 token 在金额下方；按命中 / 未命中 / 输出三段计价，DeepSeek 走**峰谷价**（工作日 9–12、14–18 高峰，其余半价），日桶按高峰小时加权。价格来自内置种子 + `data/prices.json` 手改覆盖（改完刷新即生效）。**纯展示**：不参与计费、选号、积分保底 |
 
 ## 🎯 成长任务一键完成（23/25）
@@ -566,7 +567,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
 | `pool.credit_floor` | `100` | **积分保底**：账号余额低于该值时，对**实测收费**模型（tier 2，账本 6h 内有效观测）不再参与选号——防止收费模型把余额打穿、连免费模型都 402 冷却到次日签到（最坏约 11.5 小时不可用）。tier 0（实测免费）/ tier 1（无观测）**不受限**：保底保的是「留余额给免费模型用」，且 tier 1 若拦会让账本过期 / 重启清零的触底号死锁在「学不回来」。含会话粘性路径（粘性号触底则解绑换号）。全池触底且全 tier 2 时选号返回空（网关回 503），**不放行**。签到回血越过 floor 即刻自动恢复。`0` = 关闭 |
-| `pool.cross_domain_fallback` | `false` | **裸模型名跨域回退**（issue #135）：开启后，请求 `model` 不带 `cn:` / `global:` 前缀时不再等价于 `cn:<模型>`——首选域（cn）选不到可用号（账号级冷却/熔断/在途占满，或该域账号对这个模型 11102 后被模型级负缓存避开）会自动改用另一域再选一次，客户端只写一个模型名即可跟随账号池切换。显式 `cn:` / `global:` 前缀**永不回退**（写哪个域就用哪个域）。跨域会消耗另一个域的额度，故默认关闭 |
+| `pool.cross_domain_fallback` | `false` | **裸模型名跨域回退**（issue #135）：开启后，请求 `model` 不带 `cn:` / `global:` 前缀时不再等价于 `cn:<模型>`——首选域（cn）选不到可用号（账号级冷却/熔断/在途占满，或该域账号对这个模型 11102 后被模型级负缓存避开）会自动改用另一域再选一次，客户端只写一个模型名即可跟随账号池切换。显式 `cn:` / `global:` 前缀**不受本开关影响**（写哪个域就用哪个域；要连显式前缀一起回退请用下面的 `cross_domain_model_fallback`）。跨域会消耗另一个域的额度，故默认关闭 |
+| `pool.cross_domain_model_fallback` | `false` | **同名模型跨域回退**：对**显式 `cn:` / `global:` 前缀同样生效**，但要求「另一域目录里确有同名模型」——目录未探测到/已过期（1h TTL）时视为未知，**不猜、不回退**。触发条件二选一：①本域目录明确没有该模型（第一次上游调用之前就改道，不浪费 11102 轮转）；②本域对该模型整池不可服务（账号级冷却/熔断/在途占满/模型级负缓存/积分保底）而另一域有可服务号。cn↔global 双向，每请求最多切一次。两开关同开时裸名沿用旧开关的宽松语义（不校验目录），显式前缀仍要求目录同名。面板保存后热生效 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
@@ -762,6 +764,23 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 - TTL 滚动续期（默认 30m），GC 周期 5m；绑定可镜像到 Redis（7 天 TTL）防重启丢失
 - 请求失败自动解绑；成功后绑定跟随最终成功账号
 
+### 同名模型跨域回退
+
+上游对同一个模型名的可见性会按域分叉：`deepseek-v4.1-flash-sg` 只在国际版目录里，某些 `gpt-*` 只在国内版。客户端写死一个 `cn:xxx` 后，一旦该域对这个模型整池不可用，请求就只能失败。`pool.cross_domain_model_fallback`（默认关）让网关在**另一域确有同名模型**时自动改道：
+
+| 触发条件 | 说明 |
+|---|---|
+| T1 本域目录明确没有该模型 | 目录快照（1h TTL）里本域 absent、另一域 present → **第一次上游调用之前**就换域，不浪费 `MaxRotate` 次 11102 轮转 |
+| T2 本域对该模型整池不可服务 | `ServableForModelRealm(本域) == 0` 且另一域 > 0：账号级冷却 / 熔断 / 在途占满 / 模型级负缓存（11102、6004）/ 积分保底都计入 |
+
+约束与边界：
+
+- **目录未探测到/已过期 = 不猜、不回退**（宁可本次失败，也不拿旧目录决定路由）。目录由启动预热（`warmModelRates`）与 `/v1/models`、面板模型页刷新；CN 走 `/v3/config` + 企业端点，global 走三路 UA + 企业端点家族。
+- cn↔global **双向**，每个请求最多切一次（防两域来回打乒乓）。
+- 目录未知但上游先撞 11102 时，本次可能以 `model_unavailable` 结束（受 `MaxRotate` 封顶）；该域账号的模型级负缓存会让**下一次**请求走 T2 改道。
+- 显式 `cn:` / `global:` 前缀**参与**（这是与 `pool.cross_domain_fallback` 的核心区别）；两开关同开时，裸名沿用旧开关的宽松语义（不校验目录）。
+- 可观测：切换时打一行 `INFO: [server] model realm fallback model=… cn -> global (catalog=… servable=…/…)`；请求归档记 `realm`（实际服务域）与 `fallback`（是否回退），面板「反代劣化」看板的「跨域回退」计数与分域对比都取自这两个字段。
+
 ### 定时任务
 
 六类 hourly 任务各自独立排程、各有开关，互不影响；另有余额刷新与任务补领清扫两个分钟级任务。容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
@@ -953,13 +972,14 @@ http://127.0.0.1:7863/panel/
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面**默认跟随系统明暗**（`prefers-color-scheme`，系统切主题时实时生效），顶栏主题按钮按「跟随系统 → 浅色 → 深色 → 跟随系统」三态循环并记住选择。左侧导航七个视图（按「观测 / 运行 / 系统」分组）：
+界面**默认跟随系统明暗**（`prefers-color-scheme`，系统切主题时实时生效），顶栏主题按钮按「跟随系统 → 浅色 → 深色 → 跟随系统」三态循环并记住选择。左侧导航八个视图（按「观测 / 运行 / 系统」分组）：
 
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 已暂停选号 / 积分剩余·总额 / 粘性会话）+ **积分到期提醒卡**（按最近到期批次估算、FEFO 口径；点「检查」拉逐包明细）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 暂停选号 / 恢复选号 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条与「官方价」列）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」）+ **已省**（一张账单：左边大字金额 + 覆盖率细条，右边按模型列出 请求 / token / 折算金额 / 占比条，金额降序、未定价排末尾；牌价快照与模型数压成 header 一行小字，点「展开全部」看全量） |
-| **积分构成** | **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
+| **积分构成** | **剩余积分走势**（全池合计 + cn/global 分域折线，余额后台刷新/签到结束时采样；企业版不限量账号不计入合计）+ **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
+| **反代劣化** | 上游对反代通道的识别与拦截**随时间的劣化趋势**：6 张 KPI（请求数 / 成功率 / 通道拒绝 11-128 / 内容拦截 / 模型不可用 11102 / 限流·拥塞）+ 提示词降级状态条（模式、降级期截止、已学习指纹、跨域回退与降级请求数）+ **100% 堆叠结果构成图**（成功 / 通道拒绝 / 内容拦截 / 模型不可用 / 限流·拥塞 / 其他失败，按小时或按日）+ **错误分类表**（次数 / 占请求 / 最近一次）+ **分域对比表**（请求 / 成功 / 失败 / 成功率 / 平均耗时 / 平均 TTFB / 跨域回退）。数据来自请求归档（脱敏元数据），不触发上游调用 |
 | **任务中心** | 成长任务队列：一键扫描全部账号未完成待办（默认口径 + 小程序口径）→ 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询（活动已结束，仅历史券）。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长 / 补领清扫 时点与开关 + 余额刷新间隔；夜猫子时点与开关仅 `config.json`）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / system→user 兜底 / 粘性路由）、日志（调用来源记录开关） |
@@ -1090,6 +1110,13 @@ http://127.0.0.1:7863/panel/
 - 字号阶梯保留 12 / 12.5 / 13 / 13.5 的细档：密集表格里「控件 12.5 / 表格 13 / 强调 13.5」有实际区分作用，不为了档位数量强行合并。
 - 配置表单用 `aria-label`（取 `.lb` 一行）而不是给 30+ 字段批量加 `for/id`：读屏效果等价，结构改动风险小得多。
 
+**v1.21.0 两个新看板**
+
+- **反代劣化**（新导航视图）：6 张 KPI + 提示词降级状态条 + **100% 堆叠结果构成图** + 错误分类表 + 分域对比表。柱子按桶内请求数归一化——看的是「构成怎么变」，绝对量交给 KPI 与表格；跨天断档用真实时间轴定位，不会被画成一段连续曲线。
+- **剩余积分走势**（积分构成页顶部）：合计 / CN / Global 三条折线 + 合计面积填充 + 采样点 tooltip；y 轴从 0 起（积分为负没有意义），x 轴同样用真实时间轴。采样点 > 60 时自动隐藏圆点，避免糊成一条粗线。
+- 两个新图都复用现有 `.uschart` 外壳与刻度样式，新增的只有 `polyline.ctl-*` / `path.ctarea` / `rect.dbar` / `.dchip` 这几条规则；配色走既有令牌（`--accent` / `--ok` / `--warn` / `--bad` / `--chart-*`），没有引入新色板。
+- 窄屏同样走 440 宽 viewBox（刻度 4 个），与用量图的手机版同口径；错误分类表与分域表由 `mobile.js` 的 `labelTables()` 自动转成卡片。
+
 ### 手机端（≤760px）
 
 无需配置：窗口宽度 ≤760px 时自动生效，>760px 完全不参与，桌面端逐像素不变。
@@ -1103,7 +1130,7 @@ http://127.0.0.1:7863/panel/
 
 ### 时间范围查询
 
-「用量」与「运行日志 → 请求记录」共用同一个时间范围控件，预设 **今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义**（自定义展开起止时间输入，精确到分钟；起止颠倒就地标红）：
+「用量」「运行日志 → 请求记录」「反代劣化」「剩余积分走势」共用同一个时间范围控件，预设 **今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义**（自定义展开起止时间输入，精确到分钟；起止颠倒就地标红）：
 
 - 「今天」与「自定义」的区间由**浏览器按本地时区**算好后发给服务端——服务端时区未必与浏览器一致（容器常挂 `TZ=Asia/Shanghai`），让服务端算"今天"会在跨时区时切错日子；
 - 滚动预设走服务端的 `hours` 口径（当前整点往回 N-1 小时），与既有统计口径逐位一致（前端自己减 N 小时会在边界多算/少算一个桶）；
@@ -1117,7 +1144,7 @@ http://127.0.0.1:7863/panel/
 来源信息比 token 计数敏感（IP 属个人信息），因此由 `logging.request_client_info` 控制，**缺省开启、热生效、面板「配置 → 日志」可关**；关闭后归档与面板都不再出现来源字段（老归档里没有该字段的条目显示 `—`）。
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`features.system_as_user_fallback`、`models.hidden`、`models.id_style`、`models.realm_name_prefix`、`logging.request_client_info`、`pool.*`（熔断/在途/批量并发/权重）、
+`features.system_as_user_fallback`、`models.hidden`、`models.id_style`、`models.realm_name_prefix`、`logging.request_client_info`、`pool.*`（熔断/在途/批量并发/权重/跨域回退）、
 `schedule.*`（时点/开关/余额刷新间隔/补领清扫）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`dns_servers`、`server.read_timeout`、`upstream.*`、`global.*`、`cn.chat_base`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
@@ -1133,7 +1160,7 @@ http://127.0.0.1:7863/panel/
 | `cn/glm-5.2` / `global/gpt-5.6-sol` | 斜杠写法，`models.id_style=slash` 时输出 |
 | `glm-5.2` | 裸名 = `cn:glm-5.2`（历史兼容） |
 
-请求里的 `model` 用上述任一写法，网关都按同一 realm 路由；显式前缀不参与跨域回退，裸名才参与（`pool.cross_domain_fallback`）。
+请求里的 `model` 用上述任一写法，网关都按同一 realm 路由。跨域回退有两档、互相独立：`pool.cross_domain_fallback` 只对**裸名**生效（不校验目录）；`pool.cross_domain_model_fallback` 连**显式前缀**也生效，但要求另一域目录里确有同名模型。两者都默认关闭，详见[同名模型跨域回退](#同名模型跨域回退)。
 
 **为什么需要斜杠**：Cherry Studio 2.x 用内置 provider registry 判断「模型是什么」（能力、上下文窗口、推理档位、是否出现在 Pi/DSH 智能体选择器里）。它的归一化只按 `/` 取 ID 最后一段——`cn:glm-5.2` 匹配不到 registry 里的 `glm-5.2`，只能降级成「无元数据的自定义模型」；`cn/glm-5.2` 取末段后能精确命中。RikkaHub 等不查 registry 的客户端两种写法都能直接用。
 
@@ -1147,7 +1174,7 @@ http://127.0.0.1:7863/panel/
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET credit_trend`（`from` / `to`；走势采样点 + 实时 `current`）· `GET channel_health`（`from` / `to`；窗口总量 / 错误分类 / 时间桶 / 分域 / 当前降级状态 / 归档状态）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
@@ -1298,9 +1325,58 @@ wire_api = "responses"
 | `rid` / `out` / `try` / `credit` | 请求 ID / 结果（`success` / `http_error` 等）/ 尝试次数 / 扣减积分；仅带 `requestID` 的请求出现 |
 | `src` / `ua` | 来源 IP 与压缩后的客户端 UA 标签；`logging.request_client_info=true` 时出现 |
 
+**归档字段（JSONL，面板「反代劣化」看板的数据源）**：除上表的基础元数据外，每条事件还记 `realm`（实际服务域 cn/global）、`err_kind`（归一化失败分类：`channel_refused` / `content_blocked` / `model_blocked` / `soft_rate` / `model_busy` / `upstream_busy` / `waf_block` / `server` / `timeout` / `transport_error` / `no_healthy_account` / `stream_read_error` / `empty_stream` / `upstream_parse` / …）、`fallback`（本次是否跨域回退）、`degraded`（是否走了 Degraded 中性提示词）、`sys_as_user`（是否走过 system→user 搬移）。旧归档没有这些字段时，看板把它们归入「未分类」而不是丢弃。
+
 **敏感度**：流水日志不含任何 token 明文（详见[安全与合规](#安全与合规)）；stdout 流水不落盘，请求元数据按 `logging.request_archive_*` 归档 JSONL（不含提示词、响应正文、Authorization）。
 
 ## 部署运维
+
+### 发版（自动）
+
+**版本号就是发布开关**：把 `cmd/server/main.go` 里的 `appVersion` 改成新版本（如 `1.21.0-panel`）→ 推到 `main`，`.github/workflows/auto-release.yml` 自动完成：
+
+1. 从源码读出 `appVersion`，剥掉 `-panel` 得到 tag 名 `v1.21.0`；
+2. tag 不存在就建并推送（**已存在则跳过**，重复推送 / 补提交都安全）；
+3. 显式触发 `go-binaries`（测试 → 五平台二进制 → GitHub Release + `checksums.txt`）与 `docker-ghcr`（amd64/arm64 镜像）。
+
+> 为什么打完 tag 还要「显式触发」：用仓库 `GITHUB_TOKEN` 推的 tag **不会**再触发 `push` 事件（GitHub 防递归），两个发布工作流不会自己跑；`auto-release` 用 `gh workflow run --ref <tag>` 把它们按 tag 引用拉起，行为与手工推 tag 完全一致。
+
+手工等价流程（演练 / 补发 / 回滚版本）仍然可用，直接推 tag 即可，`push` 事件照常触发两个发布工作流：
+
+```bash
+git tag v1.21.0 && git push origin v1.21.0
+```
+
+发布纪律（CI 断言，不合规直接失败）：
+
+- tag `vX.Y.Z` 必须等于源码 `appVersion`（剥掉 `-panel` 后比对；`-ci` 演练 tag 豁免一致性断言）；
+- 二进制里必须能 `grep` 到 `appVersion`（防交叉编译矩阵编错树 / 漏 ldflags）；
+- 打包名不带 `-panel` 后缀：`wb2api-panel-v1.21.0-<os>-<arch>.tar.gz`。
+
+产物与去向：
+
+| 渠道 | 内容 |
+|---|---|
+| GitHub Release `vX.Y.Z` | `windows-amd64.zip` / `linux-amd64.tar.gz` / `linux-arm64.tar.gz` / `darwin-{amd64,arm64}.tar.gz` + `checksums.txt` |
+| GHCR `ghcr.io/renleihaokun/workbuddy2api-panel` | tag 发布 `X.Y.Z` / `X.Y` / `X` / `sha-xxxxxx`；`main` 推送另出 `latest` / `main` |
+
+**部署到服务器（单文件二进制）**：
+
+```bash
+# 1) 本机下载并校验 arm64 包
+gh release download v1.21.0 -p '*linux-arm64.tar.gz' -p checksums.txt
+sha256sum -c checksums.txt --ignore-missing && tar xzf wb2api-panel-v1.21.0-linux-arm64.tar.gz
+
+# 2) 传到服务器，跑现成的滚动更新脚本（备份 → 原子替换 → 重启 → 健康检查 → 失败自动回滚）
+scp wb2api haokun:~/workbuddy2api-panel/wb2api.new
+ssh haokun 'cd ~/workbuddy2api-panel && sha256sum wb2api.new'   # 记下 sha，下一步用
+ssh haokun 'cd ~/workbuddy2api-panel && sudo systemd-run --unit=wb2api-deploy --collect \
+  env EXPECT=<sha256> VER=1.21.0-panel ./deploy-wb2api.sh'
+```
+
+`deploy-wb2api.sh` 通过 `EXPECT`（二进制 sha256）与 `VER`（版本串）两个环境变量校验新包，缺省值保留上次发布的口径；脚本用 `systemd-run` 起，SSH 断线也会跑完，结果看 `deploy-last-status` 与 `deploy-<时间戳>.log`。
+
+> 全自动「发版即部署」需要把服务器 SSH 私钥存进仓库 Secrets（如 `DEPLOY_SSH_KEY`）再加一个 deploy job；这一步涉及生产机凭据，**未默认开启**，需要时再单独加。
 
 ### Docker 镜像
 
@@ -1545,6 +1621,14 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | disabled 账号透出 `disabled_reason` | `internal/pool/entry.go` `Status.DisabledReason` |
 | 硬冷却至次日 04:00 | `internal/pool/cooldown.go` `Pool.CooldownUntilTomorrow4AM` |
 | 软冷却退避封顶 2h | `internal/pool/entry.go` `defaultSoftRateMax` |
+| `pool.cross_domain_fallback` 默认 `false`（裸名回退） | `cmd/server/config.go` `Default()` / `Pool.CrossDomainFallback`；接线 `internal/server/handler.go` `chatCompletions` |
+| `pool.cross_domain_model_fallback` 默认 `false`（同名模型回退，含显式前缀） | `cmd/server/config.go` `Pool.CrossDomainModelFallback`；决策 `internal/server/handler.go`（`canSwitch` / `otherHasModel`） |
+| 每域模型名快照（1h TTL，Present/Absent/Unknown 三态） | `internal/upstream/catalog.go`（`CatalogModelState` / `storeCatalogNames`）；写入点 `FetchModels` / `fetchGlobalModelsOnce` |
+| 请求归档的 `realm` / `err_kind` / `fallback` / `degraded` / `sys_as_user` | `internal/reqlog/reqlog.go` `Event`；写入 `internal/server/logging.go` `requestTrace.event` |
+| 归档窗口聚合（小时/日桶、错误分类、分域） | `internal/reqlog/reqlog.go` `Recorder.Aggregate` |
+| 剩余积分走势采样（1 分钟去抖、30 分钟落盘节流、上限 1.2 万点、落盘 `credit-trend.json`） | `internal/creditline/creditline.go`（`Snapshot` / `Ledger.Add` / `Ledger.Flush`）；触发 `internal/scheduler/scheduler.go`（`SetCreditTrendHook`） |
+| 面板「反代劣化」/「积分走势」接口 | `internal/panel/degrade.go` `channelHealth`、`internal/panel/credittrend.go` `creditTrend`；路由 `internal/panel/panel.go` `routes` |
+| 提示词降级状态 / 已学习指纹条数对外只读出口 | `internal/server/degrade.go` `DegradeState`、`internal/server/systemmode.go` `systemModeGate.Len` |
 | Top-5 候选短名单 | `internal/pool/pick.go` `Pool.pick` |
 | `activity_hours` 默认 `[10]` | `cmd/server/config.go` `Default()` |
 | `growth_hours` 默认 `[1]` 与成长队列 | `cmd/server/config.go` `Default()`；`internal/scheduler/scheduler.go` `taskGrowth` |

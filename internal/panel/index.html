@@ -962,6 +962,9 @@ body[data-view="config"] #toasts { bottom: 84px; }
     gap: 10px; padding: 16px var(--pad-x) 4px;
   }
   .kpis.k4 { grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); }
+  /* k6：六张卡在常见桌面宽度下排成 3×2（minmax 240 时 950px 内容区正好 3 列），
+     避免 auto-fit 排成 5+1 留下一个孤零零的卡片。 */
+  .kpis.k6 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
   /* 首屏骨架：KPI 网格在数据到达前是空的，给一条微光占位条，
      比"整块空白"更像"正在加载"。数据一到就自然消失（:empty 不再匹配）。 */
   .kpis:empty::after {
@@ -970,7 +973,7 @@ body[data-view="config"] #toasts { bottom: 84px; }
     background-size: 400% 100%; animation: sk 1.5s ease-in-out infinite;
   }
   @keyframes sk { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
-  @media (max-width: 700px) { .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 700px) { .kpis, .kpis.k4, .kpis.k6 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   /* 外观继承上方共享的 .stat/.kpi 规格，这里只保留入场动画 */
   .kpi {
     /* 六张卡依次浮起（每张 +35ms）：比整块一起出现更有"数据在落位"的感觉，
@@ -1065,6 +1068,29 @@ body[data-view="config"] #toasts { bottom: 84px; }
   .uschart-body rect.usbar { transition: opacity .12s; }
   .uschart-body rect.usbar:hover { opacity: .82; }
   .uschart-body .us-empty { padding: 30px 0; text-align: center; color: var(--ink-3); font-size: var(--fs-ctl); }
+
+  /* 积分走势折线：三条线共用一套坐标；面积填充只给合计，三条都填会糊成色块 */
+  .uschart-body polyline.ctl { fill: none; stroke-linejoin: round; stroke-linecap: round; }
+  .uschart-body polyline.ctl-total { stroke: var(--accent); stroke-width: 2.2; }
+  .uschart-body polyline.ctl-cn { stroke: var(--chart-2); stroke-width: 1.6; opacity: .9; }
+  .uschart-body polyline.ctl-gl { stroke: var(--chart-3); stroke-width: 1.6; opacity: .9; }
+  .uschart-body path.ctarea { fill: var(--accent); opacity: .10; }
+  .uschart-body circle.ctdot { fill: var(--surface); stroke: var(--accent); stroke-width: 1.4; }
+  .uschart-hd .sw-total { background: var(--accent); }
+  .uschart-hd .sw-cn { background: var(--chart-2); }
+  .uschart-hd .sw-gl { background: var(--chart-3); }
+  /* 反代劣化 100% 堆叠柱：交互与 usbar 同款，类名分开便于分别断言 */
+  .uschart-body rect.dbar { transition: opacity .12s; }
+  .uschart-body rect.dbar:hover { opacity: .82; }
+  /* 降级状态条：一排只读 chip（不是筛选按钮，故不复用 .chips 的按钮规格） */
+  .dginfo { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 12px; }
+  .dchip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+    border: 1px solid var(--line-soft); border-radius: var(--r-pill);
+    background: var(--surface-2); color: var(--ink-2); font-size: var(--fs-label); }
+  .dchip b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .dchip.ok { border-color: var(--ok); color: var(--ok); }
+  .dchip.warn { border-color: var(--warn); color: var(--warn); }
+  .dchip.bad { border-color: var(--bad); color: var(--bad); }
 
   /* 用量表内的 prompt/completion 占比条。用 .us-mix 而不是复用账号池的 .bar：
      全局 .bar 是块级容器（积分条），同优先级下会互相覆盖（v1.9.0 回归）。 */
@@ -1330,6 +1356,9 @@ button.ghost.danger:hover:not(:disabled) {
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
+      <li><a href="#channel" data-view="channel">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.8 3.2h12.4"/><path d="M2.4 12.4l3-4.4 2.6 2.3 3-4.9 2.6 3.4"/><path d="M2.4 14.2h11.2"/></svg>
+        反代劣化</a></li>
       <li class="nav-sec" aria-hidden="true">运行</li>
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
@@ -1540,6 +1569,31 @@ button.ghost.danger:hover:not(:disabled) {
 
     <!-- 积分构成 -->
     <section class="view" id="view-packages" hidden>
+      <!-- 剩余积分走势：全池合计 + 分域。数据来自余额后台刷新/签到结束时的采样
+           （credit-trend.json），本卡不打上游；空态会说明采样依赖哪个开关。 -->
+      <div class="box" id="ctBox">
+        <header>
+          <h3>剩余积分走势<span class="hint" title="余额后台刷新（或签到）结束时采样一次：全池合计 + cn/global 分域；企业版不限量账号不计入合计。">全池合计 · 分域 · 余额刷新时采样</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="ctNote">—</span>
+          <span class="trange" id="ctRange"></span>
+          <button class="xs" id="btnCt">刷新</button>
+        </header>
+        <div class="pad">
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">剩余积分</span>
+              <span class="note" id="ctChartNote">—</span>
+              <span class="grow"></span>
+              <span class="legend">
+                <i class="sw sw-total"></i>合计<i class="sw sw-cn"></i>CN<i class="sw sw-gl"></i>Global
+              </span>
+            </div>
+            <div id="ctChart" class="uschart-body"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>积分到期分布</h3>
@@ -1670,6 +1724,66 @@ button.ghost.danger:hover:not(:disabled) {
           <table class="acc zebra">
             <thead id="usCreditHead"></thead>
             <tbody id="usCreditBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 反代劣化：上游对反代通道的识别与拦截随时间的劣化趋势 -->
+    <section class="view" id="view-channel" hidden>
+      <div class="box">
+        <header>
+          <h3>反代通道健康<span class="hint" title="上游把非官方客户端判成风险时的表现：11-128 通道校验、内容审核、模型下线、限流、WAF、超时。数据来自请求归档（只含脱敏元数据，不含提示词/凭证）。">上游识别 / 拦截趋势</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="dgNote">—</span>
+          <span class="trange" id="dgRange"></span>
+          <button class="xs" id="btnDg">刷新</button>
+        </header>
+        <div class="kpis k6" id="dgStats"></div>
+        <div class="pad">
+          <div class="dginfo" id="dgState"></div>
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">结果构成（100% 堆叠）</span>
+              <span class="note" id="dgChartNote">—</span>
+              <span class="grow"></span>
+              <span class="legend" id="dgLegend"></span>
+            </div>
+            <div id="dgChart" class="uschart-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>错误分类</h3>
+          <span class="grow"></span>
+          <span class="note" id="dgKindNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead><tr>
+              <th>类型</th><th class="num">次数</th><th class="num">占请求</th><th>最近一次</th>
+            </tr></thead>
+            <tbody id="dgKindBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>分域对比</h3>
+          <span class="grow"></span>
+          <span class="note">成功 = 上游读完且无 error 帧；「跨域回退」含裸名与同名模型两种回退</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead><tr>
+              <th>域</th><th class="num">请求</th><th class="num">成功</th><th class="num">失败</th>
+              <th class="num">成功率</th><th class="num">平均耗时</th><th class="num">平均 TTFB</th>
+              <th class="num">跨域回退</th>
+            </tr></thead>
+            <tbody id="dgRealmBody"></tbody>
           </table>
         </div>
       </div>
@@ -1838,6 +1952,11 @@ button.ghost.danger:hover:not(:disabled) {
             </div>
             <label class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></label>
+            <label class="switch"><span class="lb">裸模型名跨域回退（旧，不校验目录）</span>
+              <input type="checkbox" name="cross_domain_fallback"></label>
+            <label class="switch"><span class="lb">同名模型跨域回退（含显式前缀）</span>
+              <input type="checkbox" name="cross_domain_model_fallback"></label>
+            <div class="hint">两个跨域开关互相独立：旧的只对裸模型名生效；新的对显式 <code>cn:</code> / <code>global:</code> 前缀也生效，但要求另一域目录里确有同名模型（目录未探测到时不猜）。同开时裸名沿用旧开关的宽松语义。</div>
           </div>
         </div>
 

@@ -77,6 +77,22 @@ func (g *systemModeGate) Remember(key string) {
 	}
 }
 
+// Len 返回学习表当前有效条目数（面板「反代劣化」看板用）：顺手清掉过期条目，
+// 避免把「已经该重新先原样、撞了再伪装」的旧键算成已学习。
+func (g *systemModeGate) Len() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for k, at := range g.m {
+		if time.Since(at) > systemModeTTL {
+			delete(g.m, k)
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // systemModeKey 把一段 system 原文派生为稳定短键；空文本返回 ""（不学习）。
 //
 // 复用 session.RequestIDForKey（sha256 + 进程盐，恒 32 hex）：纯派生、无缓存、

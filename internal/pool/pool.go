@@ -65,6 +65,11 @@ type Pool struct {
 	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
 	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
 	crossDomainFallback bool
+	// crossDomainModelFallback 同名模型跨域回退开关（默认 false = 零回归）。
+	// 与 crossDomainFallback 的区别：**显式 cn:/global: 前缀同样参与**，但要求另一域
+	// 目录里确有同名模型（目录由 handler 侧的 ModelCatalog 回调判定）。触发条件是
+	// 「本域对该模型整池不可服务」或「本域目录明确没有该模型」，且另一域可服务。
+	crossDomainModelFallback bool
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -221,6 +226,21 @@ func (p *Pool) CrossDomainFallback() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.crossDomainFallback
+}
+
+// SetCrossDomainModelFallback 注入同名模型跨域回退开关（false = 零回归）。
+// 与其它 pool.* 参数一致：面板保存配置后经同一条热应用路径立即生效。
+func (p *Pool) SetCrossDomainModelFallback(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.crossDomainModelFallback = enabled
+}
+
+// CrossDomainModelFallback 报告同名模型跨域回退开关当前状态（选号侧只读，热改安全）。
+func (p *Pool) CrossDomainModelFallback() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.crossDomainModelFallback
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

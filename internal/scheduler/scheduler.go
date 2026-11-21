@@ -67,6 +67,11 @@ type Config struct {
 	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
 	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
 	TaskSweepHook func()
+
+	// CreditTrendHook 积分走势采样回调（main 注入：读池快照 → creditline.Add）。
+	// 每轮余额刷新与每轮签到结束后各调一次——这两条路径都会把权威余额写回池，
+	// 采样点因此总是「刚刷新过的那份余额」。与 GrowthHook 同款延迟挂载；nil 时跳过。
+	CreditTrendHook func()
 }
 
 // Scheduler 调度器。
@@ -545,6 +550,9 @@ func (s *Scheduler) runCheckin() {
 		})
 	}
 	s.RunStreakBonusNow()
+	// 签到也刷新了全部账号的余额（上面循环里的 UserResourceSnapshot）→ 同样落一个
+	// 走势采样点。放在 streak 之后：连登兑换/抽奖可能刚发了积分，采样越晚越接近真实。
+	s.noteCreditTrend()
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -776,6 +784,8 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			})
 		})
 		s.lastBalanceRefresh.Store(time.Now().UnixNano())
+		// 余额走势采样：这一轮刚把权威余额写回池，是最有意义的采样时点。
+		s.noteCreditTrend()
 	})
 }
 
@@ -888,6 +898,24 @@ func (s *Scheduler) SetTaskSweepHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.TaskSweepHook = fn
 	s.schedMu.Unlock()
+}
+
+// SetCreditTrendHook 挂载/替换积分走势采样回调（main 装配期注入：读池快照后落点）。
+// 与 SetTaskSweepHook 同款延迟接线；未挂载时采样点零开销跳过。
+func (s *Scheduler) SetCreditTrendHook(fn func()) {
+	s.schedMu.Lock()
+	s.cfg.CreditTrendHook = fn
+	s.schedMu.Unlock()
+}
+
+// noteCreditTrend 触发一次积分走势采样（hook 未挂载时零开销）。
+func (s *Scheduler) noteCreditTrend() {
+	s.schedMu.Lock()
+	hook := s.cfg.CreditTrendHook
+	s.schedMu.Unlock()
+	if hook != nil {
+		hook()
+	}
 }
 
 // SetTaskSweepInterval 热改任务补领清扫间隔；<=0 表示暂停循环（面板关闭该开关时）。

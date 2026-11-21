@@ -530,7 +530,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', channel: '反代劣化', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -546,7 +546,8 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
-  if (v === 'packages') loadPackages();
+  if (v === 'packages') { loadPackages(); loadCreditTrend(); }
+  if (v === 'channel') loadChannelHealth();
   // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
@@ -1405,6 +1406,9 @@ function requestLogText(e) {
     fmtTok(token) + ' tok',
     credit,
     cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens) === '—' ? '' : '命中 ' + cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens),
+    // 服务域 / 跨域回退：只有归档里存在该字段时才追加（旧归档与既有断言输出不变）。
+    e && e.realm ? '域 ' + e.realm : '',
+    e && e.fallback ? '跨域回退' : '',
     e && e.request_id || '—',
   ].filter(Boolean).join(' | ');
 }
@@ -1451,6 +1455,8 @@ const CFG_MAP = {
   cost_explore_interval: ['pool', 'cost_explore_interval'],
   credit_floor: ['pool', 'credit_floor'],
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
+  cross_domain_fallback: ['pool', 'cross_domain_fallback'],
+  cross_domain_model_fallback: ['pool', 'cross_domain_model_fallback'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
@@ -3893,7 +3899,7 @@ async function loadExpiry(force) {
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
 // 「刷新」始终实时查（显式 force，不依赖事件对象真值）
-if ($('btnPk')) $('btnPk').onclick = () => loadPackages(true);
+if ($('btnPk')) $('btnPk').onclick = () => { loadPackages(true); loadCreditTrend(); };
 
 /* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════
    键取 uid 前 8 位——与 renderUsageDim 账号维度的 key 和积分扣除表的 uid 前缀同源，
@@ -3990,3 +3996,376 @@ if ($('btnExpFold')) {
   };
 }
 applyExpFold();
+
+/* ══ 反代劣化看板 ═══════════════════════════════════════════════════════
+   上游对反代通道的识别与拦截（11-128 通道校验 / 内容拦截 / 11102 模型下线 /
+   限流 / WAF / 超时）是**随时间劣化**的：只看当前成功率回答不了「是不是越来越差」。
+   这里把请求归档按时间桶摊开，用 100% 堆叠柱看构成变化，配错误分类表与分域对比。
+   数据全部来自 /panel/api/channel_health（后端流式聚合归档，不触发上游调用）。 */
+
+let channelData = null;
+
+/* DG_SERIES 结果构成的系列定义：kinds 命中的失败分类合并成一段；kinds=null 表示
+   「其余失败」= 总请求 − 成功 − 已列分类（后端不预先分组，前端只负责排版与配色）。 */
+const DG_SERIES = [
+  { key: 'success', label: '成功', color: 'var(--ok)' },
+  { key: 'channel_refused', label: '通道拒绝', color: 'var(--bad)', kinds: ['channel_refused'] },
+  { key: 'content_blocked', label: '内容拦截', color: 'var(--warn)', kinds: ['content_blocked'] },
+  { key: 'model_blocked', label: '模型不可用', color: 'var(--chart-6)', kinds: ['model_blocked'] },
+  { key: 'throttled', label: '限流·拥塞', color: 'var(--chart-4)',
+    kinds: ['soft_rate', 'hard_credit', 'model_busy', 'upstream_busy'] },
+  { key: 'other', label: '其他失败', color: 'var(--ink-3)', kinds: null },
+];
+
+/* dgSeriesCount 取某个桶里某系列的数量（other 走「剩余」口径）。 */
+function dgSeriesCount(b, s) {
+  const kinds = (b && b.kinds) || {};
+  if (s.key === 'success') return Number(b && b.success || 0);
+  if (s.kinds) {
+    let n = 0;
+    for (const k of s.kinds) n += Number(kinds[k] || 0);
+    return n;
+  }
+  let listed = 0;
+  for (const x of DG_SERIES) {
+    if (!x.kinds) continue;
+    for (const k of x.kinds) listed += Number(kinds[k] || 0);
+  }
+  return Math.max(0, Number(b && b.requests || 0) - Number(b && b.success || 0) - listed);
+}
+
+function dgPct(part, total) {
+  const t = Number(total || 0);
+  if (!t) return '—';
+  return (Number(part || 0) / t * 100).toFixed(1) + '%';
+}
+
+function dgRateChip(label, value, total, cls) {
+  const n = Number(value || 0);
+  return '<span class="dchip' + (n > 0 && cls ? ' ' + cls : '') + '">' + esc(label) +
+    ' <b>' + (total ? dgPct(n, total) : '—') + '</b></span>';
+}
+
+/* renderChannelHealth 画整个看板：KPI、降级状态条、堆叠图、分类表、分域表。 */
+function renderChannelHealth(d) {
+  channelData = d || {};
+  const t = channelData.totals || {};
+  const reqs = Number(t.requests || 0);
+  const kinds = channelData.kinds || [];
+  const kindCount = k => {
+    const hit = kinds.find(x => x.kind === k);
+    return hit ? Number(hit.count || 0) : 0;
+  };
+  const throttled = kindCount('soft_rate') + kindCount('hard_credit') +
+    kindCount('model_busy') + kindCount('upstream_busy');
+
+  $('dgStats').innerHTML =
+    usKpi(fmtTok(reqs), '请求数', 'c-accent',
+      reqs ? (Number(t.success || 0) + ' 次成功 · ' + (reqs - Number(t.success || 0)) + ' 次失败') : '窗口内无请求') +
+    usKpi(reqs ? Number(t.success_rate || 0).toFixed(1) + '%' : '—', '成功率', 'c-ok',
+      '成功 = 上游读完且无 error 帧') +
+    usKpi(dgPct(kindCount('channel_refused'), reqs), '通道拒绝', kindCount('channel_refused') ? 'c-warn' : 'c-mute',
+      '11-128：上游认为请求不是官方客户端') +
+    usKpi(dgPct(kindCount('content_blocked'), reqs), '内容拦截', kindCount('content_blocked') ? 'c-warn' : 'c-mute',
+      'blocked by security policy（含指纹误报）') +
+    usKpi(dgPct(kindCount('model_blocked'), reqs), '模型不可用', kindCount('model_blocked') ? 'c-warn' : 'c-mute',
+      '11102 / 该模型整池冷却') +
+    usKpi(dgPct(throttled, reqs), '限流·拥塞', throttled ? 'c-warn' : 'c-mute',
+      '6004 / 14003 / 6021 / 402');
+
+  // 降级状态条：提示词模式、是否在降级期、已学习指纹、跨域回退。
+  const deg = channelData.degrade || {};
+  let state = '';
+  if (deg.available) {
+    state += '<span class="dchip">提示词模式 <b>' + esc(deg.mode || '—') + '</b></span>';
+    state += deg.active
+      ? '<span class="dchip warn">提示词降级中 <b>至 ' + esc(fmtStampShort(deg.until)) + '</b></span>'
+      : '<span class="dchip ok">提示词降级 <b>未触发</b></span>';
+    state += '<span class="dchip">已学习指纹 <b>' + Number(deg.learned || 0) + ' 条</b></span>';
+  } else {
+    state += '<span class="dchip">降级状态 <b>不可用</b></span>';
+  }
+  state += '<span class="dchip">跨域回退 <b>' + Number(t.fallbacks || 0) + ' 次</b></span>';
+  state += '<span class="dchip">降级提示词请求 <b>' + Number(t.degraded || 0) + ' 次</b></span>';
+  $('dgState').innerHTML = state;
+
+  // 口径说明：窗口 + 桶粒度 + 归档状态。
+  const win = channelData.window_from
+    ? String(channelData.window_from).replace('T', ' ').slice(0, 16) +
+      (channelData.window_to ? ' → ' + String(channelData.window_to).replace('T', ' ').slice(0, 16) : '')
+    : trangeLabel('dgRange');
+  const arc = channelData.archive || {};
+  $('dgNote').textContent = win + ' · ' + (channelData.bucket === 'day' ? '按日' : '按小时') +
+    (arc.enabled ? ' · 归档 ' + (arc.files || 0) + ' 个文件' : ' · 归档已关闭');
+  $('dgNote').title = $('dgNote').textContent;
+
+  // 图例：色块 + 名称。
+  $('dgLegend').innerHTML = DG_SERIES.map(s =>
+    '<i class="sw" style="background:' + s.color + '"></i>' + esc(s.label)).join('');
+  $('dgChartNote').textContent = (channelData.bucket === 'day' ? '按日' : '按小时') +
+    ' · ' + (channelData.buckets || []).length + ' 个桶';
+
+  renderChannelChart(channelData.buckets || []);
+
+  // 错误分类表。
+  if (!kinds.length) {
+    $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">' +
+      (reqs ? '窗口内没有失败请求。' : '该时间窗内没有请求记录。') + '</div></td></tr>';
+    $('dgKindNote').textContent = '—';
+  } else {
+    $('dgKindBody').innerHTML = kinds.map(k =>
+      '<tr><td>' + esc(k.label || k.kind) + '</td>' +
+      '<td class="num">' + fmtTok(k.count) + '</td>' +
+      '<td class="num">' + esc(dgPct(k.count, reqs)) + '</td>' +
+      '<td>' + esc(fmtStampShort(k.last_at)) + '</td></tr>').join('');
+    $('dgKindNote').textContent = kinds.length + ' 类失败 · 按次数降序';
+  }
+
+  // 分域对比表。
+  const realms = channelData.realms || {};
+  const rows = ['cn', 'global', 'unknown'].filter(r => realms[r]).map(r => {
+    const a = realms[r] || {};
+    const n = Number(a.requests || 0);
+    const failed = n - Number(a.success || 0);
+    return '<tr><td>' + esc(r === 'unknown' ? '未标注' : r) + '</td>' +
+      '<td class="num">' + fmtTok(n) + '</td>' +
+      '<td class="num">' + fmtTok(a.success) + '</td>' +
+      '<td class="num">' + fmtTok(failed) + '</td>' +
+      '<td class="num">' + (n ? Number(a.success_rate || 0).toFixed(1) + '%' : '—') + '</td>' +
+      '<td class="num">' + fmtMs(a.avg_duration_ms) + '</td>' +
+      '<td class="num">' + fmtMs(a.avg_ttfb_ms) + '</td>' +
+      '<td class="num">' + fmtTok(a.fallbacks) + '</td></tr>';
+  });
+  $('dgRealmBody').innerHTML = rows.length ? rows.join('') :
+    '<tr><td colspan="8"><div class="empty inline">该时间窗内没有请求记录。</div></td></tr>';
+}
+
+/* renderChannelChart 画 100% 堆叠柱：每根柱子按该桶请求数归一化，看的是「构成」，
+   绝对量在 KPI 与表格里（100% 图看趋势更直观，不会被流量高峰压扁）。 */
+function renderChannelChart(buckets) {
+  const host = $('dgChart');
+  if (!host) return;
+  const pts = [];
+  for (const b of buckets || []) {
+    const t = parsePointTime({ t: b.t, scope: b.scope });
+    if (t === null) continue;
+    pts.push({ t, raw: b.t, scope: b.scope, b });
+  }
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">该时间窗内没有请求记录。</div>';
+    return;
+  }
+  // 窄屏用 440 宽的 viewBox：1200 缩到 330px 宽时刻度只剩 ~3px（手机端 mobile.css
+  // 把 .tk 提到 13px，配 440 宽约 10px 有效字号，与用量图的手机版同口径）。
+  const narrow = typeof matchMedia === 'function' && matchMedia('(max-width: 760px)').matches;
+  const W = narrow ? 440 : 1200, H = narrow ? 230 : 220, PL = narrow ? 46 : 52, PR = narrow ? 10 : 14, PT = 16, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const t0 = pts[0].t, span = Math.max(1, pts[pts.length - 1].t - t0);
+
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const slot = iw * (minGap / span);
+  const bw = Math.max(2, Math.min(narrow ? 16 : 30, slot * 0.7));
+  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
+  // y 轴 0/25/50/75/100%
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + (i * 25) + '%</text>';
+  }
+  for (const p of pts) {
+    const total = Number(p.b.requests || 0);
+    const x = xOf(p.t) - bw / 2;
+    out += '<g><title>' + esc(p.raw) + '  ' + total + ' 次请求 · 成功 ' +
+           Number(p.b.success || 0) + ' / 失败 ' + (total - Number(p.b.success || 0)) +
+           '</title>';
+    if (total > 0) {
+      let acc = 0; // 已堆叠的百分比（从顶往下画）
+      for (const s of DG_SERIES) {
+        const n = dgSeriesCount(p.b, s);
+        if (n <= 0) continue;
+        const h = ih * (n / total);
+        const y = yBase - ih * ((acc + n) / total);
+        out += '<rect class="dbar" x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
+               '" width="' + bw.toFixed(2) + '" height="' + Math.max(1, h).toFixed(2) +
+               '" fill="' + s.color + '"/>';
+        acc += n;
+      }
+    }
+    out += '</g>';
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
+         '" y2="' + yBase + '"/>';
+  // x 轴刻度：等距目标取最近的真实柱子（与用量图同口径）；窄屏只放 4 个。
+  const TICKS = Math.min(narrow ? 4 : 6, pts.length);
+  const used = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const dd = Math.abs(pts[i].t - target);
+      if (dd < best) { best = dd; bi = i; }
+    }
+    if (used.has(bi)) continue;
+    used.add(bi);
+    const p = pts[bi];
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' +
+           esc(fmtTokTimeLabel(p)) + '</text>';
+  }
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
+async function loadChannelHealth() {
+  const q = trangeQuery('dgRange', false);
+  try {
+    const d = await api('channel_health?' + q.toString());
+    renderChannelHealth(d);
+  } catch (e) {
+    channelData = null;
+    $('dgStats').innerHTML = '';
+    $('dgState').innerHTML = '';
+    $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">读取失败</div></td></tr>';
+    $('dgRealmBody').innerHTML = '<tr><td colspan="8"><div class="empty inline">读取失败</div></td></tr>';
+    $('dgChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
+    $('dgNote').textContent = '读取失败';
+    $('dgChartNote').textContent = '—';
+    $('dgKindNote').textContent = '—';
+    $('dgLegend').innerHTML = '';
+  }
+}
+if ($('btnDg')) $('btnDg').onclick = loadChannelHealth;
+if ($('dgRange')) trangeBind('dgRange', loadChannelHealth, '168');
+
+/* ══ 剩余积分走势（积分构成页顶部）═══════════════════════════════════════
+   采样点是「余额后台刷新 / 签到结束时」落的（后端 creditline），所以这张图不需要
+   打上游；采样依赖 schedule.balance_refresh_enabled，关掉后不再产生新点，
+   空态会如实说明。 */
+
+let creditTrendData = null;
+
+/* renderCreditTrend 画三条折线（合计 / CN / Global）。
+   x 轴用真实时间轴（采样点不等距，等距排布会把停机断档画成一段正常曲线）；
+   y 轴从 0 起——积分为负没有意义，从 0 起才能直观看出「还剩多少」。 */
+function renderCreditTrend(d) {
+  const host = $('ctChart');
+  if (!host) return;
+  creditTrendData = d || {};
+  const pts = [];
+  for (const p of (d && d.points) || []) {
+    const t = parsePointTime({ t: p.t, scope: p.scope });
+    if (t === null) continue;
+    pts.push({ t, raw: p.t, scope: p.scope,
+               total: Number(p.total || 0), cn: Number(p.cn || 0), gl: Number(p.global || 0) });
+  }
+  const cur = (d && d.current) || {};
+  const curTxt = Number(cur.accounts || 0) > 0
+    ? '当前合计 ' + fmtTok(cur.total) +
+      '（CN ' + fmtTok(cur.cn) + ' · Global ' + fmtTok(cur.global) + '）' +
+      (Number(cur.unlimited || 0) > 0 ? ' · 另有 ' + cur.unlimited + ' 个不限量账号未计入' : '')
+    : '当前池内无账号（历史曲线仍保留）';
+  $('ctNote').textContent = curTxt;
+  $('ctNote').title = curTxt;
+  if (!pts.length) {
+    // 空态说清「为什么没有点」：采样依赖余额后台刷新，关掉后只在签到时落点。
+    const on = d && d.refresh_enabled;
+    const every = Number((d && d.refresh_sec) || 0);
+    host.innerHTML = '<div class="us-empty">' + (on
+      ? '还没有采样点：余额后台刷新（每 ' + Math.max(1, Math.round(every / 60)) +
+        ' 分钟）或签到结束后会自动记录，稍后刷新即可。'
+      : '还没有采样点：余额后台刷新已关闭（schedule.balance_refresh_enabled=false），' +
+        '只在签到时采样；开启后约一个刷新周期即可看到曲线。') + '</div>';
+    $('ctChartNote').textContent = '—';
+    return;
+  }
+  // 窄屏同口径：440 宽 viewBox（刻度 4 个），桌面 1200（刻度 6 个）。
+  const narrow = typeof matchMedia === 'function' && matchMedia('(max-width: 760px)').matches;
+  const W = narrow ? 440 : 1200, H = narrow ? 230 : 220, PL = narrow ? 48 : 58, PR = narrow ? 10 : 14, PT = 16, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+  const max = Math.max(1, ...pts.map(p => Math.max(p.total, p.cn, p.gl)));
+  const xOf = t => pts.length === 1 ? PL + iw / 2 : PL + (t - t0) / span * iw;
+  const yOf = v => yBase - ih * (v / max);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
+  for (let i = 0; i <= 4; i++) {
+    const y = yBase - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+  }
+  // 合计的面积填充先画（在折线之下，不遮线）。
+  if (pts.length > 1) {
+    let area = 'M' + xOf(pts[0].t).toFixed(1) + ',' + yBase.toFixed(1);
+    for (const p of pts) area += ' L' + xOf(p.t).toFixed(1) + ',' + yOf(p.total).toFixed(1);
+    area += ' L' + xOf(pts[pts.length - 1].t).toFixed(1) + ',' + yBase.toFixed(1) + ' Z';
+    out += '<path class="ctarea" d="' + area + '"/>';
+  }
+  const line = (key, cls) => {
+    if (pts.length < 2) return '';
+    const dstr = pts.map(p => xOf(p.t).toFixed(1) + ',' + yOf(p[key]).toFixed(1)).join(' ');
+    return '<polyline class="ctl ' + cls + '" points="' + dstr + '"/>';
+  };
+  out += line('cn', 'ctl-cn') + line('gl', 'ctl-gl') + line('total', 'ctl-total');
+  // 采样点 ≤ 60 时画点并给 tooltip（点多时圆点会糊成一条粗线）。
+  if (pts.length <= 60) {
+    for (const p of pts) {
+      out += '<g><title>' + esc(p.raw) + '  合计 ' + fmtTok(p.total) +
+             ' · CN ' + fmtTok(p.cn) + ' · Global ' + fmtTok(p.gl) + '</title>' +
+             '<circle class="ctdot" cx="' + xOf(p.t).toFixed(1) + '" cy="' + yOf(p.total).toFixed(1) +
+             '" r="2.6"/></g>';
+    }
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
+         '" y2="' + yBase + '"/>';
+  // x 轴刻度：首尾 + 中间，取最近的真实采样点；窄屏只放 4 个。
+  const TICKS = Math.min(narrow ? 4 : 6, pts.length);
+  const used = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const dd = Math.abs(pts[i].t - target);
+      if (dd < best) { best = dd; bi = i; }
+    }
+    if (used.has(bi)) continue;
+    used.add(bi);
+    const p = pts[bi];
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' +
+           esc(fmtTokTimeLabel(p)) + '</text>';
+  }
+  out += '</svg>';
+  host.innerHTML = out;
+  $('ctChartNote').textContent = pts.length + ' 个采样点 · ' +
+    (d.bucket === 'day' ? '按日' : '按小时') + ' · 最近 ' +
+    (d.last_sample_at ? fmtStampShort(d.last_sample_at) : '—');
+}
+
+async function loadCreditTrend() {
+  const q = trangeQuery('ctRange', false);
+  try {
+    const d = await api('credit_trend?' + q.toString());
+    renderCreditTrend(d);
+  } catch (e) {
+    creditTrendData = null;
+    $('ctChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
+    $('ctChartNote').textContent = '—';
+    $('ctNote').textContent = '读取失败';
+  }
+}
+if ($('btnCt')) $('btnCt').onclick = loadCreditTrend;
+if ($('ctRange')) trangeBind('ctRange', loadCreditTrend, '168');
+

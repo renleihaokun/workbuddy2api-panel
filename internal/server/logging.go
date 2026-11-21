@@ -71,6 +71,16 @@ type chatStat struct {
 	clientIP  string
 	userAgent string
 
+	// realm 实际服务域（cn/global；一个号都没选到时为请求声明的域）。
+	// fallback 本次是否发生了跨域回退；errKind 归一化失败分类（成功为空）。
+	// 三者只进 reqlog 归档（面板「反代劣化」看板的数据源），不改变 stdout 行格式。
+	realm    string
+	fallback bool
+	errKind  string
+	// degraded 本次走了 Degraded 中性提示词；sysAsUser 本次走过 system→user 搬移。
+	degraded  bool
+	sysAsUser bool
+
 	logged bool
 }
 
@@ -81,6 +91,26 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 		mode = "stream"
 	}
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+}
+
+// fail 记录本次请求的归一化失败分类（面板「反代劣化」看板按它分桶）。
+//
+// 语义是「最后一次失败归因」：轮转中先软限流、后 5xx 时归档记 5xx（末端透传给
+// 客户端的那一类），因此后到的分类覆盖先前的。成功路径负责把它清空
+// （succeed），否则「先失败一次、换号后成功」的请求会被看板算成失败。
+func (s *chatStat) fail(kind string) {
+	if s == nil || kind == "" {
+		return
+	}
+	s.errKind = kind
+}
+
+// succeed 清空失败分类：本次请求最终成功（换号后成功也走这里）。
+func (s *chatStat) succeed() {
+	if s == nil {
+		return
+	}
+	s.errKind = ""
 }
 
 // done 幂等落一行表格日志。
@@ -477,6 +507,13 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		// 反代劣化看板维度（面板 /panel/api/channel_health 按它们分桶）：
+		// 实际服务域 / 归一化失败分类 / 跨域回退 / 提示词降级 / system→user。
+		e.Realm = s.realm
+		e.ErrKind = s.errKind
+		e.Fallback = s.fallback
+		e.Degraded = s.degraded
+		e.SysAsUser = s.sysAsUser
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent

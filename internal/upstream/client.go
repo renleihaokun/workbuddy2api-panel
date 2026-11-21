@@ -875,6 +875,10 @@ type Client struct {
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
+	// catalog 每域最近一次成功探测的模型名快照（见 catalog.go）：同名模型跨域
+	// 回退用它回答「另一域到底有没有这个模型」，只读、不触发上游探测。
+	catalog realmCatalog
+
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
@@ -1607,6 +1611,13 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	c.storeModelRates(a.Realm(), out)
+	// 名字快照（catalog.go）：同名模型跨域回退的目录判据。与倍率表分开存——
+	// 倍率表只收「有可解析倍率」的模型，不能当目录用。
+	ids := make([]string, 0, len(out))
+	for _, mi := range out {
+		ids = append(ids, mi.ID)
+	}
+	c.storeCatalogNames(a.Realm(), ids)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache := make(map[string][]string, len(out))

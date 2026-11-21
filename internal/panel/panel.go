@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -69,6 +70,9 @@ type Config struct {
 	// CreditHistory 积分变动账本（nil = 积分历史接口返回 501）。只读展示：
 	// 留痕由余额查询路径（upstream.Client 的余额观察者）写入。
 	CreditHistory *credithist.Ledger
+	// CreditTrend 剩余积分走势采样账本（nil = credit_trend 接口返回 501）。
+	// 采样由 scheduler 的余额刷新/签到结束回调写入（见 main 的接线），面板只读。
+	CreditTrend *creditline.Ledger
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -110,6 +114,42 @@ type Panel struct {
 	// sweepRun 任务补领清扫单飞：上一轮未结束时（上游慢/账号多）跳过本轮，
 	// 避免 15 分钟 ticker 与手动入口叠加出两批并发清扫。
 	sweepRun sync.Mutex
+
+	// degradeMu/degradeState 反代劣化看板的进程内状态源（server.Handler 的
+	// degradeGate / systemModeGate 快照）。handler 在 panel 之后构造，故用
+	// SetDegradeState 事后接线；未接线时看板显示「状态不可用」而不是编造。
+	degradeMu    sync.RWMutex
+	degradeState func() DegradeState
+}
+
+// DegradeState 反代通道劣化的当前状态（面板看板用；与请求路径同一口径）。
+type DegradeState struct {
+	// Active 是否处于提示词降级期（内容拦截误报触发的 Degraded 中性提示词）。
+	Active bool `json:"active"`
+	// Until 降级期截止（次日 00:00 CST）；未触发时为零值。
+	Until time.Time `json:"until,omitempty"`
+	// Learned 已学习「必须伪装成 user 角色」的 system 指纹条数。
+	Learned int `json:"learned"`
+	// Mode 当前系统提示词模式（passthrough / custom / append）。
+	Mode string `json:"mode"`
+}
+
+// SetDegradeState 挂载反代劣化状态回调（main 在 NewHandler 之后接线）。
+func (p *Panel) SetDegradeState(fn func() DegradeState) {
+	p.degradeMu.Lock()
+	p.degradeState = fn
+	p.degradeMu.Unlock()
+}
+
+// currentDegradeState 读当前状态快照；未接线 → ok=false。
+func (p *Panel) currentDegradeState() (DegradeState, bool) {
+	p.degradeMu.RLock()
+	fn := p.degradeState
+	p.degradeMu.RUnlock()
+	if fn == nil {
+		return DegradeState{}, false
+	}
+	return fn(), true
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -209,6 +249,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
+	p.mux.HandleFunc("GET /panel/api/credit_trend", p.withAuth(p.creditTrend))
+	p.mux.HandleFunc("GET /panel/api/channel_health", p.withAuth(p.channelHealth))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))

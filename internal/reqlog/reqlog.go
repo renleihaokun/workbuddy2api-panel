@@ -84,6 +84,20 @@ type Event struct {
 	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
 	ClientIP         string    `json:"client_ip,omitempty"`
 	UserAgent        string    `json:"user_agent,omitempty"`
+	// Realm 实际服务域（cn / global）。一个号都没选到的失败按请求声明的域记。
+	// 面板「反代劣化」看板据此按域切分成功率。
+	Realm string `json:"realm,omitempty"`
+	// ErrKind 归一化失败分类（成功为空）。取值 = 上游错误分类
+	// （channel_refused / content_blocked / model_blocked / soft_rate / model_busy /
+	// upstream_busy / waf_block / server / …），外加 3 个本地合成值：
+	// timeout（上游超时）、stream_read_error（流读取失败）、no_healthy_account（无号）。
+	ErrKind string `json:"err_kind,omitempty"`
+	// Fallback 本次请求发生了跨域回退（同名模型跨域回退 / 裸名跨域回退）。
+	Fallback bool `json:"fallback,omitempty"`
+	// Degraded 本次走了 Degraded 中性提示词（内容拦截降级期）。
+	Degraded bool `json:"degraded,omitempty"`
+	// SysAsUser 本次走过 system→user 角色搬移重试。
+	SysAsUser bool `json:"sys_as_user,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -648,3 +662,295 @@ func (w *archiveWriter) errString() string {
 	defer w.lastErrMu.Unlock()
 	return w.lastErr
 }
+
+// ---------------------------------------------------------------------------
+// 窗口聚合（面板「反代劣化」看板）
+// ---------------------------------------------------------------------------
+
+// AggTotals 一个窗口（或一个域）的汇总。字段口径与面板 KPI 卡一一对应。
+type AggTotals struct {
+	Requests   int64 `json:"requests"`
+	Success    int64 `json:"success"`
+	HTTPError  int64 `json:"http_error"`
+	StreamError int64 `json:"stream_error"`
+	Interrupted int64 `json:"interrupted"`
+	// Fallbacks 跨域回退命中次数；Degraded / SysAsUser 走降级提示词 / 角色搬移的次数。
+	Fallbacks int64   `json:"fallbacks"`
+	Degraded  int64   `json:"degraded"`
+	SysAsUser int64   `json:"sys_as_user"`
+	SuccessRate   float64 `json:"success_rate"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
+	AvgTTFBMs     float64 `json:"avg_ttfb_ms"`
+
+	durationSum int64
+	ttfbSum     int64
+	ttfbCount   int64
+}
+
+// add 累加一条事件（内部口径；finish 之前不对外）。
+func (a *AggTotals) add(e Event) {
+	a.Requests++
+	switch e.Outcome {
+	case OutcomeSuccess:
+		a.Success++
+	case OutcomeStreamError:
+		a.StreamError++
+	case OutcomeInterrupted:
+		a.Interrupted++
+	default:
+		a.HTTPError++
+	}
+	if e.Fallback {
+		a.Fallbacks++
+	}
+	if e.Degraded {
+		a.Degraded++
+	}
+	if e.SysAsUser {
+		a.SysAsUser++
+	}
+	if e.DurationMs > 0 {
+		a.durationSum += e.DurationMs
+	}
+	// TTFB 只在流式成功时有观测；非流式恒 0，不能把它算进均值（会把平均拉成 0）。
+	if e.TTFBMs > 0 {
+		a.ttfbSum += e.TTFBMs
+		a.ttfbCount++
+	}
+}
+
+// finish 收敛派生指标。
+func (a *AggTotals) finish() {
+	if a.Requests > 0 {
+		a.SuccessRate = round1(float64(a.Success) / float64(a.Requests) * 100)
+		a.AvgDurationMs = float64(a.durationSum) / float64(a.Requests)
+	}
+	if a.ttfbCount > 0 {
+		a.AvgTTFBMs = float64(a.ttfbSum) / float64(a.ttfbCount)
+	}
+}
+
+// AggBucket 一个时间桶。t 的格式与 usage 的时序点一致（hour: 2006-01-02T15，
+// day: 2006-01-02），前端可直接复用 parsePointTime / fmtTokTimeLabel。
+type AggBucket struct {
+	T           string           `json:"t"`
+	Scope       string           `json:"scope"`
+	Requests    int64            `json:"requests"`
+	Success     int64            `json:"success"`
+	HTTPError   int64            `json:"http_error"`
+	StreamError int64            `json:"stream_error"`
+	Interrupted int64            `json:"interrupted"`
+	Fallbacks   int64            `json:"fallbacks"`
+	Kinds       map[string]int64 `json:"kinds,omitempty"`
+}
+
+// KindCount 某失败分类在窗口内的次数与最近发生时间。
+type KindCount struct {
+	Kind   string    `json:"kind"`
+	Count  int64     `json:"count"`
+	LastAt time.Time `json:"last_at,omitempty"`
+}
+
+// Aggregate 窗口聚合结果。
+type Aggregate struct {
+	Bucket  string               `json:"bucket"` // "hour" / "day"
+	From    time.Time            `json:"from"`
+	To      time.Time            `json:"to"`
+	Totals  AggTotals            `json:"totals"`
+	Buckets []AggBucket          `json:"buckets"`
+	Kinds   []KindCount          `json:"kinds"`
+	Realms  map[string]AggTotals `json:"realms"`
+	Archive ArchiveStats         `json:"archive"`
+}
+
+// aggregateKindUnknown 旧归档没有 err_kind 字段（或失败分类缺失）时的兜底桶。
+const aggregateKindUnknown = "unknown"
+
+// Aggregate 扫描归档并按时间桶聚合（只读、内存有界：只保留桶与分类计数，
+// 不把事件整批读进内存）。
+//
+// 参数：from/to 为闭区间（零值 = 该侧不设界）；bucket<=0 按小时。
+// 归档未启用/无目录 → 返回空结果（Archive.Enabled=false），不报错——面板据此
+// 提示「归档已关闭」而不是显示一片 0。
+//
+// 与 ReadArchive 的取舍：后者为「最近 N 条」而生（全量读+排序+截断），窗口聚合
+// 要的是全窗口计数，因此这里流式扫描、边读边累加，不保留事件本体。
+func (r *Recorder) Aggregate(from, to time.Time, bucket time.Duration) (Aggregate, error) {
+	// 空切片而不是 nil：面板把 null 与「接口不可用」混在一起会显示成加载失败
+	// （与 ReadArchive 的空结果回 [] 同口径）。
+	agg := Aggregate{
+		From: from, To: to,
+		Buckets: []AggBucket{},
+		Kinds:   []KindCount{},
+		Realms:  map[string]AggTotals{},
+	}
+	scope, layout := aggregateScope(bucket)
+	agg.Bucket = scope
+	if r == nil || r.archive == nil {
+		return agg, nil
+	}
+	agg.Archive = r.archive.stats()
+	if !r.archive.enabled() {
+		return agg, nil
+	}
+	paths, err := archiveFiles(r.archive.cfg.Dir)
+	if err != nil {
+		return agg, err
+	}
+	buckets := map[string]*AggBucket{}
+	kinds := map[string]*KindCount{}
+	var total AggTotals
+	// firstSeen/lastSeen 用于「不设界」时回显真实数据区间（面板右上角的口径说明）。
+	var firstSeen, lastSeen time.Time
+	for _, path := range paths {
+		if err := scanFile(path, from, to, func(e Event) {
+			if firstSeen.IsZero() || e.Time.Before(firstSeen) {
+				firstSeen = e.Time
+			}
+			if e.Time.After(lastSeen) {
+				lastSeen = e.Time
+			}
+			total.add(e)
+			realm := e.Realm
+			if realm == "" {
+				realm = aggregateKindUnknown
+			}
+			ra := agg.Realms[realm]
+			ra.add(e)
+			agg.Realms[realm] = ra
+
+			key := e.Time.In(time.Local).Format(layout)
+			b := buckets[key]
+			if b == nil {
+				b = &AggBucket{T: key, Scope: scope, Kinds: map[string]int64{}}
+				buckets[key] = b
+			}
+			b.Requests++
+			switch e.Outcome {
+			case OutcomeSuccess:
+				b.Success++
+			case OutcomeStreamError:
+				b.StreamError++
+			case OutcomeInterrupted:
+				b.Interrupted++
+			default:
+				b.HTTPError++
+			}
+			if e.Fallback {
+				b.Fallbacks++
+			}
+			kind := e.ErrKind
+			if kind == "" {
+				// 成功与「客户端断连」都不属于失败分类：前者无失败，后者是客户端
+				// 主动离开（上游帧无恙），把它算进错误表会让看板虚高。
+				if e.Outcome == OutcomeSuccess || e.Outcome == OutcomeInterrupted {
+					return
+				}
+				kind = aggregateKindUnknown
+			}
+			b.Kinds[kind]++
+			kc := kinds[kind]
+			if kc == nil {
+				kc = &KindCount{Kind: kind}
+				kinds[kind] = kc
+			}
+			kc.Count++
+			if e.Time.After(kc.LastAt) {
+				kc.LastAt = e.Time
+			}
+		}); err != nil {
+			return agg, err
+		}
+	}
+	total.finish()
+	agg.Totals = total
+	for realm, ra := range agg.Realms {
+		ra.finish()
+		agg.Realms[realm] = ra
+	}
+	// 桶按时间升序（格式本身即字典序），空桶不补——前端按真实时间轴定位。
+	keys := make([]string, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	agg.Buckets = make([]AggBucket, 0, len(keys))
+	for _, k := range keys {
+		b := buckets[k]
+		if len(b.Kinds) == 0 {
+			b.Kinds = nil
+		}
+		agg.Buckets = append(agg.Buckets, *b)
+	}
+	agg.Kinds = make([]KindCount, 0, len(kinds))
+	for _, kc := range kinds {
+		agg.Kinds = append(agg.Kinds, *kc)
+	}
+	sort.SliceStable(agg.Kinds, func(i, j int) bool {
+		if agg.Kinds[i].Count == agg.Kinds[j].Count {
+			return agg.Kinds[i].Kind < agg.Kinds[j].Kind
+		}
+		return agg.Kinds[i].Count > agg.Kinds[j].Count
+	})
+	// 不设界的一侧回显真实数据区间：面板右上角要显示「数据自 … → …」，
+	// 零值时间会让前端渲染出 0001-01-01。
+	if agg.From.IsZero() {
+		agg.From = firstSeen
+	}
+	if agg.To.IsZero() {
+		agg.To = lastSeen
+	}
+	return agg, nil
+}
+
+// aggregateScope 把桶宽映射成 (scope, 本地时间格式)。
+func aggregateScope(bucket time.Duration) (scope, layout string) {
+	if bucket >= 24*time.Hour {
+		return "day", "2006-01-02"
+	}
+	return "hour", "2006-01-02T15"
+}
+
+// archiveFiles 列出归档目录下的 JSONL 文件名（完整路径，未排序）。
+func archiveFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		out = append(out, filepath.Join(dir, name))
+	}
+	return out, nil
+}
+
+// scanFile 流式扫描单个归档文件：只回调落在 [from,to] 内的事件（零值侧不设界）。
+// 解析失败的行跳过（半截写入/手工编辑），不中断整窗统计。
+func scanFile(path string, from, to time.Time, fn func(Event)) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		var e Event
+		if json.Unmarshal(scanner.Bytes(), &e) != nil || e.Time.IsZero() {
+			continue
+		}
+		if !from.IsZero() && e.Time.Before(from) {
+			continue
+		}
+		if !to.IsZero() && e.Time.After(to) {
+			continue
+		}
+		fn(e)
+	}
+	return scanner.Err()
+}
+

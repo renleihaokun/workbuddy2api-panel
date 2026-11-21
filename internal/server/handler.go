@@ -93,6 +93,12 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// ModelCatalog 同名模型跨域回退（pool.cross_domain_model_fallback）的目录前置
+	// 条件：报告某域目录里是否确有该模型。nil = 一律视为未知（不跨域）——目录未
+	// 探测到时不猜，这是「另一域确有同名模型」这条前提的兜底。
+	// 生产由 main 注入 upstream.Client.CatalogModelState；测试注入固定桩。
+	ModelCatalog func(realm, model string) upstream.CatalogState
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -680,14 +686,51 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
-	// 跨域回退（issue #135）：只有裸模型名 + 显式开启 pool.cross_domain_fallback 时生效。
-	// 语义 = 「裸名不绑定单一域」：首选域（裸名默认 cn）选不到可用号（账号级冷却/熔断/
-	// 在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）时，改用另一域再选一次；
-	// 显式 cn:/global: 前缀保持原语义，永不回退。
-	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	// 跨域回退有两套开关（语义见 cmd/server/config.go 的 pool 段）：
+	//   legacy：裸名 + pool.cross_domain_fallback —— issue #135 原语义，不校验目录；
+	//   model ：pool.cross_domain_model_fallback —— 显式 cn:/global: 前缀也参与，
+	//           但要求另一域目录里确有同名模型（目录未探测到 = 不猜、不回退）。
+	// 两开关同开时，裸名沿用 legacy 的宽松语义（requireCatalog=false）。
+	legacyRealmFallback := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	modelRealmFallback := bareModel != "" && h.cfg.Pool.CrossDomainModelFallback()
+	switchAllowed := legacyRealmFallback || modelRealmFallback
+	requireCatalog := modelRealmFallback && !legacyRealmFallback
+	// pickRealm 本轮实际选号域；跨域后固定为另一域，每请求最多切一次（防 ping-pong）。
+	pickRealm := realm
+	realmSwitched := false
+	// catalogState 读目录快照（只读、零上游调用）；未注入一律 Unknown。
+	catalogState := func(r string) upstream.CatalogState {
+		if h.cfg.ModelCatalog == nil {
+			return upstream.CatalogUnknown
+		}
+		return h.cfg.ModelCatalog(r, bareModel)
+	}
+	// otherHasModel 另一域是否满足「确有同名模型」这条前提（未要求校验时恒真）。
+	otherHasModel := func(r string) bool {
+		return !requireCatalog || catalogState(r) == upstream.CatalogPresent
+	}
+	// canSwitch 主动换域：另一域此刻有可服务账号，且（本域目录明确没有该模型 或
+	// 本域对该模型整池不可服务）。目录缺模型这条优先——它能把「本域注定 11102」
+	// 的请求在第一次上游调用之前就改道，而不是先撞满 MaxRotate 次。
+	canSwitch := func(from string) bool {
+		if !switchAllowed || realmSwitched {
+			return false
+		}
+		to := otherRealm(from)
+		if h.cfg.Pool.ServableForModelRealm(bareModel, to) == 0 || !otherHasModel(to) {
+			return false
+		}
+		if catalogState(from) == upstream.CatalogAbsent {
+			return true
+		}
+		return h.cfg.Pool.ServableForModelRealm(bareModel, from) == 0
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	// 请求声明的域先落统计（选中账号后覆盖为实际服务域）：面板「反代劣化」看板
+	// 按域切分时，连「一个号都没选到」的失败也有归属，不会掉进未知桶。
+	st.realm = realm
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -853,6 +896,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
+		st.degraded = true
 	}
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
@@ -916,6 +960,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if moved := prompt.SystemAsUser(body, prompt.Degraded); moved != nil {
 			body = moved
 			systemConverted = true
+			st.sysAsUser = true
 		}
 	}
 
@@ -924,9 +969,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			// 跨域回退开启且请求为裸名时，粘性号可以落在任一域（回退成功后绑定的是另一域
-			// 的账号，下一轮不该被 realm 校验立刻解绑）。
-			if acct == nil || (realm != "" && acct.Realm() != realm && !crossRealm) {
+			// 允许跨域时粘性号可以落在任一域（回退成功后绑定的是另一域的账号，下一轮
+			// 不该被 realm 校验立刻解绑）；粘性绑定是按模型解析的，能绑上就说明该模型
+			// 在这个域上确实成功过。
+			if acct == nil || (realm != "" && acct.Realm() != realm && !switchAllowed) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
@@ -934,21 +980,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if acct == nil {
+			// 主动换域（同名模型跨域回退）：本域目录明确没有该模型，或该模型在本域
+			// 整池不可服务，而另一域有可服务号且确有同名模型。
+			if canSwitch(pickRealm) {
+				from := pickRealm
+				pickRealm = otherRealm(from)
+				realmSwitched = true
+				log.Printf("INFO: [server] model realm fallback model=%s %s -> %s (catalog=%s servable=%d/%d)",
+					bareModel, from, pickRealm, catalogState(from),
+					h.cfg.Pool.ServableForModelRealm(bareModel, from),
+					h.cfg.Pool.ServableForModelRealm(bareModel, pickRealm))
+			}
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			pickRealm := realm
-			if crossRealm && h.cfg.Pool.ServableForModelRealm(bareModel, realm) == 0 &&
-				h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(realm)) > 0 {
-				// 首选域此刻没有真正可服务的号（11102 模型级负缓存 / 账号级冷却 /
-				// 在途占满），而另一域有 → 直接换域选号（issue #135）。先看健康度再选，
-				// 避免拿全冷却兜底捞回来的旧域账号白撞一次上游。
-				pickRealm = otherRealm(realm)
-			}
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, pickRealm)
-			if acct == nil && crossRealm {
-				// 该域选不到（并发抢名额/轮换耗尽/另一域刚冷却完）→ 另一域再试一次，
-				// 保持尽力而为语义；tried 已记录失败号，轮转仍由 MaxRotate 封顶。
-				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm))
+			if acct == nil && switchAllowed && !realmSwitched && otherHasModel(otherRealm(pickRealm)) {
+				// 该域本轮已选不出号（并发抢名额/轮换耗尽/整池冷却）→ 另一域再试一次，
+				// 保持尽力而为语义；试到了才真正切换，避免把「另一域也没号」变成
+				// 一次无意义的域改写。tried 已记录失败号，轮转仍由 MaxRotate 封顶。
+				if alt := h.cfg.Pool.PickExcludingForRealm(tried, bareModel, otherRealm(pickRealm)); alt != nil {
+					from := pickRealm
+					pickRealm = otherRealm(from)
+					realmSwitched = true
+					acct = alt
+					log.Printf("INFO: [server] model realm fallback model=%s %s -> %s (opportunistic)",
+						bareModel, from, pickRealm)
+				}
 			}
 		}
 		if acct == nil {
@@ -964,7 +1021,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
-		if crossRealm && h.cfg.Upstream != nil && acct.Realm() != realm {
+		// 实际服务域（可能与请求声明的域不同）+ 跨域回退标记：面板看板按真实域
+		// 统计，回退命中单独计数。
+		st.realm = acct.Realm()
+		if acct.Realm() != realm {
+			st.fallback = true
+		}
+		if switchAllowed && h.cfg.Upstream != nil && acct.Realm() != realm {
 			// 跨域回退命中：按实际服务域取积分倍率，用量/账本记的是真实域口径，
 			// 而不是请求前缀声明的域。
 			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)
@@ -1028,6 +1091,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if moved := prompt.SystemAsUser(body, prompt.Degraded); moved != nil {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				systemConverted = true
+				st.sysAsUser = true
 				body = moved
 				log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(sysKey))
@@ -1054,6 +1118,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
+				st.fail("timeout")
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
@@ -1122,6 +1187,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.hintOf(upstream.ErrContentBlocked, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
+				st.fail(upstream.ErrContentBlocked.String())
 				return
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
@@ -1137,6 +1203,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
+				st.fail(upstream.ErrPromptTooLong.String())
 				return
 			}
 			// 图片格式/数据无效：立即透传上游原文回客户端，不罚号不轮转。
@@ -1152,6 +1219,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.hintOf(upstream.ErrImageInvalid, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
+				st.fail(upstream.ErrImageInvalid.String())
 				return
 			}
 			// 请求体解析失败（11101）：与 11115 / 图片无效同一哲学——同一 body 换任何
@@ -1170,6 +1238,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.hintOf(upstream.ErrBadParams, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
+				st.fail(upstream.ErrBadParams.String())
 				return
 			}
 			// 14003「Model busy」模型级拥塞：**不罚号不轮转**，立即回 429 + Retry-After。
@@ -1190,6 +1259,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.hintOf(upstream.ErrModelBusy, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusTooManyRequests
 				st.outcome = reqlog.OutcomeHTTPError
+				st.fail(upstream.ErrModelBusy.String())
 				return
 			}
 			// 6021「queue.full.title」渠道级容量满载：**不罚号不轮转**，立即透传
@@ -1208,6 +1278,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeHTTPError
+				st.fail(upstream.ErrUpstreamBusy.String())
 				return
 			}
 			// 11-128 通道校验/系统指纹拒绝（层 4）：已在上面尝试过一次 system→user
@@ -1274,6 +1345,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
+				st.fail("empty_stream")
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1284,6 +1356,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
+				st.fail(kind.String())
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case sErr != nil:
@@ -1292,6 +1365,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					// 也必须记失败——否则面板显示成功、账号还绑了粘性。
 					st.status = http.StatusBadGateway
 					st.outcome = reqlog.OutcomeStreamError
+					st.fail("stream_read_error")
 					log.Printf("WARN: [server] stream acct=%s model=%s: upstream read error: %v",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 					break
@@ -1307,6 +1381,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
+				st.succeed()
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
@@ -1372,6 +1447,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						h.hintOf(ue.Kind, upstreamBody(ue), bareModel, reqHasImage, ue))
 					st.status = status
 					st.outcome = reqlog.OutcomeHTTPError
+					st.fail(ue.Kind.String())
 					return
 				}
 				lastErr = &upstream.Error{Kind: ue.Kind, Status: http.StatusOK, Msg: ue.Msg, Raw: ue.Raw, RetryAfter: ue.RetryAfter}
@@ -1384,6 +1460,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			st.outcome = reqlog.OutcomeHTTPError
+			st.fail("upstream_parse")
 			return
 		}
 		// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
@@ -1410,6 +1487,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
+		st.succeed()
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -1528,6 +1606,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			hint += "; upstream: " + s
 		}
 		status = http.StatusBadRequest
+	}
+	// 归一化失败分类（面板「反代劣化」看板按它分桶）：末端透传给客户端的那一类
+	// 才是归因——上游分类优先，其次本地合成类（超时 / 传输层 / 无号）。
+	switch {
+	case errors.As(lastErr, &ue):
+		st.fail(ue.Kind.String())
+	case errors.Is(lastErr, errUpstreamTimeout):
+		st.fail("timeout")
+	case modelBlock.Blocked:
+		st.fail(upstream.ErrModelBlocked.String())
+	case lastErr != nil:
+		// 传输层错误（连不上上游，没有分类信封）：与「号全挂了」区分开。
+		st.fail("transport_error")
+	default:
+		// 一个号都没选到（账号级冷却/在途占满/积分保底），且没有任何上游错误。
+		st.fail("no_healthy_account")
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status

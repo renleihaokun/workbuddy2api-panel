@@ -2316,7 +2316,7 @@ func TestCSSSwitchIsCustom(t *testing.T) {
 	}
 }
 
-// TestIndexHTMLNavGroups 导航分组标签与 7 个视图必须一一对应：
+// TestIndexHTMLNavGroups 导航分组标签与视图必须一一对应：
 // 分组标签丢了只是少一行小字；data-view 丢了则是「点了没反应」级别的故障。
 func TestIndexHTMLNavGroups(t *testing.T) {
 	b, err := os.ReadFile("index.html")
@@ -2335,7 +2335,7 @@ func TestIndexHTMLNavGroups(t *testing.T) {
 		t.Fatal("index.html 找不到导航容器 #navDrawer")
 	}
 	nav := html[navStart:navEnd]
-	for _, v := range []string{"accounts", "usage", "packages", "taskscenter", "models", "config", "logs"} {
+	for _, v := range []string{"accounts", "usage", "packages", "channel", "taskscenter", "models", "config", "logs"} {
 		if got := strings.Count(nav, "data-view=\""+v+"\""); got != 1 {
 			t.Fatalf("导航项 data-view=%q 在 <nav> 里出现 %d 次（应恰好 1 次）", v, got)
 		}

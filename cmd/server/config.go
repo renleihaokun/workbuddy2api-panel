@@ -263,6 +263,13 @@ type Config struct {
 		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
 		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
 		CrossDomainFallback bool `json:"cross_domain_fallback"`
+		// CrossDomainModelFallback 同名模型跨域回退开关，默认 false（零回归）。
+		// 与 cross_domain_fallback 的区别：本开关对**显式 cn:/global: 前缀同样生效**，
+		// 但要求「另一域目录里确有同名模型」（目录未探测到时不猜、不回退）。触发条件：
+		// 本域对该模型整池不可服务（冷却/在途占满/模型级负缓存/积分保底），或本域目录
+		// 明确没有该模型；且另一域此刻有可服务账号。cn↔global 双向，每请求最多切一次。
+		// 两开关同开时，裸名沿用旧开关的宽松语义（不校验目录），显式前缀仍要求目录同名。
+		CrossDomainModelFallback bool `json:"cross_domain_model_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {

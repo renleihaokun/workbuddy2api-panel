@@ -25,6 +25,14 @@ func (g *degradeGate) Active() bool {
 	return time.Now().Before(g.until)
 }
 
+// Status 返回降级状态快照（面板「反代劣化」看板用）：是否在降级期 + 重置时刻。
+// 与 Active 同一把锁、同一判定，避免看板与请求路径出现两套口径。
+func (g *degradeGate) Status() (active bool, until time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return time.Now().Before(g.until), g.until
+}
+
 // Trigger 触发降级，直到次日 00:00 CST（Asia/Shanghai）。
 // 已在降级期内则不续期（保持最早触发点的 00:00 重置语义）。
 func (g *degradeGate) Trigger() {
@@ -52,4 +60,14 @@ func nextMidnightCST(now time.Time) time.Time {
 		midnight = midnight.Add(24 * time.Hour)
 	}
 	return midnight
+}
+
+// DegradeState 当前「反代通道劣化」的进程内状态快照（只读，面板看板用）：
+// 是否处于提示词降级期、降级期截止、已学习的 system 指纹条数、当前提示词模式。
+//
+// 为什么由 handler 暴露而不是放进 panel：degradeGate / systemModeGate 都是
+// handler 的进程内私有状态，面板只能经这条只读出口取值（main 事后接线）。
+func (h *Handler) DegradeState() (active bool, until time.Time, learned int, mode string) {
+	active, until = h.degrade.Status()
+	return active, until, h.sysMode.Len(), h.cfg.PromptMode
 }
