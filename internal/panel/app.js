@@ -3083,14 +3083,19 @@ function renderUsageChart(series) {
            '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
 
-  // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
-  // v3：图内不再写"均值/峰值"文字——usChartNote 已经给出两者，图内文字在
-  // 峰值贴顶时还会和 y 轴刻度重叠。只留虚线，数值看顶部说明。
-  if (avg > 0 && avg < max) {
-    const y = yOf(avg);
-    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
-           '" y2="' + y.toFixed(1) + '"/>';
+  // 跨天日期分隔线画在柱子之前：画在之后会横穿柱体，像把柱子切成两半。
+  let prevDay = null;
+  for (const p of pts) {
+    const d = new Date(p.t).getDate();
+    if (prevDay !== null && d !== prevDay) {
+      const x = xOf(p.t).toFixed(1);
+      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '" style="opacity:.28;pointer-events:none"/>';
+    }
+    prevDay = d;
   }
+
+  // 均值参考线挪到柱子之后绘制（见下方），否则柱高的时段会把虚线完全盖住。
 
   // 柱子
   const yBase = PT + ih;
@@ -3120,6 +3125,14 @@ function renderUsageChart(series) {
     out += '</g>';
   }
 
+  // 均值参考线画在柱子之后：先画会被高柱完全盖住，虚线等于不存在。
+  // v3：图内不再写"均值/峰值"文字——usChartNote 已经给出两者。
+  if (avg > 0 && avg < max) {
+    const y = yOf(avg);
+    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '" style="pointer-events:none"/>';
+  }
+
   // x 轴基线画在柱子之后，避免压在柱底
   out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
          '" y2="' + yBase + '"/>';
@@ -3143,18 +3156,6 @@ function renderUsageChart(series) {
     const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
     out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
            '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(fmtTokTimeLabel(p)) + '</text>';
-  }
-
-  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
-  let prevDay = null;
-  for (const p of pts) {
-    const d = new Date(p.t).getDate();
-    if (prevDay !== null && d !== prevDay) {
-      const x = xOf(p.t).toFixed(1);
-      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
-             (PT + ih) + '" style="opacity:.45"/>';
-    }
-    prevDay = d;
   }
 
   out += '</svg>';

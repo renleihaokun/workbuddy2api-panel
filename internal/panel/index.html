@@ -75,7 +75,7 @@
   /* 控件三档 + 表单边距：卡片头/筛选栏 30，顶栏与弹层 32，表格行内 26 */
   --h-xs: 26px; --h-ctl: 30px; --h-btn: 32px;
   --pad-x: 18px; --pad-cell-x: 12px; --gap-box: 18px;
-  --zebra: color-mix(in srgb, var(--surface-2) 45%, transparent);
+  --zebra: #191e2a;
   /* 图表色板：包来源 / 账号对比 / 到期分布共用；浅色块里覆盖成更适合白底的一组 */
   --chart-1: #4f8cff; --chart-2: #25b08b; --chart-3: #e8a33d; --chart-4: #c96bd6;
   --chart-5: #e2607a; --chart-6: #5aa9e6; --chart-7: #8fbf3f; --chart-8: #b58b5a;
@@ -115,7 +115,7 @@
     --glass-blur: 18px;
     --glow-1: rgba(43,81,204,.07);
     --glow-2: rgba(7,122,75,.04);
-    --zebra: color-mix(in srgb, var(--surface-2) 60%, transparent);
+    --zebra: #f2f5fa;
     --chart-1: #2f6fe0; --chart-2: #12876a; --chart-3: #b8730f; --chart-4: #a341b5;
     --chart-5: #c33d59; --chart-6: #2b7fbf; --chart-7: #5f8f1a; --chart-8: #8a6236;
     --chart-9: #5b6b80; --chart-10: #b4553a; --chart-11: #0f8a8a; --chart-12: #5a62c4;
@@ -147,7 +147,7 @@
   --glass-blur: 18px;
   --glow-1: rgba(43,81,204,.07);
   --glow-2: rgba(7,122,75,.04);
-  --zebra: color-mix(in srgb, var(--surface-2) 60%, transparent);
+    --zebra: #f2f5fa;
   --chart-1: #2f6fe0; --chart-2: #12876a; --chart-3: #b8730f; --chart-4: #a341b5;
   --chart-5: #c33d59; --chart-6: #2b7fbf; --chart-7: #5f8f1a; --chart-8: #8a6236;
   --chart-9: #5b6b80; --chart-10: #b4553a; --chart-11: #0f8a8a; --chart-12: #5a62c4;
@@ -219,7 +219,7 @@ html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *
   display: flex; flex-direction: column; position: sticky; top: 0;
   height: 100vh; overflow-y: auto; overflow-x: hidden;
 }
-.brand { padding: 18px 15px 15px; border-bottom: 1px solid var(--line-soft); }
+.brand { padding: 18px 15px 15px 20px; border-bottom: 1px solid var(--line-soft); }
 .brand .row1 { display: flex; align-items: center; gap: 10px; }
 /* 品牌标记：唯一的渐变实心块，作为整页的视觉锚点 */
 .brand .logo {
@@ -270,7 +270,7 @@ html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *
   transition: opacity var(--dur-1) var(--ease);
 }
 .nav a:hover svg, .nav a.on svg { opacity: 1; }
-.nav .sig { padding: 12px 12px 14px; border-top: 1px solid var(--line-soft); }
+.nav .sig { padding: 12px 12px 14px 20px; border-top: 1px solid var(--line-soft); }
 /* 侧栏底部状态卡：两行裸文字贴在左下角像没渲染完，包一层内嵌卡片 */
 .nav-status {
   background: var(--surface-2); border: 1px solid var(--line-soft);
@@ -1011,7 +1011,15 @@ body[data-view="config"] #toasts { bottom: 84px; }
     transition: width var(--dur-3) var(--ease); }
   .sav-covtxt { font-size: var(--fs-label); color: var(--ink-3); margin-top: 6px; }
   .sav-list { min-width: 0; }
-  .sav-tbl { min-width: 520px; font-size: var(--fs-table); }
+  .sav-tbl { min-width: 520px; font-size: var(--fs-table); table-layout: fixed; }
+/* 列宽固定：模型名 + 价格说明是两块 nowrap 文本，auto 布局下会把首列撑到 332px，
+   请求/Token/折算/占比全被压扁。 */
+.sav-tbl th:nth-child(1) { width: 38%; }
+.sav-tbl th:nth-child(2) { width: 12%; }
+.sav-tbl th:nth-child(3) { width: 14%; }
+.sav-tbl th:nth-child(4) { width: 18%; }
+.sav-tbl th:nth-child(5) { width: 18%; }
+.sv-price { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sav-tbl th { padding: 8px var(--pad-cell-x); }
   .sav-tbl td { padding: 7px var(--pad-cell-x); border-bottom: 1px solid var(--line-soft); }
   .sav-tbl th:first-child, .sav-tbl td:first-child { padding-left: var(--pad-x); }
