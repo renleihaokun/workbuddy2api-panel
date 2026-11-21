@@ -148,24 +148,29 @@
   .acc .usage-item b { font-size: 10px; }
   .acc .usage-item em { font-size: 8.5px; }
   /* ④ 操作按钮：固定占满一行并平分宽度 → 全部按钮永远一行（主按钮蓝） */
-  /* 操作按钮：6 个按钮在 350px 宽度里放成 3×2 等宽网格——比挤一行再掉一个好看得多 */
-  .acc .acts { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
-  .acc .acts button { width: 100%; min-width: 0; height: 30px; padding: 0 4px; font-size: 11.5px; white-space: nowrap; border-radius: 8px; }
+  /* 操作按钮：5 个（签到/余额/任务/暂停/更多）在 390px 卡片里正好一行；
+     极窄屏（320）自动折成 4+1，不会把「更多」挤出卡片。 */
+  .acc .acts { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(52px, 1fr)); gap: 5px; }
+  .acc .acts button { width: 100%; min-width: 0; height: 40px; padding: 0 4px; font-size: 12px; white-space: nowrap; border-radius: 8px; }
 
-  /* 账号卡：① 标题/ID + 状态 ② 积分细条+积分+成功失败+在途 ③ 用量标签+最近成功 ④ 按钮 */
-  #accBody tr > .who { grid-column: 1 / 9; }
+  /* 账号卡：① 名称/ID + 状态 ② 积分（整行）③ 成功/失败 + 在途 ④ 用量 ⑤ 最近成功 ⑥ 操作
+     之前 who 占 1/9、状态占 7/13，列区间重叠 → grid 自动放置把状态整块挤到第二行，
+     首行右侧留一大块空白。现在显式指定 grid-row，两块永远同一行。 */
+  #accBody tr > .who { grid-column: 1 / 7; grid-row: 1; align-self: start; width: auto; max-width: none; }
   /* 状态列给宽一点：冷却态要同时放「限流冷却 · 30分40秒」和模型限流 chip，
      只给 4 格会把标签顶到卡片外面去 */
-  #accBody tr > td:nth-child(3) { grid-column: 7 / 13; flex-direction: column; align-items: flex-end; gap: 2px; }
+  #accBody tr > td:nth-child(3) { grid-column: 7 / 13; grid-row: 1; flex-direction: column; align-items: flex-end; gap: 2px; align-self: start; width: auto; max-width: none; }
   #accBody tr > td:nth-child(3)::before { content: none; }
   #accBody tr > td:nth-child(3) .hint { font-size: 9.5px; margin-top: 0; text-align: right; }
-  #accBody tr > .cred { grid-column: 1 / 7; gap: 5px; }
-  #accBody tr > .cred .n { font-size: 10.5px; }
-  #accBody tr > td:nth-child(5) { grid-column: 7 / 10; }
-  #accBody tr > td:nth-child(6) { grid-column: 10 / 13; }
-  #accBody tr > td:nth-child(8) { grid-column: 1 / 4; order: 1; }
-  #accBody tr > .usage-cell { grid-column: 4 / 13; order: 2; }
-  #accBody tr > .acts { order: 3; }
+  /* 积分独占一行：数字 + 进度条，跟其它字段不再挤成一段 */
+  #accBody tr > .cred { grid-column: 1 / 13; grid-row: 2; gap: 7px; text-align: left; }
+  #accBody tr > .cred .n { text-align: left; }
+  #accBody tr > .cred .bar { margin-left: 0; }
+  #accBody tr > td:nth-child(5) { grid-column: 1 / 7; grid-row: 3; }
+  #accBody tr > td:nth-child(6) { grid-column: 7 / 13; grid-row: 3; }
+  #accBody tr > .usage-cell { grid-column: 1 / 13; grid-row: 4; width: auto; }
+  #accBody tr > td:nth-child(8) { grid-column: 1 / 13; grid-row: 5; }
+  #accBody tr > .acts { grid-column: 1 / 13; grid-row: 6; order: 0; }
 
   /* 模型锁池（v1.12.0 新增，8 列）：模型 / 域 / 状态 / 可选·总数 / 锁定账号 / 最早解锁 / 全池解锁 / 原因 */
   #mlBody tr > td:nth-child(1) { grid-column: 1 / 9; }
