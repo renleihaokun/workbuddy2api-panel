@@ -1,0 +1,102 @@
+name: auto-release
+
+# 版本号即发布开关：把 `cmd/server/main.go` 里的 appVersion 改好推到 main，
+# 本工作流自动打 tag 并发起发布，不再需要手工 `git tag` + `git push --tags`。
+#
+# 为什么打完 tag 还要显式 dispatch：用仓库 GITHUB_TOKEN 推上去的 tag **不会**再触发
+# push 事件（GitHub 防递归），go-binaries / docker-ghcr 因此不会自己跑；这里用
+# `gh workflow run --ref <tag>` 把它们按 tag 引用拉起，行为与手工推 tag 完全一致。
+#
+# 幂等：tag 已存在就跳过（重复推送 / 手工补发都不炸）。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/server/main.go"
+  workflow_dispatch:
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # 建并推送 tag
+  actions: write  # dispatch 两个发布工作流
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 取全部历史与 tag，用于「tag 是否已存在」判定
+
+      - name: 读取源码版本号
+        id: ver
+        run: |
+          RAW=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)
+          if [ -z "$RAW" ]; then
+            echo "::error::cmd/server/main.go 里找不到 appVersion"
+            exit 1
+          fi
+          V="${RAW%-panel}" # tag 不带 -panel 后缀（与既有 v1.20.0 一致）
+          echo "raw=$RAW" >> "$GITHUB_OUTPUT"
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+          echo "源码版本 $RAW → tag v$V"
+
+      - name: 判断是否已发布
+        id: check
+        run: |
+          if git rev-parse "refs/tags/v${{ steps.ver.outputs.v }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag v${{ steps.ver.outputs.v }} 已存在，本次跳过"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "tag v${{ steps.ver.outputs.v }} 不存在，准备发版"
+          fi
+
+      - name: 打 tag 并推送
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git tag "v${{ steps.ver.outputs.v }}"
+          git push origin "v${{ steps.ver.outputs.v }}"
+
+      # GITHUB_TOKEN 推的 tag 不触发 push 工作流 → 显式 dispatch（带重试：新 tag 有时
+      # 需要几秒才在 API 侧可见）。
+      - name: 触发发布工作流
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.ver.outputs.v }}
+        run: |
+          for wf in go-binaries.yml docker-ghcr.yml; do
+            ok=0
+            for i in 1 2 3 4 5; do
+              if gh workflow run "$wf" --ref "$TAG"; then
+                echo "已触发 $wf @ $TAG"
+                ok=1
+                break
+              fi
+              echo "$wf 第 $i 次触发失败，3s 后重试"
+              sleep 3
+            done
+            if [ "$ok" != "1" ]; then
+              echo "::error::触发 $wf 失败（tag 已推送，可手工 workflow_dispatch 补发）"
+              exit 1
+            fi
+          done
+
+      - name: 写运行摘要
+        if: always()
+        run: |
+          {
+            echo "### 自动发版"
+            echo ""
+            echo "- 源码版本：\`${{ steps.ver.outputs.raw }}\`"
+            echo "- tag：\`v${{ steps.ver.outputs.v }}\`"
+            if [ "${{ steps.check.outputs.exists }}" = "true" ]; then
+              echo "- 结果：tag 已存在，跳过（未重复发版）"
+            else
+              echo "- 结果：已打 tag 并触发 go-binaries / docker-ghcr"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
