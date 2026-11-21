@@ -65,10 +65,14 @@
     width: 264px; max-width: 86vw; height: 100%;
     flex-direction: column; align-items: stretch;
     overflow-x: hidden; overflow-y: auto;
-    transform: translateX(-100%); transition: transform .22s ease;
+    /* visibility 让关闭态真正离开渲染与可聚焦树（transform 不会）；
+       延迟到收起动画结束再隐藏，展开时立即可见。 */
+    visibility: hidden;
+    transform: translateX(-100%);
+    transition: transform .22s ease, visibility 0s linear .22s;
     border-right: 1px solid var(--line);
   }
-  .nav.open { transform: translateX(0); }
+  .nav.open { transform: translateX(0); visibility: visible; transition: transform .22s ease, visibility 0s linear 0s; }
   .nav ul { display: block; padding: 10px 8px; }
   .nav .sig { border-top: 1px solid var(--line-soft); }
   .nav-btn { display: inline-flex; align-items: center; padding: 6px 8px; }
@@ -76,6 +80,7 @@
     display: block; position: fixed; inset: 0; z-index: 65;
     background: rgba(6,8,13,.55); opacity: 0; pointer-events: none;
     transition: opacity .22s ease;
+    touch-action: none; overscroll-behavior: contain;
   }
   .nav-veil.on { opacity: 1; pointer-events: auto; }
 

@@ -406,8 +406,90 @@ function formatRate(rate) {
   return n.toFixed(1) + 'tok/s';
 }
 
+/* ── 弹层管理器 ─────────────────────────────────────────────────────
+   五个 .veil 以前只有 CSS 的 display 切换：读屏不知道是对话框、Tab 会跑到背后、
+   Esc 关不掉、背景还能滚。这里统一补语义与行为，open/close 两个入口是唯一开关。
+
+   - role="dialog" / aria-modal / aria-labelledby（取弹层里的 h3）
+   - 打开时记录触发元素、把焦点送进弹层；关闭时归还
+   - Tab 在弹层内循环；Esc 关最上层（data-lock 的密钥门除外）
+   - html.lock 锁背景滚动；点遮罩关闭（密钥门除外） */
+const DLG_STACK = [];
+const DLG_FOCUS_SEL = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function dlgFocusables(veil) {
+  return [...veil.querySelectorAll(DLG_FOCUS_SEL)].filter(el => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 || r.height > 0;
+  });
+}
+
+function openVeil(id) {
+  const veil = $(id);
+  if (!veil) return;
+  const dlg = veil.querySelector('.dlg');
+  if (dlg) {
+    dlg.setAttribute('role', 'dialog');
+    dlg.setAttribute('aria-modal', 'true');
+    const h = dlg.querySelector('h3');
+    if (h) {
+      if (!h.id) h.id = id + 'Title';
+      dlg.setAttribute('aria-labelledby', h.id);
+    }
+  }
+  if (veil.classList.contains('on') && DLG_STACK.some(x => x.veil === veil)) return;
+  const prev = document.activeElement;
+  veil.classList.add('on');
+  document.documentElement.classList.add('lock');
+  DLG_STACK.push({ veil, prev });
+  setTimeout(() => {
+    const f = dlgFocusables(veil);
+    const target = f[0] || dlg;
+    if (target && target.focus) target.focus({ preventScroll: true });
+  }, 30);
+}
+
+function closeVeil(id) {
+  const veil = $(id);
+  const i = DLG_STACK.findIndex(x => x.veil === veil);
+  if (i < 0) { if (veil) veil.classList.remove('on'); return; }
+  const { prev } = DLG_STACK.splice(i, 1)[0];
+  veil.classList.remove('on');
+  if (!DLG_STACK.length) document.documentElement.classList.remove('lock');
+  if (prev && prev.focus) { try { prev.focus({ preventScroll: true }); } catch (e) { prev.focus(); } }
+}
+
+document.addEventListener('keydown', e => {
+  if (!DLG_STACK.length) return;
+  // 下拉候选层/行内菜单开着时，Esc 先交给它们处理（controls.js 的 capture 监听更晚注册）
+  if (document.querySelector('.sel-pop, .sel-sheet, .ctx-pop')) return;
+  const top = DLG_STACK[DLG_STACK.length - 1];
+  if (e.key === 'Escape') {
+    if (top.veil.hasAttribute('data-lock')) return;
+    e.preventDefault();
+    closeVeil(top.veil.id);
+    return;
+  }
+  if (e.key === 'Tab') {
+    const f = dlgFocusables(top.veil);
+    if (!f.length) { e.preventDefault(); return; }
+    const first = f[0], last = f[f.length - 1];
+    if (!top.veil.contains(document.activeElement)) { e.preventDefault(); first.focus(); return; }
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+}, true);
+
+document.querySelectorAll('.veil').forEach(v => {
+  v.addEventListener('pointerdown', e => {
+    if (e.target !== v || v.hasAttribute('data-lock')) return;
+    e.preventDefault();
+    closeVeil(v.id);
+  });
+});
+
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+function openKey() { openVeil('keyVeil'); setTimeout(() => $('keyInput').focus(), 60); }
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -415,7 +497,7 @@ $('btnKey').onclick = async () => {
   try {
     await api('overview');
     $('keyErr').hidden = true;
-    $('keyVeil').classList.remove('on');
+    closeVeil('keyVeil');
     start();
   } catch (e) { $('keyErr').hidden = false; }
 };
@@ -1547,7 +1629,7 @@ $('cfgForm').onsubmit = async ev => {
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
-  $('addVeil').classList.add('on');
+  openVeil('addVeil');
   // 重置到登录标签
   switchAddTab('login');
   $('addPick').hidden = false;
@@ -1604,7 +1686,7 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() { stopPoll(); loginState = null; closeVeil('addVeil'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
@@ -1886,11 +1968,11 @@ const AUTO_TASKS = {
 function openTasks(uid) {
   taskUID = uid;
   $('taskWho').textContent = uid.slice(0, 16);
-  $('taskVeil').classList.add('on');
+  openVeil('taskVeil');
   $('btnTaskReload').hidden = false;
   loadTasks();
 }
-function closeTasks() { $('taskVeil').classList.remove('on'); taskUID = null; }
+function closeTasks() { closeVeil('taskVeil'); taskUID = null; }
 $('btnCloseTask').onclick = closeTasks;
 $('btnTaskReload').onclick = loadTasks;
 
@@ -2230,7 +2312,7 @@ function vcCard(v) {
 
 async function loadSchoolVouchers() {
   const body = $('vcBody');
-  $('vcVeil').classList.add('on');
+  openVeil('vcVeil');
   body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
   $('vcNote').textContent = '';
   try {
@@ -2269,7 +2351,7 @@ async function loadSchoolVouchers() {
   }
 }
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
-$('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
+$('btnVcClose').onclick = () => closeVeil('vcVeil');
 $('btnVcRefresh').onclick = loadSchoolVouchers;
 
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
@@ -3838,9 +3920,9 @@ function renderRemarkBody() {
 }
 function openRemarks() {
   renderRemarkBody();
-  if ($('remarkVeil')) $('remarkVeil').classList.add('on');
+  if ($('remarkVeil')) openVeil('remarkVeil');
 }
-function closeRemarks() { if ($('remarkVeil')) $('remarkVeil').classList.remove('on'); }
+function closeRemarks() { if ($('remarkVeil')) closeVeil('remarkVeil'); }
 function saveRemarkForm() {
   const map = {};
   document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {

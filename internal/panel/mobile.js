@@ -25,12 +25,45 @@ const MOBILE_MQ = matchMedia('(max-width: 760px)');
 
 const navDrawer = document.querySelector('.nav');
 const navBtn = $('navBtn'), navVeil = $('navVeil');
+const mainEl = document.querySelector('.main');
 
-/* drawerSet 幂等设置抽屉三态载体：侧栏 .open / 遮罩 .on / 按钮 aria-expanded。 */
+/* setInert 兼容老内核：优先用原生 inert（Safari 15.5+/Chrome 102+），
+   不支持时退成 aria-hidden —— 至少读屏不会读到屏幕外的导航。 */
+function setInert(el, on) {
+  if (!el) return;
+  if ('inert' in el) el.inert = on;
+  if (on) el.setAttribute('aria-hidden', 'true');
+  else el.removeAttribute('aria-hidden');
+}
+
+/* drawerSet 幂等设置抽屉四态载体：侧栏 .open / 遮罩 .on / aria-expanded / 焦点与 inert。
+   关闭态把整个侧栏移出 Tab 序列：transform 移到屏幕外并不会取消可聚焦性，
+   以前的实现里 Tab 会依次落在 7 个看不见的导航链接上。 */
 function drawerSet(open) {
+  const mobile = MOBILE_MQ.matches;
+  const hadFocusInside = !!(navDrawer && navDrawer.contains(document.activeElement));
   if (navDrawer) navDrawer.classList.toggle('open', open);
   if (navVeil) navVeil.classList.toggle('on', open);
   if (navBtn) navBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (!mobile) {
+    // 桌面端侧栏常驻：清掉移动端加的 inert/aria-hidden，否则整个导航不可用。
+    setInert(navDrawer, false);
+    setInert(mainEl, false);
+    return;
+  }
+  /* 顺序很重要：先把焦点送到目标区域，再给另一块加 inert/aria-hidden。
+     反过来会短暂出现「aria-hidden 元素里还有焦点」，Chrome 会直接拒绝隐藏。 */
+  if (open) {
+    setInert(navDrawer, false);
+    const first = navDrawer && navDrawer.querySelector('a');
+    if (first) first.focus({ preventScroll: true });
+    setInert(mainEl, true);
+  } else {
+    // 先解除 .main 的 inert 再 focus 汉堡：inert 子树里的元素是 focus 不了的。
+    setInert(mainEl, false);
+    if (hadFocusInside && navBtn) navBtn.focus({ preventScroll: true });
+    setInert(navDrawer, true);
+  }
 }
 function drawerClose() { drawerSet(false); }
 function drawerToggle() { drawerSet(!(navDrawer && navDrawer.classList.contains('open'))); }
@@ -41,10 +74,12 @@ if (navVeil) navVeil.addEventListener('click', drawerClose);         // 点遮�
 if (navDrawer) navDrawer.addEventListener('click', ev => { if (ev.target.closest('a')) drawerClose(); });
 addEventListener('keydown', ev => { if (ev.key === 'Escape') drawerClose(); }); // ESC 关
 // 转回 >760px 自动复位：matchMedia 的 change 在跨过断点时触发，resize 兜底
-function drawerResetIfWide() { if (!MOBILE_MQ.matches) drawerClose(); }
+function drawerResetIfWide() { if (!MOBILE_MQ.matches) drawerClose(); else drawerSet(navDrawer && navDrawer.classList.contains('open')); }
 if (MOBILE_MQ.addEventListener) MOBILE_MQ.addEventListener('change', drawerResetIfWide);
 else if (MOBILE_MQ.addListener) MOBILE_MQ.addListener(drawerResetIfWide); // 旧 Safari
 addEventListener('resize', drawerResetIfWide);
+// 首屏按当前断点同步一次：手机端抽屉关闭 → 导航 inert；桌面端清掉。
+drawerSet(false);
 
 /* ── 表格字段名 → data-l ─────────────────────────────────────────────── */
 /* thLabel 只取表头里的**纯文本节点**：表头里可能还有排序箭头之类的装饰 <span>，
