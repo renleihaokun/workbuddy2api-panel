@@ -319,9 +319,10 @@
   window.addEventListener('scroll', function () { clearTimeout(tipTimer); hideTip(); }, true);
   upgradeTitles(document);
   upgradeDateTimes(document);
+  labelFields(document);
   new MutationObserver(function (muts) {
     for (var i = 0; i < muts.length; i++) {
-      if (muts[i].type === 'attributes' || (muts[i].addedNodes && muts[i].addedNodes.length)) { scheduleTipUpgrade(); scheduleDTUpgrade(); return; }
+      if (muts[i].type === 'attributes' || (muts[i].addedNodes && muts[i].addedNodes.length)) { scheduleTipUpgrade(); scheduleDTUpgrade(); labelFields(document); return; }
     }
   }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['title'] });
 
@@ -530,6 +531,23 @@
     if (dtPending) return;
     dtPending = true;
     setTimeout(function () { dtPending = false; upgradeDateTimes(document); }, 60);
+  }
+
+  /* ══ 表单可读名：把 .lb 文本补成 aria-label ═════════════════════════
+     配置页用 <label class="fld"> 包裹整块（含 .hint 说明），读屏会把说明也念进
+     控件名称里（「监听地址 改动需重启进程」）。aria-label 只取 .lb 一行。 */
+  function labelFields(root) {
+    var labs = root && root.querySelectorAll ? root.querySelectorAll('label.fld, label.switch') : [];
+    for (var i = 0; i < labs.length; i++) {
+      var lb = labs[i].querySelector('.lb');
+      if (!lb) continue;
+      var text = (lb.textContent || '').trim();
+      if (!text) continue;
+      var fields = labs[i].querySelectorAll('input, select, textarea');
+      for (var j = 0; j < fields.length; j++) {
+        if (!fields[j].getAttribute('aria-label')) fields[j].setAttribute('aria-label', text);
+      }
+    }
   }
 
   /* ══ 确认框 ════════════════════════════════════════════════════════ */
