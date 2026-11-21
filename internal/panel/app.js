@@ -1156,7 +1156,7 @@ $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
   logCh = b.dataset.ch;
-  document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
+  document.querySelectorAll('#logChips .chip').forEach(c => { const on = c === b; c.classList.toggle('on', on); c.setAttribute('aria-pressed', on ? 'true' : 'false'); });
   loadLogs();
 });
 async function loadLogs() {

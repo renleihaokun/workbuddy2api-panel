@@ -1975,10 +1975,10 @@ button.ghost.danger:hover:not(:disabled) {
           <h3>运行日志</h3>
           <span class="grow"></span>
           <span class="chips" id="logChips">
-            <button class="xs chip on" data-ch="all">全部</button>
-            <button class="xs chip" data-ch="task">任务</button>
-            <button class="xs chip" data-ch="chat">对话</button>
-            <button class="xs chip" data-ch="sys">系统</button>
+            <button class="xs chip on" data-ch="all" aria-pressed="true">全部</button>
+            <button class="xs chip" data-ch="task" aria-pressed="false">任务</button>
+            <button class="xs chip" data-ch="chat" aria-pressed="false">对话</button>
+            <button class="xs chip" data-ch="sys" aria-pressed="false">系统</button>
           </span>
           <span class="note" id="logNote">最近 500 行</span>
           <button class="xs" id="btnLogPin">自动滚动：开</button>
@@ -2092,7 +2092,7 @@ button.ghost.danger:hover:not(:disabled) {
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tab-panel" hidden>
         <div class="hint mb-2">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
-        <input type="file" id="importFile" accept=".json" class="mb-2">
+        <input type="file" id="importFile" accept=".json" class="mb-2" aria-label="选择 cockpit 导出的 JSON 文件">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>
       </div>
@@ -2121,7 +2121,7 @@ button.ghost.danger:hover:not(:disabled) {
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <form class="contents" id="keyForm"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
+      <form class="contents" id="keyForm"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off" aria-label="访问密钥"></form>
       <div class="state err mt-3" id="keyErr" hidden>密钥不正确，请重试。</div>
     </div>
     <footer>
