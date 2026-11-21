@@ -1393,6 +1393,10 @@ async function loadConfig() {
   setConfigReady(false, '正在读取配置…');
   try {
     const d = await api('config');
+    // 响应形状校验：只有 200 但没有 config（网关截断/版本不匹配/脚本注入的桩）
+    // 时，dig() 会把 undefined 摊平成空值，表单看起来"加载成功"却全是空的。
+    // 必须当成失败处理，否则同样会走「空表单保存覆盖线上配置」。
+    if (!d || !d.config || typeof d.config !== 'object') throw new Error('配置响应缺少 config 字段');
     cfgLoaded = d.config;
     $('cfgPath').textContent = d.path || '';
     const f = $('cfgForm');
