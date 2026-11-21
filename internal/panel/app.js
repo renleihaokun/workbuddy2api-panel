@@ -216,6 +216,17 @@ function fmtLocalDateTime(ms) {
     p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
+/* fmtStampShort 表格/日志里的时间戳：MM-DD HH:mm:ss。
+   请求记录、积分历史、运行日志都可能跨天，只给时分秒会出现两行都写 14:05:06、
+   却分不清哪天的情形。年份不进列宽，完整值挂在单元格 title 上。 */
+function fmtStampShort(ts) {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '—';
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
 /* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────────
    预设项：今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义。
 
@@ -409,41 +420,6 @@ function rateLimitRowsHtml(rows, now) {
   }).join('') + '</div>';
 }
 
-function formatTokenCount(tokens) {
-  if (tokens == null || tokens === '') return '—';
-  const n = Number(tokens);
-  if (!Number.isFinite(n) || n < 0) return '—';
-  if (n < 1000) return String(Math.round(n));
-  const units = [['k', 1e3], ['m', 1e6], ['b', 1e9]];
-  let unit = units[0];
-  for (const candidate of units) {
-    if (n >= candidate[1]) unit = candidate;
-  }
-  let value = n / unit[1];
-  let rounded = Number(value.toFixed(1));
-  // 999999 → 1m，而不是 1000k；四舍五入后自动升级单位。
-  const next = units[units.indexOf(unit) + 1];
-  if (next && rounded >= 1000) {
-    unit = next;
-    value = n / unit[1];
-    rounded = Number(value.toFixed(1));
-  }
-  return rounded + unit[0];
-}
-
-function formatLatency(ms) {
-  if (ms == null || ms === '') return '—';
-  const n = Number(ms);
-  if (!Number.isFinite(n) || n <= 0) return '—';
-  return n < 1000 ? Math.round(n) + 'ms' : (n / 1000).toFixed(1).replace(/\.0$/, '') + 's';
-}
-function formatRate(rate) {
-  if (rate == null || rate === '') return '—';
-  const n = Number(rate);
-  if (!Number.isFinite(n) || n < 0) return '—';
-  return n.toFixed(1) + 'tok/s';
-}
-
 /* ── 弹层管理器 ─────────────────────────────────────────────────────
    五个 .veil 以前只有 CSS 的 display 切换：读屏不知道是对话框、Tab 会跑到背后、
    Esc 关不掉、背景还能滚。这里统一补语义与行为，open/close 两个入口是唯一开关。
@@ -622,7 +598,7 @@ function renderAccounts(list) {
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
     const unlimited = s.credits_total === -1;
     const cred = unlimited ? '不限'
-      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+      : (s.credits == null ? '—' : (s.credits_total > 0 ? creditNum(s.credits) + '<span class="of">/' + creditNum(s.credits_total) + '</span>' : creditNum(s.credits)));
     const pct = unlimited ? 100
       : (s.credits_total > 0
         ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
@@ -643,10 +619,10 @@ function renderAccounts(list) {
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
-    const totalTok = formatTokenCount(tu.total_tokens);
+    const totalTok = fmtTok(tu.total_tokens);
     const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
-    const latency = formatLatency(tu.last_latency_ms);
-    const rate = formatRate(tu.last_tokens_per_second);
+    const latency = fmtMs(tu.last_latency_ms);
+    const rate = fmtRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
@@ -1205,7 +1181,7 @@ async function loadLogs() {
     box.innerHTML = entries.length
       ? entries.map(e => {
         const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
-        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+        const t = e.ts ? fmtStampShort(e.ts) : '';
         const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
         return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
@@ -1259,7 +1235,7 @@ function creditTimeText(e) {
   // 正常链路 time 由 Go 的 time.Time 序列化，恒为 RFC3339；这里挡的是手工改文件/
   // 将来换格式等脏数据——toLocaleTimeString 遇到非法日期不抛异常，只会渲染出
   // "Invalid Date" 这种没意义的字样。
-  return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString('zh-CN', { hour12: false });
+  return isNaN(d.getTime()) ? '—' : fmtStampShort(e.time);
 }
 function creditAccountText(e) {
   e = e || {};
@@ -1356,7 +1332,7 @@ function renderRequestTable() {
   const tb = $('reqBody');
   if (!tb) return;
   tb.innerHTML = list.map(e => {
-    const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+    const when = e && e.time ? fmtStampShort(e.time) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
     const rid = e && e.request_id ? e.request_id : '';
@@ -1406,7 +1382,7 @@ if ($('creditLimit')) $('creditLimit').onchange = loadCreditHistory;
 if ($('btnCreditReload')) $('btnCreditReload').onclick = loadCreditHistory;
 
 function requestLogText(e) {
-  const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const when = e && e.time ? fmtStampShort(e.time) : '—';
   const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
   const token = Number(e && e.total_tokens || 0) ||
     (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
@@ -2543,7 +2519,10 @@ function reattachQueueView() {
    就得带上打包器，得不偿失。这里只需要堆叠柱状图，二十行足够。 */
 
 function fmtTok(n) {
-  n = Number(n || 0);
+  // 缺失值统一 —：以前 null → 0，账号表里看起来像「这个号真的用了 0 token」。
+  if (n == null || n === '') return '—';
+  n = Number(n);
+  if (!Number.isFinite(n)) return '—';
   if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';

@@ -44,12 +44,14 @@ const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
 const start = src.indexOf('function creditNum');
 const end = src.indexOf('function creditLimitValue');
-if ([escStart, escEnd, start, end].some(v => v < 0)) throw new Error('credit history helpers not found');
+const stampStart = src.indexOf('function fmtStampShort');
+const stampEnd = src.indexOf('function dtLocalValue');
+if ([escStart, escEnd, start, end, stampStart, stampEnd].some(v => v < 0)) throw new Error('credit history helpers not found');
 const els = {};
 const $ = id => (els[id] || (els[id] = { innerHTML: '', textContent: '' }));
 const ctx = { Date, Number, String, Math, RegExp, isNaN, $ };
 vm.createContext(ctx);
-vm.runInContext(src.slice(escStart, escEnd) + src.slice(start, end) +
+vm.runInContext(src.slice(stampStart, stampEnd) + src.slice(escStart, escEnd) + src.slice(start, end) +
   '\nthis.renderCreditHistory=renderCreditHistory;', ctx);
 const t = new Date(2026, 8, 28, 14, 5, 6).toISOString();
 const out = {};
@@ -156,10 +158,12 @@ const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function creditNum');
 const end = src.indexOf('function creditLimitValue');
-if (start < 0 || end < 0) throw new Error('credit history helpers not found');
+const stampStart = src.indexOf('function fmtStampShort');
+const stampEnd = src.indexOf('function dtLocalValue');
+if (start < 0 || end < 0 || stampStart < 0 || stampEnd < 0) throw new Error('credit history helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.creditEntryText=creditEntryText;', ctx);
+vm.runInContext(src.slice(stampStart, stampEnd) + src.slice(start, end) + '\nthis.creditEntryText=creditEntryText;', ctx);
 process.stdout.write(JSON.stringify({
   bad: ctx.creditEntryText({ time: 'not-a-date', uid: 'u1', delta: 1, before: 0, after: 1 }),
   empty: ctx.creditEntryText({ time: '', uid: 'u1', delta: 1, before: 0, after: 1 }),

@@ -240,13 +240,15 @@ const escStart = src.indexOf('function esc(');
 const escEnd = src.indexOf('function ago(');
 const fmtStart = src.indexOf('function fmtTok(');
 const fmtEnd = src.indexOf('function usStat(');
+const stampStart = src.indexOf('function fmtStampShort');
+const stampEnd = src.indexOf('function dtLocalValue');
 const reqStart = src.indexOf('function requestLogText');
 const reqEnd = src.indexOf('function fmtBytes');
-if ([escStart, escEnd, fmtStart, fmtEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('request log helpers not found');
+if ([escStart, escEnd, fmtStart, fmtEnd, stampStart, stampEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('request log helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(reqStart, reqEnd) +
+  src.slice(stampStart, stampEnd) + src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(reqStart, reqEnd) +
   '\nthis.requestLogText=requestLogText;',
   ctx
 );
@@ -271,9 +273,9 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("request log formatting node test failed: %v\n%s", err, out)
 	}
-	text := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
-	noSource := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
-	cached := "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
+	text := "09-28 14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | req-1"
+	noSource := "09-28 14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | — | — | 1.25s | 2.3k tok | 0.12 credit | req-3"
+	cached := "09-28 14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 203.0.113.7 | python-requests/2.31.0 | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1% | req-2"
 	want := `{"good":` + strconv.Quote(text) + `,"noSource":` + strconv.Quote(noSource) + `,"cached":` + strconv.Quote(cached) + `}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("request log formatting=%s want %s", out, want)
@@ -291,11 +293,13 @@ const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function creditNum');
 const end = src.indexOf('function renderCreditHistory');
-if (start < 0 || end < 0) throw new Error('credit history helpers not found');
+const stampStart = src.indexOf('function fmtStampShort');
+const stampEnd = src.indexOf('function dtLocalValue');
+if (start < 0 || end < 0 || stampStart < 0 || stampEnd < 0) throw new Error('credit history helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
 vm.runInContext(
-  src.slice(start, end) +
+  src.slice(stampStart, stampEnd) + src.slice(start, end) +
   '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
   ctx
 );
@@ -318,8 +322,8 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("credit history formatting node test failed: %v\n%s", err, out)
 	}
-	gain := "14:05:06 | 小明 | +100 | 1,400 | 余额 1,300 → 1,400"
-	loss := "14:05:06 | 89374120 | −30 | 1,370 | 余额 1,400 → 1,370"
+	gain := "09-28 14:05:06 | 小明 | +100 | 1,400 | 余额 1,300 → 1,400"
+	loss := "09-28 14:05:06 | 89374120 | −30 | 1,370 | 余额 1,400 → 1,370"
 	want := `{"gain":` + strconv.Quote(gain) + `,"loss":` + strconv.Quote(loss) +
 		`,"note":"2 条 · 净 +1,240","empty":"暂无积分变动记录"}`
 	if strings.TrimSpace(string(out)) != want {
@@ -2042,7 +2046,8 @@ const ctx = {
   remarkName: (u, n) => n,
   rateLimitRowsHtml: () => '',
   dur: () => '-', ago: () => '-',
-  formatTokenCount: () => '-', formatLatency: () => '-', formatRate: () => '-',
+  creditNum: n => String(n),
+  fmtTok: () => '-', fmtMs: () => '-', fmtRate: () => '-',
   $: () => box,
 };
 vm.createContext(ctx);
