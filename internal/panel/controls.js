@@ -244,6 +244,86 @@
     closePop();
   }, true);
 
+  /* ══ 自绘 tooltip：把 title 换成同一套视觉的浮层 ═════════════════════
+     系统黄气泡有三个问题：1 秒延迟、不可主题化、手机完全不可达。这里把
+     title 搬进 data-tip 后由 pointerover/focusin 驱动，读屏仍能用 aria-label
+     （元素没有文本时自动补一份）。<tr title> 直接删掉：整行提示会挡住数据。 */
+  var tipEl = null, tipTimer = null, tipFor = null;
+
+  function ensureTip() {
+    if (!tipEl) {
+      tipEl = document.createElement('div');
+      tipEl.className = 'wb-tip';
+      tipEl.setAttribute('role', 'tooltip');
+      document.body.appendChild(tipEl);
+    }
+    return tipEl;
+  }
+  function showTip(el) {
+    var text = el.getAttribute('data-tip');
+    if (!text) return;
+    var t = ensureTip();
+    t.textContent = text;
+    t.classList.add('on');
+    var r = el.getBoundingClientRect();
+    var w = t.offsetWidth, h = t.offsetHeight;
+    var left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+    var top = r.bottom + 8;
+    if (top + h > window.innerHeight - 8) top = r.top - h - 8;
+    t.style.left = Math.max(8, left) + 'px';
+    t.style.top = Math.max(8, top) + 'px';
+  }
+  function hideTip() {
+    if (tipEl) tipEl.classList.remove('on');
+    tipFor = null;
+  }
+  function upgradeTitles(root) {
+    var nodes = root && root.querySelectorAll ? root.querySelectorAll('[title]') : [];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var text = el.getAttribute('title');
+      if (!text) { el.removeAttribute('title'); continue; }
+      // 整行 title（账号行 / 请求行）只会挡住下面的数据，直接丢弃。
+      if (el.tagName === 'TR') { el.removeAttribute('title'); continue; }
+      if (!el.getAttribute('aria-label') && !(el.textContent || '').trim()) {
+        el.setAttribute('aria-label', text);
+      }
+      el.setAttribute('data-tip', text);
+      el.removeAttribute('title');
+    }
+  }
+  var tipPending = false;
+  function scheduleTipUpgrade() {
+    if (tipPending) return;
+    tipPending = true;
+    setTimeout(function () { tipPending = false; upgradeTitles(document); }, 60);
+  }
+  document.addEventListener('pointerover', function (e) {
+    var el = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (!el) return;
+    if (tipFor === el) return;
+    clearTimeout(tipTimer);
+    tipTimer = setTimeout(function () { tipFor = el; showTip(el); }, 380);
+  }, true);
+  document.addEventListener('pointerout', function (e) {
+    var el = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (!el) return;
+    clearTimeout(tipTimer);
+    if (tipFor === el) hideTip();
+  }, true);
+  document.addEventListener('focusin', function (e) {
+    var el = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (el) { clearTimeout(tipTimer); tipFor = el; showTip(el); }
+  }, true);
+  document.addEventListener('focusout', function () { clearTimeout(tipTimer); hideTip(); }, true);
+  window.addEventListener('scroll', function () { clearTimeout(tipTimer); hideTip(); }, true);
+  upgradeTitles(document);
+  new MutationObserver(function (muts) {
+    for (var i = 0; i < muts.length; i++) {
+      if (muts[i].type === 'attributes' || (muts[i].addedNodes && muts[i].addedNodes.length)) { scheduleTipUpgrade(); return; }
+    }
+  }).observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ['title'] });
+
   /* ══ 行内「更多」菜单 ═══════════════════════════════════════════════
      表格最后一列的空间很贵：把低频且危险的操作收进这里，行宽能少 80px。
      与候选层一样用 fixed 定位挂 body，避免被 .tbl-wrap 的 overflow 裁掉。 */

@@ -188,6 +188,30 @@ textarea:-webkit-autofill {
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
+/* ── 自绘 tooltip（替代 43 处系统黄气泡） ───────────────────────────── */
+.wb-tip {
+  position: fixed;
+  z-index: 120;
+  max-width: min(340px, calc(100vw - 24px));
+  padding: 7px 10px;
+  border-radius: var(--r-sm);
+  background: var(--raise);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--line);
+  box-shadow: var(--sh-3);
+  color: var(--ink-2);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+.wb-tip.on { opacity: 1; transform: none; }
+
 /* ── 行内「更多」菜单（账号表的禁用/移除） ──────────────────────────── */
 .ctx-pop { min-width: 132px; padding: 4px; }
 .ctx-item {
