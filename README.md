@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.24.0-panel`（面板视觉 v4：手机/平板断点统一到 1000，首屏折叠积分到期提醒，积分构成改单账号明细，图表按容器宽度绘制并修跨天刻度，日志/请求/模型分页加载；详见 `docs/ui-v4/README.md`）。
+> 当前版本 `1.24.3-panel`（脱敏补齐上游四条通道校验规则：身份句、per-model 身份句、system 全文产品名、`@` 路径说明的 AND 句对；后者是每轮必带、社区 2026-10-27 起复现的第三条指纹）。
 
 ## 核心能力
 

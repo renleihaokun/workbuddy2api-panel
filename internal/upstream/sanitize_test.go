@@ -565,6 +565,102 @@ func TestPrepareBodyRewritesReviewPluginPrompt(t *testing.T) {
 	}
 }
 
+// DSH profile 的模型介绍句：provider 段是反代网关自己的名字，必须中性化。
+func TestCodingAgentModelLineRewritten(t *testing.T) {
+	cases := []string{
+		"You are a coding agent powered by wb2/cn/deepseek-v4.1-flash model.",
+		"You are a coding agent powered by workbuddy2api-panel/global/deepseek-v4.1-flash model.",
+	}
+	for _, in := range cases {
+		if !hasFingerprint(in) {
+			t.Errorf("fast-path precheck missed: %q", in)
+		}
+		if got := sanitizeText(in); got != "You are a coding agent." {
+			t.Errorf("got %q want %q (in=%q)", got, "You are a coding agent.", in)
+		}
+	}
+}
+
+// 上游第三条指纹是 AND 匹配：@ 路径说明那两句同时出现才拦。
+// 只改 A 句、保留 B 句（B 描述 read/write/glob 的路径语义，原样最友好）。
+func TestAtPathPhrasePairRewritten(t *testing.T) {
+	const a = "Tokens prefixed with @ are paths the user explicitly referenced"
+	const b = "Relative paths resolve from the workspace root"
+	in := a + ". " + b + "; absolute paths identify files or directories on the host."
+	if !hasFingerprint(in) {
+		t.Fatalf("fast-path precheck missed")
+	}
+	out := sanitizeText(in)
+	if strings.Contains(out, a) {
+		t.Errorf("phrase A survived: %q", out)
+	}
+	if !strings.Contains(out, b) {
+		t.Errorf("phrase B must stay verbatim: %q", out)
+	}
+	if again := sanitizeText(out); again != out {
+		t.Errorf("not idempotent: %q -> %q", out, again)
+	}
+}
+
+// system / developer 里的 DSH 品牌名必须中性化，user / assistant 逐字原样。
+func TestBrandNeutralisedOnlyInSystemRole(t *testing.T) {
+	const sys = "The runtime context names the DeepSeek Harness implementation checkout."
+	const assistantText = "DeepSeek Harness 的 system 提示词会被上游拦截。"
+	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[` +
+		`{"role":"system","content":` + strconv.Quote(sys) + `},` +
+		`{"role":"user","content":` + strconv.Quote(sys) + `},` +
+		`{"role":"assistant","content":` + strconv.Quote(assistantText) + `}]}`)
+	out := string(PrepareBodyOpt(body, true))
+	var parsed struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("out body not json: %v", err)
+	}
+	byRole := map[string]string{}
+	for _, m := range parsed.Messages {
+		byRole[m.Role] = m.Content
+	}
+	if strings.Contains(byRole["system"], "DeepSeek Harness") {
+		t.Errorf("system brand survived: %q", byRole["system"])
+	}
+	if byRole["user"] != sys {
+		t.Errorf("user message changed:\n got %q\nwant %q", byRole["user"], sys)
+	}
+	if byRole["assistant"] != assistantText {
+		t.Errorf("assistant message changed:\n got %q\nwant %q", byRole["assistant"], assistantText)
+	}
+}
+
+// 品牌替换必须跳过路径语境：安装路径里的 "DeepSeek Harness" 改了会让工具找不到文件。
+func TestBrandSkipsInstallPath(t *testing.T) {
+	const pathLine = `checkout: C:\Users\x\AppData\Local\Programs\DeepSeek Harness\resources\app.asar\dsh\`
+	const plainLine = "You are interacting with the user through the DeepSeek Harness Web GUI."
+	out, changed := replaceBrandSafe(pathLine)
+	if changed || out != pathLine {
+		t.Errorf("install path must be preserved untouched: got %q changed=%v", out, changed)
+	}
+	out, changed = replaceBrandSafe(plainLine)
+	if !changed {
+		t.Fatalf("plain brand should be replaced: %q", out)
+	}
+	if strings.Contains(out, "DeepSeek Harness") || !strings.Contains(out, "the harness Web GUI") {
+		t.Errorf("plain brand not neutralised: %q", out)
+	}
+}
+
+// 模型介绍句用非贪婪匹配：同一行后面若还有 " model" 字样，不能被一起吃掉。
+func TestCodingAgentModelLineStopsAtFirstModel(t *testing.T) {
+	in := "You are a coding agent powered by wb2/cn/deepseek-v4.1-flash model. Prefer the fast model."
+	want := "You are a coding agent. Prefer the fast model."
+	if got := sanitizeText(in); got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
 // newTestUpstream 起一个假上游并捕获请求。
 func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()

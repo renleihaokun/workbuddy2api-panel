@@ -25,6 +25,12 @@ var sanitizeFeatures = []string{
 	// 的真机复现也只命中整句，所以这里不再匹配裸 "DeepSeek Harness"：否则用户
 	// 在对话里讨论 DSH、或让模型读/改含品牌词的仓库文档时，正文会被无谓改写。
 	"You are an AI agent powered by DeepSeek Harness",
+	// DSH profile 的 per-model 身份句：`You are a coding agent powered by <provider>/<model> model.`
+	// provider 段就是反代网关自己的名字，官方客户端不会出现这种串。预检走前缀，改写走正则。
+	"You are a coding agent powered by",
+	// 上游第三条指纹（2026-10-27 起，AND 匹配）：这两句同时出现才拦，单独出现放行。
+	// 它们来自 DSH 的 @ 路径引用说明，每轮必带。预检命中即进入改写（只改 A 句）。
+	"Tokens prefixed with @ are paths the user explicitly referenced",
 	// 审查插件的 system/policy 身份句：这些提示词由客户端作为独立一次模型调用的
 	// 正文发出，同样按逐字指纹被拦。归属：三方 dsh-auto-review（PerryLink）四句 +
 	// 官方 @deepseek-ai/dsh-experimental-auto-review 的 REVIEW_POLICY 首句。
@@ -47,6 +53,102 @@ var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?
 // 中两者并用：先删键值形态（sanitizeHdrRe），再缩写残留裸键名（本正则），
 // 替换语义不同（整段删除 vs 最小缩写），不可合并为一个正则。
 var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
+
+// sanitizeCodingAgentModelRe 抹掉 DSH profile 模型介绍句里的 provider/模型名。
+//
+// 实测形态：
+//
+//	You are a coding agent powered by wb2/cn/deepseek-v4.1-flash model.
+//	You are a coding agent powered by workbuddy2api-panel/global/deepseek-v4.1-flash model.
+//
+// provider 段就是反代网关自己的名字，官方客户端不会出现这种串；而它的前缀
+// "You are a coding agent …" 又与上游已拦的 Codex 身份句同族。两种解释都指向
+// 「这句必须中性化」，所以整段换成不带名字的说法。
+//
+// 锚定行首 + 以 " model" 收尾：只吃这一句，不误伤正文；匹配串不含结尾标点。
+var sanitizeCodingAgentModelRe = regexp.MustCompile(`(?m)^You are a coding agent powered by [^\n]{1,200}? model`)
+
+// brandFrom / brandTo：system / developer 里的 DSH 品牌名换成中性说法。
+//
+// 身份句洗完，DSH 的 system 里还有两处运行时说明带品牌名——"The runtime context names
+// the DeepSeek Harness implementation checkout…" 与 "…through the DeepSeek Harness Web GUI…"。
+// 社区实测（AidenOrz/dsh-workbuddy-connect 0.7.12）上游对 system 做全文产品名扫描，
+// 11 处 "DeepSeek Harness" 全部替换后同一请求立即 200。
+//
+// 只作用于 system / developer：assistant 历史与 user / tool 逐字原样。
+const (
+	brandFrom = "DeepSeek Harness"
+	brandTo   = "the harness"
+)
+
+// replaceBrandSafe 把文本里的品牌名换成中性说法，但**跳过路径语境**。
+//
+// 为什么必须跳过：DSH 的 system 里会出现本机安装路径，例如
+// `C:\Users\x\AppData\Local\Programs\DeepSeek Harness\resources\app.asar\dsh\`。
+// 无脑替换会把路径改成不存在的目录，模型随后把它交给 read/write/glob → 工具全废，
+// 而且零宽/替换肉眼难辨，只会表现为「文件突然不存在」。社区踩过这个坑
+// （AsterLuo/dsh-buddy-guard 用前后负向断言 (?<![\\/])(?![\\/])；Go regexp 不支持
+// lookaround，这里用字符判断等价实现）。
+func replaceBrandSafe(s string) (string, bool) {
+	if !strings.Contains(s, brandFrom) {
+		return s, false
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	changed := false
+	for i := 0; ; {
+		j := strings.Index(s[i:], brandFrom)
+		if j < 0 {
+			b.WriteString(s[i:])
+			break
+		}
+		j += i
+		prev, next := byte(0), byte(0)
+		if j > 0 {
+			prev = s[j-1]
+		}
+		if k := j + len(brandFrom); k < len(s) {
+			next = s[k]
+		}
+		if prev == '/' || prev == '\\' || next == '/' || next == '\\' {
+			// 路径语境：原样保留这一段，继续往后找。
+			b.WriteString(s[i : j+len(brandFrom)])
+			i = j + len(brandFrom)
+			continue
+		}
+		b.WriteString(s[i:j])
+		b.WriteString(brandTo)
+		i = j + len(brandFrom)
+		changed = true
+	}
+	return b.String(), changed
+}
+
+// replaceBrandContent 把一段 content（字符串或多模态数组的 text part）里的品牌名换掉。
+func replaceBrandContent(v any) (any, bool) {
+	switch c := v.(type) {
+	case string:
+		return replaceBrandSafe(c)
+	case []any:
+		changed := false
+		for _, raw := range c {
+			p, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			t, ok := p["text"].(string)
+			if !ok {
+				continue
+			}
+			if s, ch := replaceBrandSafe(t); ch {
+				p["text"] = s
+				changed = true
+			}
+		}
+		return c, changed
+	}
+	return v, false
+}
 
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
 var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
@@ -99,6 +201,15 @@ var sanitizeRewrites = [][2]string{
 		"You are an AI agent that helps the user with programming tasks",
 	},
 	{
+		// 上游第三条指纹（2026-10-27 起实测，社区多项目复现）：system 里**同时**出现
+		// 下面两句才拦（AND 匹配，单独出现都放行）；它们来自 DSH 的 @ 路径引用说明，
+		// 每轮必带。只改 A 句、保留 B 句——B 直接描述 read/write/glob 的相对路径语义，
+		// 原样对模型最友好；破坏其中一句就能让 AND 匹配失效。
+		// 出处：AsterLuo/dsh-buddy-guard、AidenOrz/dsh-workbuddy-connect 0.7.14、issue #680/#689。
+		"Tokens prefixed with @ are paths the user explicitly referenced",
+		"Path tokens starting with the at-sign point at locations the user referenced",
+	},
+	{
 		// 三方插件 dsh-auto-review（PerryLink）的 REVIEW_SYSTEM_PROMPT：
 		// "You are a read-only safety reviewer for a coding agent. ..."
 		// 只把 reviewer 换成 checker（同一角色、语义不变），破坏逐字指纹。
@@ -137,6 +248,11 @@ func sanitizeText(text string) string {
 	}
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
+	}
+	// DSH profile 的模型介绍句：连同 provider 名一起抹掉（见 sanitizeCodingAgentModelRe）。
+	// 放在字面改写之后：若上游后续把这句也收进 sanitizeRewrites，字面规则先生效。
+	if strings.Contains(text, "You are a coding agent powered by") {
+		text = sanitizeCodingAgentModelRe.ReplaceAllString(text, "You are a coding agent")
 	}
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
@@ -249,7 +365,8 @@ func sanitizeMessagesCount(messages []any) int {
 		if !ok {
 			continue
 		}
-		switch role, _ := m["role"].(string); role {
+		role, _ := m["role"].(string)
+		switch role {
 		case "system", "developer", "assistant":
 		default:
 			continue // user / tool / 未知角色：上游不读，原样出站
@@ -259,6 +376,14 @@ func sanitizeMessagesCount(messages []any) int {
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		if c, ok := m["content"]; ok {
 			if nc, ch := sanitizeContent(c); ch {
+				m["content"] = nc
+				changed = true
+			}
+		}
+		// system / developer：品牌名中性化放在指纹脱敏之后——身份句先被整句换掉，
+		// 剩下的运行时说明（runtime context / Web GUI）里的品牌名才是要处理的对象。
+		if (role == "system" || role == "developer") && m["content"] != nil {
+			if nc, ch := replaceBrandContent(m["content"]); ch {
 				m["content"] = nc
 				changed = true
 			}
