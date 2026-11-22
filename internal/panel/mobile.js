@@ -266,3 +266,21 @@ function drawMobileUsageChart(series) {
 }
 
 renderUsageChart = mobileUsageChart;
+
+/* ── 通道健康两张图：跨断点/转屏重画 ─────────────────────────────────
+   app.js 的 channel 图表在渲染时用 matchMedia 选 440/1200 宽 viewBox，但只在
+   加载/切视图时渲染——手机先横屏进页再转竖屏，图会停在 1200 宽缩放到 360px
+   的状态（刻度字约 3px）。这里监听断点变化 + resize，用最近一次数据重渲染；
+   只在本视图可见时动，避免无谓重排。 */
+if (typeof renderChannelHealth === 'function') {
+  let chRedrawTimer = null;
+  const redrawChannel = () => {
+    if (view !== 'channel' || !channelData) return;
+    clearTimeout(chRedrawTimer);
+    chRedrawTimer = setTimeout(() => {
+      if (view === 'channel' && channelData) renderChannelHealth(channelData);
+    }, 120);
+  };
+  MOBILE_MQ.addEventListener('change', redrawChannel);
+  addEventListener('resize', redrawChannel);
+}

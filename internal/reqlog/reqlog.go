@@ -80,10 +80,10 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
 	// Realm 实际服务域（cn / global）。一个号都没选到的失败按请求声明的域记。
 	// 面板「反代劣化」看板据此按域切分成功率。
 	Realm string `json:"realm,omitempty"`
@@ -669,15 +669,15 @@ func (w *archiveWriter) errString() string {
 
 // AggTotals 一个窗口（或一个域）的汇总。字段口径与面板 KPI 卡一一对应。
 type AggTotals struct {
-	Requests   int64 `json:"requests"`
-	Success    int64 `json:"success"`
-	HTTPError  int64 `json:"http_error"`
+	Requests    int64 `json:"requests"`
+	Success     int64 `json:"success"`
+	HTTPError   int64 `json:"http_error"`
 	StreamError int64 `json:"stream_error"`
 	Interrupted int64 `json:"interrupted"`
 	// Fallbacks 跨域回退命中次数；Degraded / SysAsUser 走降级提示词 / 角色搬移的次数。
-	Fallbacks int64   `json:"fallbacks"`
-	Degraded  int64   `json:"degraded"`
-	SysAsUser int64   `json:"sys_as_user"`
+	Fallbacks     int64   `json:"fallbacks"`
+	Degraded      int64   `json:"degraded"`
+	SysAsUser     int64   `json:"sys_as_user"`
 	SuccessRate   float64 `json:"success_rate"`
 	AvgDurationMs float64 `json:"avg_duration_ms"`
 	AvgTTFBMs     float64 `json:"avg_ttfb_ms"`
@@ -753,9 +753,12 @@ type KindCount struct {
 
 // Aggregate 窗口聚合结果。
 type Aggregate struct {
-	Bucket  string               `json:"bucket"` // "hour" / "day"
-	From    time.Time            `json:"from"`
-	To      time.Time            `json:"to"`
+	Bucket string    `json:"bucket"` // "hour" / "day"
+	From   time.Time `json:"from"`
+	To     time.Time `json:"to"`
+	// Since 本窗口内最早一条记录的时刻（零值 = 窗口内没有记录）。面板「数据覆盖」
+	// 条用它说明归档在这一段的实际起点，而不是拿窗口起点冒充。
+	Since   time.Time            `json:"since,omitempty"`
 	Totals  AggTotals            `json:"totals"`
 	Buckets []AggBucket          `json:"buckets"`
 	Kinds   []KindCount          `json:"kinds"`
@@ -900,6 +903,7 @@ func (r *Recorder) Aggregate(from, to time.Time, bucket time.Duration) (Aggregat
 	if agg.To.IsZero() {
 		agg.To = lastSeen
 	}
+	agg.Since = firstSeen
 	return agg, nil
 }
 
@@ -953,4 +957,3 @@ func scanFile(path string, from, to time.Time, fn func(Event)) error {
 	}
 	return scanner.Err()
 }
-

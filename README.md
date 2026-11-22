@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.22.0-panel`（反代劣化看板重做：从「终态成功率」改为「上游拦截强度」——11-128 / 搬移重试 / 脱敏改写 / 限流按小时累计并持久化，配失败率折线与事件分类表），与 Release `v1.22.0` 同源。
+> 当前版本 `1.23.0-panel`（通道健康看板 v3：事件分类改由 `internal/channelstat/kind.go` 注册表统一驱动，趋势图拆成「拦截事件 / 出站改写」双度量并支持每千请求，补数据覆盖期与服务端分桶时区提示；请求路径收口为 `channelAdapt` 状态机，修复内容拦截降级归档、客户端断连罚号、非流式 error 帧漏计、学习计数并发重复等边界）。
 
 ## 核心能力
 
@@ -188,7 +188,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹**整句**清洗（Claude Code / Codex / DSH 身份句 / 审查插件提示词）；**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / 账号标签 / rid / 结果 / 积分）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
-| 🖥️ **Web 管理面板** | 内嵌单页面板（**默认跟随系统明暗**，可三态循环锁定；毛玻璃侧栏/顶栏/弹层 + 入场动效；八个视图）：账号运维 / 用量与积分分析（含**剩余积分走势**折线）/ **反代劣化看板**（上游识别与拦截趋势）/ 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🖥️ **Web 管理面板** | 内嵌单页面板（**默认跟随系统明暗**，可三态循环锁定；毛玻璃侧栏/顶栏/弹层 + 入场动效；八个视图）：账号运维 / 用量与积分分析（含**剩余积分走势**折线）/ **通道健康看板**（上游拦截与出站改写：双度量趋势、覆盖期、每千请求）/ 模型档位条件查询 / 在线改配置（热生效）/ 运行日志（含**调用来源 IP·UA** 与时间区间）/ 积分任务，见 [Web 管理面板](#-web-管理面板) |
 | 💰 **「已省」折算** | 用量页按厂商**官网牌价**（人民币 / 百万 tokens）把 token 折成钱：左边大字「已省 ￥ + 历史累计」，右边按模型列出折算金额与占比（每行带「入/出/缓存」单价摘要），覆盖率细条与未定价 token 在金额下方；按命中 / 未命中 / 输出三段计价，DeepSeek 走**峰谷价**（工作日 9–12、14–18 高峰，其余半价），日桶按高峰小时加权。价格来自内置种子 + `data/prices.json` 手改覆盖（改完刷新即生效）。**纯展示**：不参与计费、选号、积分保底 |
 
 ## 🎯 成长任务一键完成（23/25）
@@ -779,26 +779,31 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 - cn↔global **双向**，每个请求最多切一次（防两域来回打乒乓）。
 - 目录未知但上游先撞 11102 时，本次可能以 `model_unavailable` 结束（受 `MaxRotate` 封顶）；该域账号的模型级负缓存会让**下一次**请求走 T2 改道。
 - 显式 `cn:` / `global:` 前缀**参与**（这是与 `pool.cross_domain_fallback` 的核心区别）；两开关同开时，裸名沿用旧开关的宽松语义（不校验目录）。
-- 可观测：切换时打一行 `INFO: [server] model realm fallback model=… cn -> global (catalog=… servable=…/…)`；请求归档记 `realm`（实际服务域）与 `fallback`（是否回退），面板「反代劣化」看板的「跨域回退」计数与分域对比都取自这两个字段。
+- 可观测：切换时打一行 `INFO: [server] model realm fallback model=… cn -> global (catalog=… servable=…/…)`；请求归档记 `realm`（实际服务域）与 `fallback`（是否回退），面板「通道健康」看板的「跨域回退」计数与分域对比都取自这两个字段。
 
 ### 反代通道事件计数
 
-面板「反代劣化」看板的数据源。**数与请求终态无关**——11-128 被 system→user 救回后终态是 200，按终态统计会得出「上游从没拦过我们」的错误结论（1.21.0 的第一版就是这么错的）。
+面板「通道健康」看板的数据源。**数与请求终态无关**——11-128 被 system→user 救回后终态是 200，按终态统计会得出「上游从没拦过我们」的错误结论（1.21.0 的第一版就是这么错的）。
 
-| 事件 | 触发点 | 语义 |
-|---|---|---|
-| `channel_refused` | 每次 attempt 分类为 11-128（含流内 error 帧） | 上游认为请求不是官方客户端 |
-| `sys_as_user` | system→user 搬移重试实际发出 | 我们的救回动作 |
-| `role_normalized` / `sanitize` | `prepareBody` 的出站改写（按消息条数） | 为了让请求过通道，改了多少东西 |
-| `content_blocked` / `degrade_trigger` | 内容策略拦截 / 触发降级 | 误报与降级 |
-| `soft_rate` / `hard_credit` / `model_busy` / `upstream_busy` / `waf_block` / `model_blocked` | 各 attempt 的上游分类 | 配额、容量与风控 |
-| `stream_error` / `stream_read_error` / `empty_stream` / `timeout` | 流中断与超时 | 劣化的另一种表现 |
-| `cache_miss` | 大前缀整段未命中告警 | 成本劣化 |
-| `catalog_fail` | global 目录探测失败 | 通道可用性 |
+事件的标签、顺序、分组、单位、解释统一登记在 `internal/channelstat/kind.go` 的注册表里（18 个 kind），面板与测试都从注册表取，不再各维护一份清单：
+
+| 事件 | 触发点 | 分组 | 单位 | 语义 |
+|---|---|---|---|---|
+| `channel_refused` | 每次 attempt 分类为 11-128（含流内 error 帧） | refusal | 请求 | 上游认为请求不是官方客户端 |
+| `sys_as_user` | system→user 搬移重试实际发出 | offchart | 请求 | 我们的救回动作（与拦截成对出现，不重复进图） |
+| `content_blocked` | 上游内容策略拦截 | refusal | 请求 | 内容审核（含 system 指纹误报） |
+| `degrade_trigger` | 触发 Degraded 提示词降级 | offchart | 请求 | 按「降级窗口」计一次，不按撞墙请求数计 |
+| `soft_rate` / `hard_credit` / `model_busy` / `upstream_busy` / `waf_block` / `model_blocked` | 各 attempt 的上游分类 | throttle | 请求 | 配额、容量与风控 |
+| `stream_error` / `stream_read_error` / `empty_stream` / `timeout` | 流中断与超时 | stream | 请求 | 劣化的另一种表现 |
+| `role_normalized` / `sanitize` | `prepareBody` 的出站改写（按消息条数） | offchart | 工作 | 为了让请求过通道，改了多少东西 |
+| `cache_miss` | 大前缀整段未命中告警 | other | 请求 | 成本劣化 |
+| `catalog_fail` | global 目录探测失败 | other | 请求 | 通道可用性 |
 
 - 存储：`data/channel-stats.json`，小时桶保留 90 天后折叠为日桶，5 分钟防抖落盘；重启后继续累计（`since` / 上次降级触发 / 累计学习次数一并持久化）。
-- 口径：`sys_as_user` 与 `channel_refused` 几乎一一对应，看板上**只把 channel_refused 画进柱子**（否则同一件事画两遍）；`sanitize` / `role_normalized` 是按消息条数计的工作量，和按请求计的拦截事件差两个数量级，只进 KPI 与事件表。
-- 回填：把历史数据写成 `data/channel-stats.seed.json`，服务启动时合并一次并改名 `.imported`（先落盘再改名，避免「改名成功 + 落盘失败」丢数据）。
+- 分组：`refusal` / `throttle` / `stream` / `other` 四个进图组由后端按「总数 − 进图组 − offchart」倒推 `other`（未登记的新事件不会丢，落进 other）；`offchart`（搬移 / 归一 / 清洗 / 降级）只进 KPI 与事件表，不画柱。
+- 口径：`sys_as_user` 与 `channel_refused` 几乎一一对应，看板上**只把 channel_refused 画进拦截柱**；`sanitize` / `role_normalized` 是按消息条数计的工作量，和按请求计的拦截事件差两个数量级，走「出站改写」度量（独立 y 轴），不参与每千请求换算。
+- 时区：桶键是**服务端本地时间**（不带偏移）。面板接口回 `tz`（如 `+00:00`），前端据此把小时桶换算成浏览器本地时间显示，并在覆盖条标注「服务端分桶 UTC±HH:MM」；日桶按服务端日历日标注。生产宿主是 UTC、用户在 UTC+8 时，图上的小时标签是本地时间、日标签是服务端日期，tooltip 与覆盖条会说明口径。若要统一到 `Asia/Shanghai`，需在部署侧设 `TZ`，并注意**存量桶键会按新时区重新解释（8 小时偏移）**——历史数据迁移要单独处理。
+- 回填：把历史数据写成 `data/channel-stats.seed.json`，服务启动时合并一次并改名 `.imported`（先落盘再改名，避免「改名成功 + 落盘失败」丢数据）；合并时 `since` 取最早、`degrade_last_at` 取最晚、`learned_total` 累加、`last_at` 每 kind 取最晚，不会让种子回滚主账本元信息。
 
 ### 定时任务
 
@@ -998,13 +1003,13 @@ http://127.0.0.1:7863/panel/
 | **账号池** | 统计条（账号总数 / 可用 / 冷却中 / 已禁用 / 已暂停选号 / 积分剩余·总额 / 粘性会话）+ **积分到期提醒卡**（按最近到期批次估算、FEFO 口径；点「检查」拉逐包明细）+ 账号表：健康色条与状态标签（可用 / 限流冷却 / 积分冷却 / 熔断 / 连败降权 / 已禁用）、积分量条、成功·失败计数、在途、最近一次用量（次数 / token / 延迟 / 速率）、最近成功时间；单号操作 签到 / 余额 / 任务 / 暂停选号 / 恢复选号 / 解冻 / 禁用 / 移除；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」；下方**模型锁池**表列出被上游按模型限流的模型（整池不可用 / 没号可用 / 部分限流）、可选与总数、锁定账号数、最早解锁与全池解锁倒计时、限流原因，无锁定时显示「所有模型均可选」 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败尝试 / 平均延迟，含占比与吐字速率）+ **Token 时序图**（渐变堆叠柱、均值参考线、峰值标注、悬停看单桶明细）+ **用量明细**（按账号 / 按模型 / 按域切换，可按合计 Token / 请求数 / 失败数 / 平均延迟排序，含 prompt·completion 占比条与「官方价」列）+ **积分扣除历史**（按账号 / 按模型，折算「积分 / 1M Token」）+ **已省**（一张账单：左边大字金额 + 覆盖率细条，右边按模型列出 请求 / token / 折算金额 / 占比条，金额降序、未定价排末尾；牌价快照与模型数压成 header 一行小字，点「展开全部」看全量） |
 | **积分构成** | **剩余积分走势**（全池合计 + cn/global 分域折线，余额后台刷新/签到结束时采样；企业版不限量账号不计入合计）+ **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
-| **反代劣化** | 上游对反代通道的**拦截强度**：6 张 KPI（请求数 / 失败率 / 11-128 拦截 / 搬移重试 / 脱敏改写 / 限流·容量）+ 状态条（提示词模式、降级「本进程 / 上次触发」、已学习指纹「本进程 / 累计」、跨域回退）+ **拦截事件堆叠柱**（通道拒绝 / 限流·容量 / 流中断·超时 / 其他，按小时或按日）+ **失败率折线**（0–2% 小量程，0.3% 也看得见）+ 事件分类表（次数 / 每千请求 / 最近一次）+ 分域对比（仅统计带域标记的事件）。事件计数来自网关决策点（**含被救回的请求**），失败率来自用量账本（90 天），分域来自请求归档 |
+| **通道健康** | 上游拦截与出站改写：**6 张 KPI**（请求 / 失败率 / 11-128 拦截 / 搬移重试 / 出站改写 / 限流·容量，每张带单位与口径）+ **状态条**（通道正常/降级中徽标 + 提示词模式 + 上次降级 + 已学习指纹「本进程/历史」 + 跨域回退）+ **覆盖条**（窗口 + 事件/用量/归档各自的数据起点 + 服务端分桶时区）+ **双度量趋势图**（拦截事件堆叠柱：通道拒绝 / 限流·容量 / 流中断·超时 / 其他；出站改写双折线：归一 / 清洗；可切绝对量/每千请求，覆盖带标出「数据起点」）+ **失败率折线**（窗口定域、断档分段、均值/峰值）+ **事件分类表**（注册表标签 / 次数 / 每千请求 / 最近一次 / 说明，可按表头排序）+ **分域对比**（只比较 cn/global，标注带域标记覆盖率，不把历史全算「未标注」）。支持关 / 30 秒 / 60 秒 / 5 分钟自动刷新。事件计数来自网关决策点（**含被救回的请求**），失败率来自用量账本（90 天），分域来自请求归档 |
 | **任务中心** | 成长任务队列：一键扫描全部账号未完成待办（默认口径 + 小程序口径）→ 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询（活动已结束，仅历史券）。详见 [任务中心](#-任务中心面板新视图) |
 | **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长 / 补领清扫 时点与开关 + 余额刷新间隔；夜猫子时点与开关仅 `config.json`）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / system→user 兜底 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
-顶部另有「刷新」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
+顶部另有「刷新余额」（向上游全量查询真实余额并回写；5 秒自动轮询只读内存，不打上游）与「添加账号」（浏览器内完成 OAuth 设备授权：显示授权链接 + 自动轮询，登录后凭证落盘并**热加载进池，免重启**，也支持导入 cockpit tools 导出的 JSON）。
 
 ### 视觉与交互
 
@@ -1139,6 +1144,17 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 - 分域表只统计带域标记的事件，不足 100 条显示「数据积累中」，不再把 1.21.0 之前的 19.8k 历史全算进「未标注」。
 - 事件数据从本版本起累计（可选：用 `data/channel-stats.seed.json` 回填历史，启动时合并一次并改名 `.imported`）。
 
+**通道健康看板 v3（本次重构，未单独发版）**
+
+- 事件分类收口到 `internal/channelstat/kind.go` 注册表（18 个 kind，含中文标签 / 分组 / 单位 / Hint），面板 API 直接下发 `groups[]` 元数据与 `kinds[].group/unit/hint`；删除死条目 `model_rate_limit`，新增 `cache_miss` / `timeout` / `catalog_fail` 的显式登记。
+- 趋势图拆成两个度量：拦截事件（堆叠柱，可切绝对量 / 每千请求；分母 <10 请求的桶不画，避免 1 个事件放大成 500‰）与出站改写（归一 / 清洗双折线，独立 y 轴）。x 轴用窗口边界定域，窗口起点到 `events.since` 之间画覆盖带 + 「数据起点」标记（贴右边缘时标签自动翻到左侧）。
+- 失败率图：同样窗口定域，无请求的桶不画点、断档分段；y 上限按峰值自适应（不再固定 0–2%），标注均值 / 峰值 / 有请求桶数。
+- 状态条区分「通道正常 / 降级中」；`state` 未接线时为 `null`（不再编造「从未触发」）；零值时间字段由 `DegradeState.MarshalJSON` 省略，修复「01-01 07:36:42」。
+- 分域表只比较 cn/global，`realm_labeled / realm_total` 给出覆盖率，未标注不占一行。
+- 事件表加「说明」列（注册表 Hint）、可排序；每千请求只对 `unit=request` 的事件换算，按消息计的工作量显示「—」。
+- 请求路径：`internal/server/channel.go` 的 `channelAdapt` 状态机收口「提示词改写 / system→user 搬移 / 内容拦截降级」，修复：降级重试漏记 `degraded`、循环耗尽把内容拦截报成 503、客户端断连被记成传输失败并罚号、非流式 200+error 帧不计事件、`degrade_trigger` 按请求重复计、学习计数并发重复。
+- usage 序列按看板粒度折叠（不再「事件按日、失败率按小时」）、窗口左边界按桶对齐（三源同口径）、72h 预设留 1 分钟容差（不再永远落日桶）。
+
 **v1.21.0 两个新看板**
 
 - **反代劣化**（新导航视图）：6 张 KPI + 提示词降级状态条 + **100% 堆叠结果构成图** + 错误分类表 + 分域对比表。柱子按桶内请求数归一化——看的是「构成怎么变」，绝对量交给 KPI 与表格；跨天断档用真实时间轴定位，不会被画成一段连续曲线。
@@ -1159,7 +1175,7 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 
 ### 时间范围查询
 
-「用量」「运行日志 → 请求记录」「反代劣化」「剩余积分走势」共用同一个时间范围控件，预设 **今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义**（自定义展开起止时间输入，精确到分钟；起止颠倒就地标红）：
+「用量」「运行日志 → 请求记录」「通道健康」「剩余积分走势」共用同一个时间范围控件，预设 **今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义**（自定义展开起止时间输入，精确到分钟；起止颠倒就地标红）：
 
 - 「今天」与「自定义」的区间由**浏览器按本地时区**算好后发给服务端——服务端时区未必与浏览器一致（容器常挂 `TZ=Asia/Shanghai`），让服务端算"今天"会在跨时区时切错日子；
 - 滚动预设走服务端的 `hours` 口径（当前整点往回 N-1 小时），与既有统计口径逐位一致（前端自己减 N 小时会在边界多算/少算一个桶）；
@@ -1203,7 +1219,7 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET credit_trend`（`from` / `to`；走势采样点 + 实时 `current`）· `GET channel_health`（`from` / `to`；`requests` 失败率序列 + `events` 拦截事件序列 + `kinds` 事件表 + `state` 进程内/跨重启状态 + `sources` 各数据源覆盖区间 + `realms` 分域）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET credit_trend`（`from` / `to`；走势采样点 + 实时 `current`）· `GET channel_health`（`from` / `to`；`requests` 失败率序列 + `events` 事件序列（每点带 `groups`）+ `groups` 堆叠组元数据 + `kinds` 事件表（`label/group/unit/hint/per_1k/last_at`）+ `state`（未接线为 `null`）+ `sources` 各源 `from/to/since` + `tz` + `realms` 分域 + `realm_labeled/realm_total`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
 | 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
@@ -1354,7 +1370,7 @@ wire_api = "responses"
 | `rid` / `out` / `try` / `credit` | 请求 ID / 结果（`success` / `http_error` 等）/ 尝试次数 / 扣减积分；仅带 `requestID` 的请求出现 |
 | `src` / `ua` | 来源 IP 与压缩后的客户端 UA 标签；`logging.request_client_info=true` 时出现 |
 
-**归档字段（JSONL，面板「反代劣化」看板的数据源）**：除上表的基础元数据外，每条事件还记 `realm`（实际服务域 cn/global）、`err_kind`（归一化失败分类：`channel_refused` / `content_blocked` / `model_blocked` / `soft_rate` / `model_busy` / `upstream_busy` / `waf_block` / `server` / `timeout` / `transport_error` / `no_healthy_account` / `stream_read_error` / `empty_stream` / `upstream_parse` / …）、`fallback`（本次是否跨域回退）、`degraded`（是否走了 Degraded 中性提示词）、`sys_as_user`（是否走过 system→user 搬移）。旧归档没有这些字段时，看板把它们归入「未分类」而不是丢弃。
+**归档字段（JSONL，面板「通道健康」看板的数据源）**：除上表的基础元数据外，每条事件还记 `realm`（实际服务域 cn/global）、`err_kind`（归一化失败分类：`channel_refused` / `content_blocked` / `model_blocked` / `soft_rate` / `model_busy` / `upstream_busy` / `waf_block` / `server` / `timeout` / `transport_error` / `no_healthy_account` / `stream_read_error` / `empty_stream` / `upstream_parse` / …）、`fallback`（本次是否跨域回退）、`degraded`（是否走了 Degraded 中性提示词）、`sys_as_user`（是否走过 system→user 搬移）。旧归档没有这些字段时，看板把它们归入「未分类」而不是丢弃。
 
 **敏感度**：流水日志不含任何 token 明文（详见[安全与合规](#安全与合规)）；stdout 流水不落盘，请求元数据按 `logging.request_archive_*` 归档 JSONL（不含提示词、响应正文、Authorization）。
 
@@ -1656,8 +1672,8 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 请求归档的 `realm` / `err_kind` / `fallback` / `degraded` / `sys_as_user` | `internal/reqlog/reqlog.go` `Event`；写入 `internal/server/logging.go` `requestTrace.event` |
 | 归档窗口聚合（小时/日桶、错误分类、分域） | `internal/reqlog/reqlog.go` `Recorder.Aggregate` |
 | 剩余积分走势采样（1 分钟去抖、30 分钟落盘节流、上限 1.2 万点、落盘 `credit-trend.json`） | `internal/creditline/creditline.go`（`Snapshot` / `Ledger.Add` / `Ledger.Flush`）；触发 `internal/scheduler/scheduler.go`（`SetCreditTrendHook`） |
-| 面板「反代劣化」/「积分走势」接口 | `internal/panel/degrade.go` `channelHealth`、`internal/panel/credittrend.go` `creditTrend`；路由 `internal/panel/panel.go` `routes` |
-| 反代通道事件计数（11-128 / 搬移 / 改写 / 限流 / 流中断…，与请求终态无关） | `internal/channelstat`（`Inc` / `Series` / `Rollup`）；埋点 `internal/server/handler.go`（`noteEvent` / `noteKind`）、`internal/upstream/payload.go`（`PrepareBodyOptStats`）、`internal/upstream/global_models.go`、`internal/server/logging.go`（缓存未命中） |
+| 面板「通道健康」/「积分走势」接口 | `internal/panel/degrade.go` `channelHealth`、`internal/panel/credittrend.go` `creditTrend`；路由 `internal/panel/panel.go` `routes` |
+| 反代通道事件计数（11-128 / 搬移 / 改写 / 限流 / 流中断…，与请求终态无关） | `internal/channelstat`（`kind.go` 注册表 + `Inc` / `Series` / `Rollup`）；埋点 `internal/server/handler.go`（`noteEvent` / `noteKind`）、`internal/server/channel.go`（`channelAdapt`）、`internal/upstream/payload.go`（`PrepareBodyOptStats`）、`internal/upstream/global_models.go`、`internal/server/logging.go`（缓存未命中） |
 | 降级「上次触发」与「累计学习次数」跨重启保留 | `internal/channelstat`（`MarkDegrade` / `AddLearned`）；接线 `internal/server/handler.go`（`rememberSystem`） |
 | 提示词降级状态 / 已学习指纹条数对外只读出口 | `internal/server/degrade.go` `DegradeState`、`internal/server/systemmode.go` `systemModeGate.Len` |
 | Top-5 候选短名单 | `internal/pool/pick.go` `Pool.pick` |

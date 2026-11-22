@@ -52,17 +52,24 @@ func (g *systemModeGate) Known(key string) bool {
 	return true
 }
 
-// Remember 记下该键（已在表内则刷新时间）。超出上限按最旧条目淘汰。
-func (g *systemModeGate) Remember(key string) {
+// Learn 记下该键并刷新时间，返回「是否新学」（表内没有或已过期）。
+//
+// 单锁完成判定 + 写入：调用方据此决定要不要累计 learned_total。此前是
+// Known + Remember 两次加锁，并发首学可能重复计数。超出上限按最旧条目淘汰。
+func (g *systemModeGate) Learn(key string) (newly bool) {
 	if key == "" {
-		return
+		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.m == nil {
 		g.m = make(map[string]time.Time, 8)
 	}
-	g.m[key] = time.Now()
+	now := time.Now()
+	if at, ok := g.m[key]; !ok || now.Sub(at) > systemModeTTL {
+		newly = true
+	}
+	g.m[key] = now
 	for len(g.m) > systemModeMax {
 		oldestKey, oldest := "", time.Time{}
 		for k, at := range g.m {
@@ -75,6 +82,7 @@ func (g *systemModeGate) Remember(key string) {
 		}
 		delete(g.m, oldestKey)
 	}
+	return newly
 }
 
 // Len 返回学习表当前有效条目数（面板「反代劣化」看板用）：顺手清掉过期条目，

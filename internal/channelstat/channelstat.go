@@ -10,7 +10,9 @@
 //   - 本包            记「上游拦了几次、我们用了什么手段救」（全局计数）
 //
 // 存储：data/channel-stats.json，按小时桶（90 天后折叠为日桶），5 分钟防抖落盘。
-// 量级：约 15 类事件 × 90 天小时桶 ≈ 100 KB，一天约 30 MB 写入。
+// 量级：18 类事件 × 90 天小时桶 ≈ 0.5–0.8 MB；脏了就全量重写，一天最多约
+// 288 次 ≈ 150–250 MB 写入。SSD 部署可接受，SD 卡/机械盘部署需留意写放大
+// （事件稀疏时 dirty 不常置位，实际远低于上限）。
 package channelstat
 
 import (
@@ -21,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,16 +61,21 @@ type diskFile struct {
 }
 
 // Point 序列里的一个点（给面板画图）。
+//
+// Kinds 是原始事件计数（事件表/调试用）；Groups 是折算后的四个进图组
+// （refusal/throttle/stream/other），面板堆叠柱直接用它，不再在 JS 里做减法。
 type Point struct {
-	T     string           `json:"t"`
-	Scope string           `json:"scope"`
-	Kinds map[string]int64 `json:"kinds"`
-	Total int64            `json:"total"`
+	T      string           `json:"t"`
+	Scope  string           `json:"scope"`
+	Kinds  map[string]int64 `json:"kinds"`
+	Groups map[string]int64 `json:"groups"`
+	Total  int64            `json:"total"`
 }
 
 // Totals 窗口内的汇总。
 type Totals struct {
 	Kinds  map[string]int64  `json:"kinds"`
+	Groups map[string]int64  `json:"groups"`
 	Total  int64             `json:"total"`
 	LastAt map[string]string `json:"last_at,omitempty"`
 }
@@ -85,6 +93,8 @@ type Ledger struct {
 	stop          chan struct{}
 	done          chan struct{}
 	stopOnce      sync.Once
+	startOnce     sync.Once
+	started       atomic.Bool // Start 是否真的起过后台循环（Stop 判它避免永久阻塞）
 }
 
 // New 创建账本并尝试从 path 恢复；path 为空时禁用落盘。
@@ -105,35 +115,44 @@ func New(path string) *Ledger {
 }
 
 // Start 启动后台落盘循环（5 分钟一次，含 90 天折叠）。Stop 前一直运行。
+//
+// 幂等：重复调用只起一个 goroutine（否则两个 goroutine 会各自 close(done)，
+// Stop 时 panic: close of closed channel）。
 func (l *Ledger) Start() {
 	if l == nil {
 		return
 	}
-	go func() {
-		defer close(l.done)
-		t := time.NewTicker(flushInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-l.stop:
-				l.mu.Lock()
-				l.rollupLocked(time.Now())
-				l.flushLocked()
-				l.mu.Unlock()
-				return
-			case <-t.C:
-				l.mu.Lock()
-				l.rollupLocked(time.Now())
-				l.flushLocked()
-				l.mu.Unlock()
+	l.startOnce.Do(func() {
+		l.started.Store(true)
+		go func() {
+			defer close(l.done)
+			t := time.NewTicker(flushInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-l.stop:
+					l.mu.Lock()
+					l.rollupLocked(time.Now())
+					l.flushLocked()
+					l.mu.Unlock()
+					return
+				case <-t.C:
+					l.mu.Lock()
+					l.rollupLocked(time.Now())
+					l.flushLocked()
+					l.mu.Unlock()
+				}
 			}
-		}
-	}()
+		}()
+	})
 }
 
 // Stop 停止后台循环并做最后一次落盘（含折叠）。
+//
+// 未 Start 过的账本直接返回：此时 done 永远不会被 close，等下去就是永久阻塞
+// （测试/纯内存账本经常只 New 不 Start）。Stop 可重复调用。
 func (l *Ledger) Stop() {
-	if l == nil {
+	if l == nil || !l.started.Load() {
 		return
 	}
 	l.stopOnce.Do(func() { close(l.stop) })
@@ -141,10 +160,10 @@ func (l *Ledger) Stop() {
 }
 
 // Inc 记一次事件（now）。
-func (l *Ledger) Inc(kind string) { l.IncN(kind, 1) }
+func (l *Ledger) Inc(kind Kind) { l.IncN(kind, 1) }
 
 // IncN 记 n 次事件（now）。
-func (l *Ledger) IncN(kind string, n int) {
+func (l *Ledger) IncN(kind Kind, n int) {
 	if l == nil || kind == "" || n <= 0 {
 		return
 	}
@@ -154,7 +173,7 @@ func (l *Ledger) IncN(kind string, n int) {
 }
 
 // AddAt 把 n 次事件记到指定时刻（回填 / 测试用；不影响「最近一次」以外的语义）。
-func (l *Ledger) AddAt(t time.Time, kind string, n int) {
+func (l *Ledger) AddAt(t time.Time, kind Kind, n int) {
 	if l == nil || kind == "" || n <= 0 {
 		return
 	}
@@ -163,19 +182,20 @@ func (l *Ledger) AddAt(t time.Time, kind string, n int) {
 	l.mu.Unlock()
 }
 
-func (l *Ledger) addLocked(t time.Time, kind string, n int) {
+func (l *Ledger) addLocked(t time.Time, kind Kind, n int) {
+	key := string(kind)
 	scope := "h:" + t.Format(hourLayout)
 	b := l.buckets[scope]
 	if b == nil {
 		b = make(map[string]int64, 4)
 		l.buckets[scope] = b
 	}
-	b[kind] += int64(n)
+	b[key] += int64(n)
 	if l.since.IsZero() || t.Before(l.since) {
 		l.since = t
 	}
-	if prev, ok := l.last[kind]; !ok || t.After(prev) {
-		l.last[kind] = t
+	if prev, ok := l.last[key]; !ok || t.After(prev) {
+		l.last[key] = t
 	}
 	l.dirty = true
 }
@@ -233,7 +253,7 @@ func (l *Ledger) Len() int {
 // 柱子挤在一起）。from 零值 = 数据起点；to 零值 = 现在。窗口跨度超过 90 天且
 // 仍要求小时桶时自动降级为日桶（90 天 × 24 点已超出可读范围）。
 func (l *Ledger) Series(from, to time.Time, daily bool) ([]Point, Totals) {
-	totals := Totals{Kinds: map[string]int64{}, LastAt: map[string]string{}}
+	totals := Totals{Kinds: map[string]int64{}, Groups: map[string]int64{}, LastAt: map[string]string{}}
 	if l == nil {
 		return []Point{}, totals
 	}
@@ -250,8 +270,10 @@ func (l *Ledger) Series(from, to time.Time, daily bool) ([]Point, Totals) {
 			from = to.Add(-24 * time.Hour)
 		}
 	}
+	// 未来/倒置起点收敛到窗口末尾：此前是交换 from/to，传一个未来 from 会
+	// 交换出一个未来窗口，返回几十个未来空点（面板自定义区间可触发）。
 	if from.After(to) {
-		from, to = to, from
+		from = to
 	}
 	if !daily && to.Sub(from) > 90*24*time.Hour {
 		daily = true
@@ -293,11 +315,18 @@ func (l *Ledger) Series(from, to time.Time, daily bool) ([]Point, Totals) {
 			totals.Total += n
 		}
 	}
+	totals.Groups = groupsOf(totals.Kinds, totals.Total)
+
+	// 「最近一次」：l.last 可能是本地 time.Now()（进程内事件），也可能是
+	// time.Parse 出来的 UTC（从磁盘恢复）。必须统一到本地时区再按桶对齐，
+	// 否则 UTC 的 00:00 截断结果与本地 from/to 比较会整体错位——生产上
+	// 表现为事件明明有计数、「最近一次」却全是「—」。
 	for k, at := range l.last {
-		if truncate(at, daily).Before(from) || truncate(at, daily).After(to) {
+		local := at.In(time.Local)
+		if truncate(local, daily).Before(from) || truncate(local, daily).After(to) {
 			continue
 		}
-		totals.LastAt[k] = at.Format(time.RFC3339)
+		totals.LastAt[k] = local.Format(time.RFC3339)
 	}
 
 	points := make([]Point, 0, int(to.Sub(from)/step)+1)
@@ -319,10 +348,11 @@ func (l *Ledger) Series(from, to time.Time, daily bool) ([]Point, Totals) {
 			sum += n
 		}
 		points = append(points, Point{
-			T:     t.Format(layout),
-			Scope: scopeLabel,
-			Kinds: kinds,
-			Total: sum,
+			T:      t.Format(layout),
+			Scope:  scopeLabel,
+			Kinds:  kinds,
+			Groups: groupsOf(kinds, sum),
+			Total:  sum,
 		})
 	}
 	return points, totals
@@ -439,13 +469,26 @@ func (l *Ledger) Flush() {
 }
 
 // load 读取账本文件；随后尝试合并一次性回填种子（见 seedPath）。
+//
+// 主文件读取失败（非 NotExist）时**不再**合并种子：种子导入末尾会 flush 覆盖
+// 主账本，一次瞬时读失败就能把主账本替换成只剩种子数据。
 func (l *Ledger) load() error {
-	err := l.loadFile(l.path)
+	if err := l.loadFile(l.path, true); err != nil {
+		return err
+	}
 	l.loadSeed()
-	return err
+	return nil
 }
 
-func (l *Ledger) loadFile(path string) error {
+// loadFile 把文件里的桶累加进账本，并按 replaceMeta 决定元信息语义：
+//   - replaceMeta=true（主账本）：since/last/degrade_last_at/learned_total 以文件为准；
+//   - replaceMeta=false（回填种子）：since 取最早、last 每 kind 取最晚、
+//     degrade_last_at 取最晚、learned_total 累加。
+//
+// 桶一律累加。主文件是权威快照，种子是一次性历史补充，两者不能共用「覆盖」
+// 语义——此前种子缺 learned_total 就会把主账本累计清零，更旧的种子还能把
+// 「上次触发」回滚。
+func (l *Ledger) loadFile(path string, replaceMeta bool) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -470,18 +513,41 @@ func (l *Ledger) loadFile(path string) error {
 			dst[k] += n
 		}
 	}
-	if t, err := time.Parse(time.RFC3339, f.Since); err == nil {
-		l.since = t
-	}
-	for k, v := range f.LastAt {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			l.last[k] = t
+	if replaceMeta {
+		if t, err := time.Parse(time.RFC3339, f.Since); err == nil {
+			l.since = t
 		}
+		for k, v := range f.LastAt {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				l.last[k] = t
+			}
+		}
+		if t, err := time.Parse(time.RFC3339, f.DegradeLastAt); err == nil {
+			l.degradeLastAt = t
+		}
+		l.learnedTotal = f.LearnedTotal
+	} else {
+		if t, err := time.Parse(time.RFC3339, f.Since); err == nil {
+			if l.since.IsZero() || t.Before(l.since) {
+				l.since = t
+			}
+		}
+		for k, v := range f.LastAt {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				continue
+			}
+			if prev, ok := l.last[k]; !ok || t.After(prev) {
+				l.last[k] = t
+			}
+		}
+		if t, err := time.Parse(time.RFC3339, f.DegradeLastAt); err == nil {
+			if t.After(l.degradeLastAt) {
+				l.degradeLastAt = t
+			}
+		}
+		l.learnedTotal += f.LearnedTotal
 	}
-	if t, err := time.Parse(time.RFC3339, f.DegradeLastAt); err == nil {
-		l.degradeLastAt = t
-	}
-	l.learnedTotal = f.LearnedTotal
 	// 恢复后不置 dirty：没有新事件就不该重写文件。
 	return nil
 }
@@ -503,7 +569,7 @@ func (l *Ledger) loadSeed() {
 	if _, err := os.Stat(seed); err != nil {
 		return
 	}
-	if err := l.loadFile(seed); err != nil {
+	if err := l.loadFile(seed, false); err != nil {
 		log.Printf("[channelstat] 回填种子 %s 解析失败: %v", seed, err)
 		return
 	}

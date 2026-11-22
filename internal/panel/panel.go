@@ -154,6 +154,35 @@ func (p *Panel) SetDegradeState(fn func() DegradeState) {
 	p.degradeMu.Unlock()
 }
 
+// MarshalJSON 把零值时间序列化为「字段省略」而不是 0001-01-01T00:00:00Z。
+//
+// time.Time 是结构体，encoding/json 的 omitempty 对结构体不生效（结构体永远
+// 不算「空」），直接下发会让前端把「从未触发」渲染成 01-01 07:36:42（JS 用
+// 公元 1 年的历史时区偏移解析）。这里手写 wire 结构，零值干脆不带字段。
+func (d DegradeState) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		Active        bool   `json:"active"`
+		Until         string `json:"until,omitempty"`
+		LearnedNow    int    `json:"learned_now"`
+		LearnedTotal  int64  `json:"learned_total"`
+		DegradeLastAt string `json:"degrade_last_at,omitempty"`
+		Mode          string `json:"mode"`
+	}
+	w := wire{
+		Active:       d.Active,
+		LearnedNow:   d.LearnedNow,
+		LearnedTotal: d.LearnedTotal,
+		Mode:         d.Mode,
+	}
+	if !d.Until.IsZero() {
+		w.Until = d.Until.Format(time.RFC3339)
+	}
+	if !d.DegradeLastAt.IsZero() {
+		w.DegradeLastAt = d.DegradeLastAt.Format(time.RFC3339)
+	}
+	return json.Marshal(w)
+}
+
 // currentDegradeState 读当前状态快照；未接线 → ok=false。
 func (p *Panel) currentDegradeState() (DegradeState, bool) {
 	p.degradeMu.RLock()

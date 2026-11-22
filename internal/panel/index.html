@@ -1079,18 +1079,50 @@ body[data-view="config"] #toasts { bottom: 84px; }
   .uschart-hd .sw-total { background: var(--accent); }
   .uschart-hd .sw-cn { background: var(--chart-2); }
   .uschart-hd .sw-gl { background: var(--chart-3); }
-  /* 反代劣化 100% 堆叠柱：交互与 usbar 同款，类名分开便于分别断言 */
+  /* 反代通道拦截事件堆叠柱：交互与 usbar 同款，类名分开便于分别断言 */
   .uschart-body rect.dbar { transition: opacity .12s; }
   .uschart-body rect.dbar:hover { opacity: .82; }
-  /* 降级状态条：一排只读 chip（不是筛选按钮，故不复用 .chips 的按钮规格） */
-  .dginfo { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 12px; }
-  .dchip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
+  /* ── 通道健康：覆盖条 / 状态徽标 / 事实 chip / 分段控件 / 图表辅助 ────── */
+  .ch-hd { flex-wrap: wrap; gap: 8px; }
+  .ch-auto { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--fs-label); }
+  .ch-auto select { height: var(--h-ctl); width: auto; }
+  .ch-cover { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+    padding: 0 14px 8px; color: var(--ink-3); font-size: var(--fs-label); }
+  .ch-cover .ch-sep { opacity: .45; }
+  .ch-state { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 14px 12px; }
+  .ch-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px;
+    border: 1px solid var(--line-soft); border-radius: var(--r-pill);
+    font-weight: 600; font-size: var(--fs-label); }
+  .ch-badge.ok { color: var(--ok); border-color: var(--ok); }
+  .ch-badge.warn { color: var(--warn); border-color: var(--warn); }
+  .ch-badge.mute { color: var(--ink-3); }
+  .ch-fact { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px;
     border: 1px solid var(--line-soft); border-radius: var(--r-pill);
     background: var(--surface-2); color: var(--ink-2); font-size: var(--fs-label); }
-  .dchip b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
-  .dchip.ok { border-color: var(--ok); color: var(--ok); }
-  .dchip.warn { border-color: var(--warn); color: var(--warn); }
-  .dchip.bad { border-color: var(--bad); color: var(--bad); }
+  .ch-fact b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .seg { display: inline-flex; border: 1px solid var(--line-soft); border-radius: var(--r-pill); overflow: hidden; }
+  .seg button { border: 0; background: none; padding: 3px 10px; font-size: var(--fs-label);
+    color: var(--ink-3); cursor: pointer; }
+  .seg button.on { background: var(--surface-2); color: var(--ink); font-weight: 600; }
+  .seg[hidden] { display: none; }
+  .ch-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 0 14px 6px; }
+  .uschart-body rect.chgap { fill: var(--line-soft); opacity: .35; }
+  .uschart-body line.chmark { stroke: var(--ink-3); stroke-dasharray: 3 3; opacity: .55; }
+  .uschart-body rect.chhit { fill: transparent; }
+  .uschart-body rect.chhit:hover { fill: var(--accent); opacity: .06; }
+  .acc th[data-sort] { cursor: pointer; user-select: none; }
+  .acc th[data-sort]:hover { color: var(--ink); }
+  .acc th[aria-sort="ascending"]::after { content: " ▲"; font-size: var(--fs-meta); color: var(--accent); }
+  .acc th[aria-sort="descending"]::after { content: " ▼"; font-size: var(--fs-meta); color: var(--accent); }
+  td.ch-hint { max-width: 34em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); }
+  .ch-rate { display: inline-block; width: 64px; height: 5px; margin-right: 8px; border-radius: 3px;
+    background: var(--line); vertical-align: middle; overflow: hidden; }
+  .ch-rate i { display: block; height: 100%; background: var(--ok); }
+  .ch-error { padding: 14px; color: var(--bad); display: flex; align-items: center; gap: 10px; }
+  .kpis.ch-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .ch-legend .sw { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  @media (max-width: 760px) { td.ch-hint { white-space: normal; max-width: none; } }
+  @media (max-width: 700px) { .kpis.ch-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
   /* 用量表内的 prompt/completion 占比条。用 .us-mix 而不是复用账号池的 .bar：
      全局 .bar 是块级容器（积分条），同优先级下会互相覆盖（v1.9.0 回归）。 */
@@ -1358,7 +1390,7 @@ button.ghost.danger:hover:not(:disabled) {
         积分构成</a></li>
       <li><a href="#channel" data-view="channel">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.8 3.2h12.4"/><path d="M2.4 12.4l3-4.4 2.6 2.3 3-4.9 2.6 3.4"/><path d="M2.4 14.2h11.2"/></svg>
-        反代劣化</a></li>
+        通道健康</a></li>
       <li class="nav-sec" aria-hidden="true">运行</li>
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
@@ -1397,7 +1429,7 @@ button.ghost.danger:hover:not(:disabled) {
       <button class="icon ghost" id="btnTheme" title="主题：跟随系统（点击切换：跟随系统 → 浅色 → 深色）" aria-label="切换主题" aria-live="polite">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
-      <button id="btnRefresh">刷新</button>
+      <button id="btnRefresh" title="向上游查询全部账号的真实余额并回写（不是刷新本页数据）">刷新余额</button>
       <button class="primary" id="btnAdd">添加账号</button>
      </div>
     </div>
@@ -1729,33 +1761,50 @@ button.ghost.danger:hover:not(:disabled) {
       </div>
     </section>
 
-    <!-- 反代劣化：上游对反代通道的识别与拦截随时间的劣化趋势 -->
+    <!-- 通道健康（反代劣化）：上游拦截与出站改写 -->
     <section class="view" id="view-channel" hidden>
       <div class="box">
-        <header>
-          <h3>反代通道劣化<span class="hint" title="上游怎么对待我们：11-128 通道校验、内容拦截、模型下线、限流、WAF、流中断。事件计数来自网关决策点（含被救回的请求），失败率来自用量账本，分域来自请求归档。">上游拦截强度</span></h3>
+        <header class="ch-hd">
+          <h3>通道健康<span class="hint" title="上游怎么对待我们：11-128 通道校验、内容拦截、模型下线、限流、WAF、流中断；以及我们为了让请求过通道做了多少出站改写。">上游拦截与出站改写</span></h3>
           <span class="grow"></span>
-          <span class="note" id="dgNote">—</span>
+          <span class="note" id="dgUpdated">—</span>
           <span class="trange" id="dgRange"></span>
+          <label class="ch-auto"><span class="lb">自动刷新</span>
+            <select id="dgAuto" class="xs" aria-label="自动刷新间隔">
+              <option value="0">关</option>
+              <option value="30">30 秒</option>
+              <option value="60" selected>60 秒</option>
+              <option value="300">5 分钟</option>
+            </select>
+          </label>
           <button class="xs" id="btnDg">刷新</button>
         </header>
-        <div class="kpis k6" id="dgStats"></div>
+        <div class="ch-cover" id="dgCover">—</div>
+        <div class="ch-state" id="dgState"></div>
+        <div class="kpis k6 ch-kpis" id="dgStats"></div>
         <div class="pad">
-          <div class="dginfo" id="dgState"></div>
           <div class="uschart">
             <div class="uschart-hd">
-              <span class="lb">拦截事件</span>
-              <span class="note" id="dgEventNote">—</span>
+              <span class="lb">趋势</span>
+              <span class="seg" id="dgMeasure" role="group" aria-label="度量">
+                <button type="button" data-m="intercept" class="on">拦截事件</button>
+                <button type="button" data-m="rewrite">出站改写</button>
+              </span>
+              <span class="seg" id="dgMode" role="group" aria-label="量纲">
+                <button type="button" data-mode="abs" class="on">绝对量</button>
+                <button type="button" data-mode="per1k">每千请求</button>
+              </span>
               <span class="grow"></span>
-              <span class="legend" id="dgLegend"></span>
+              <span class="note" id="dgTrendNote">—</span>
             </div>
-            <div id="dgEventChart" class="uschart-body"></div>
+            <div class="legend ch-legend" id="dgTrendLegend"></div>
+            <div id="dgTrendChart" class="uschart-body"></div>
           </div>
           <div class="uschart">
             <div class="uschart-hd">
               <span class="lb">失败率</span>
-              <span class="note" id="dgRateNote">—</span>
               <span class="grow"></span>
+              <span class="note" id="dgRateNote">—</span>
               <span class="legend" id="dgRateLegend"></span>
             </div>
             <div id="dgRateChart" class="uschart-body"></div>
@@ -1770,9 +1819,13 @@ button.ghost.danger:hover:not(:disabled) {
           <span class="note" id="dgKindNote">—</span>
         </header>
         <div class="tbl-wrap">
-          <table class="acc zebra">
+          <table class="acc zebra" id="dgKindTable">
             <thead><tr>
-              <th>类型</th><th class="num">次数</th><th class="num">每千请求</th><th>最近一次</th>
+              <th data-sort="label">类型</th>
+              <th class="num" data-sort="count">次数</th>
+              <th class="num" data-sort="per1k">每千请求</th>
+              <th data-sort="last">最近一次</th>
+              <th>说明</th>
             </tr></thead>
             <tbody id="dgKindBody"></tbody>
           </table>

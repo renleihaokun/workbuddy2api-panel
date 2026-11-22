@@ -20,9 +20,8 @@ type degradeGate struct {
 
 // Active 当前是否处于降级期（now < until）。
 func (g *degradeGate) Active() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return time.Now().Before(g.until)
+	active, _ := g.Status()
+	return active
 }
 
 // Status 返回降级状态快照（面板「反代劣化」看板用）：是否在降级期 + 重置时刻。
@@ -34,14 +33,18 @@ func (g *degradeGate) Status() (active bool, until time.Time) {
 }
 
 // Trigger 触发降级，直到次日 00:00 CST（Asia/Shanghai）。
-// 已在降级期内则不续期（保持最早触发点的 00:00 重置语义）。
-func (g *degradeGate) Trigger() {
+// 返回是否**新开窗口**：已在降级期内不续期、返回 false（保持最早触发点的
+// 00:00 重置语义）。调用方据此决定要不要记 degrade_trigger 事件——事件按
+// 「降级窗口」计一次，而不是按撞墙的请求数计。
+func (g *degradeGate) Trigger() (started bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if !time.Now().Before(g.until) {
-		// 已过期/未触发 → 设新的 until；未过期则保持原 until（不续期）。
-		g.until = nextMidnightCST(time.Now())
+	now := time.Now()
+	if now.Before(g.until) {
+		return false
 	}
+	g.until = nextMidnightCST(now)
+	return true
 }
 
 // nextMidnightCST 返回 now 之后最近的 Asia/Shanghai 00:00 时刻（纯函数，方便单测）。

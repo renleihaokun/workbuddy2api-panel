@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -881,8 +882,10 @@ type Client struct {
 
 	// channelEvents 通道事件上报回调（反代通道看板）：role 归一 / 指纹清洗等
 	// 「改写工作量」在这里上报，与请求成败无关。main 装配期注入，nil = 不统计。
+	// 类型用 channelstat.Kind（词表在 channelstat/kind.go，本包只依赖这个 leaf
+	// 包，不反向依赖账本实现）。
 	channelMu     sync.RWMutex
-	channelEvents func(kind string, n int)
+	channelEvents func(kind channelstat.Kind, n int)
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
@@ -1062,10 +1065,10 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// 改写统计上报（反代通道看板）：这两个数字是「为了让请求过通道，我们改了多少
 	// 东西」的直接度量——与请求最终成败无关，所以在 prepareBody 这一层记最准。
 	if stats.RoleNormalized > 0 {
-		c.noteChannelEvent("role_normalized", stats.RoleNormalized)
+		c.noteChannelEvent(channelstat.KindRoleNormalized, stats.RoleNormalized)
 	}
 	if stats.Sanitized > 0 {
-		c.noteChannelEvent("sanitize", stats.Sanitized)
+		c.noteChannelEvent(channelstat.KindSanitize, stats.Sanitized)
 	}
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
@@ -1075,14 +1078,14 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 
 // SetChannelEvents 注入通道事件回调（main 装配期接线到 internal/channelstat）。
 // nil 时零开销：上游包不依赖看板，只认一个函数。
-func (c *Client) SetChannelEvents(fn func(kind string, n int)) {
+func (c *Client) SetChannelEvents(fn func(kind channelstat.Kind, n int)) {
 	c.channelMu.Lock()
 	c.channelEvents = fn
 	c.channelMu.Unlock()
 }
 
 // noteChannelEvent 上报一次通道事件（未注入时零开销）。
-func (c *Client) noteChannelEvent(kind string, n int) {
+func (c *Client) noteChannelEvent(kind channelstat.Kind, n int) {
 	if n <= 0 {
 		return
 	}

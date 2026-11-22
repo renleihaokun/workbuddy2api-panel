@@ -24,7 +24,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -110,7 +109,7 @@ type Config struct {
 }
 
 // noteEvent 记一次通道事件（未注入计数器时零开销）。
-func (h *Handler) noteEvent(kind string) {
+func (h *Handler) noteEvent(kind channelstat.Kind) {
 	if h.cfg.ChannelStats != nil && kind != "" {
 		h.cfg.ChannelStats.Inc(kind)
 	}
@@ -119,31 +118,40 @@ func (h *Handler) noteEvent(kind string) {
 // noteKind 把上游分类映射成通道事件。
 // 只记与「通道 / 配额 / 容量」相关的类型：请求级错误（参数错、上下文超长、
 // 图片无效、账号故障）换任何账号都一样失败，与通道劣化无关，记了只会稀释信号。
+//
+// 用显式 switch 而不是 kind.String()：Kind 词表是独立命名空间（见
+// internal/channelstat/kind.go），ErrKind 改名/新增时这里不会静默换桶。
 func (h *Handler) noteKind(kind upstream.ErrKind) {
 	switch kind {
-	case upstream.ErrChannelRefused, // 11-128 通道校验（核心信号）
-		upstream.ErrContentBlocked, // 内容策略拦截
-		upstream.ErrModelBusy,      // 14003 模型忙
-		upstream.ErrUpstreamBusy,   // 6021 渠道满载
-		upstream.ErrWafBlock,       // 403 WAF
-		upstream.ErrModelBlocked,   // 11102 模型不可用
-		upstream.ErrSoftRate,       // 429 软限流（含 6004 模型级限流）
-		upstream.ErrHardCredit:     // 402 余额不足
-		h.noteEvent(kind.String())
+	case upstream.ErrChannelRefused: // 11-128 通道校验（核心信号）
+		h.noteEvent(channelstat.KindChannelRefused)
+	case upstream.ErrContentBlocked: // 内容策略拦截
+		h.noteEvent(channelstat.KindContentBlocked)
+	case upstream.ErrModelBusy: // 14003 模型忙
+		h.noteEvent(channelstat.KindModelBusy)
+	case upstream.ErrUpstreamBusy: // 6021 渠道满载
+		h.noteEvent(channelstat.KindUpstreamBusy)
+	case upstream.ErrWafBlock: // 403 WAF
+		h.noteEvent(channelstat.KindWafBlock)
+	case upstream.ErrModelBlocked: // 11102 模型不可用
+		h.noteEvent(channelstat.KindModelBlocked)
+	case upstream.ErrSoftRate: // 429 软限流（含 6004 模型级限流）
+		h.noteEvent(channelstat.KindSoftRate)
+	case upstream.ErrHardCredit: // 402 余额不足
+		h.noteEvent(channelstat.KindHardCredit)
 	}
 }
 
 // rememberSystem 记住「必须伪装成 user」的 system 指纹，并累计**新学到的**条数。
 //
-// 只在首次学习时计数：成功路径的 Remember 同时承担「滑窗续期」职责，每次伪装
+// 只在首次学习时计数：成功路径的 Learn 同时承担「滑窗续期」职责，每次伪装
 // 请求都会调一次——按调用次数计会把「同一个指纹用了一百次」记成学习一百次。
+// 单锁完成判定 + 写入（Learn 返回是否新学），并发首学不会重复计数。
 func (h *Handler) rememberSystem(key string) {
 	if key == "" {
 		return
 	}
-	known := h.sysMode.Known(key)
-	h.sysMode.Remember(key)
-	if !known && h.cfg.ChannelStats != nil {
+	if h.sysMode.Learn(key) && h.cfg.ChannelStats != nil {
 		h.cfg.ChannelStats.AddLearned(1)
 	}
 }
@@ -797,6 +805,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tried := map[string]bool{}
+	// clientGone 客户端在本请求中途断连：不罚号、不记失败归因，循环后直接返回。
+	clientGone := false
 	var lastErr error
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
@@ -935,16 +945,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
-	degradedApplied := false
-	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
-		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
-		body = prompt.Append(body, h.cfg.PromptText)
-	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
-		body = prompt.Rewrite(body, prompt.Degraded)
-		degradedApplied = true
-		st.degraded = true
-	}
+	// 改写/搬移/降级的状态机集中在 channelAdapt（channel.go），这里只留调用点。
+	adapt := newChannelAdapt(h, st)
+	body = adapt.RewritePrompt(body)
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
@@ -998,18 +1001,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   层 2：撞 11-128 → 同账号、同请求内伪装重发一次（见下）；
 	//   层 3：成功后记住该段 system，后续请求直接走伪装；
 	//   层 4：伪装后仍被拒 → 立即 400 + hint 终止，只试一次不循环。
-	sysText := prompt.SystemText(body)
-	sysKey := systemModeKey(sysText)
-	systemConverted := false
-	var channelRefusedConverted bool
-	if h.systemAsUserEnabled() && sysKey != "" && h.sysMode.Known(sysKey) {
-		// 已学习：直接以搬移形态出站。nil = 已无可搬内容（幂等保护）。
-		if moved := prompt.SystemAsUser(body, prompt.Degraded); moved != nil {
-			body = moved
-			systemConverted = true
-			st.sysAsUser = true
-		}
-	}
+	body = adapt.ApplyLearned(body)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
@@ -1131,27 +1123,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// system→user 搬移重试（层 2）：只看「身份句被拒」这一类 11-128——结构性
 		// 拒绝（首条不是 system、缺会话 id）搬了也没用，直接跳过。同账号、同请求内
 		// 重发一次；不罚号、不退避、不占换号名额（inline 重发，MaxRotate=1 也能重试）。
-		// 只做一次：systemConverted 置位后，再撞 11-128 走下方终止分支（层 4）。
-		if status >= 400 && !systemConverted && h.systemAsUserEnabled() &&
-			attemptKind(status, respBody, uerr) == upstream.ErrChannelRefused &&
-			upstream.IsSystemMovedRefusal(string(respBody)) {
-			if moved := prompt.SystemAsUser(body, prompt.Degraded); moved != nil {
-				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
-				systemConverted = true
-				st.sysAsUser = true
-				// 通道事件：上游把请求判成「非官方客户端」→ 我们用 system→user 搬移救回。
-				// 这是反代通道劣化的核心信号，与本次请求最终成败无关（救回也是成功）。
-				h.noteEvent("channel_refused")
-				h.noteEvent("sys_as_user")
-				body = moved
-				log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
-					logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(sysKey))
-				attemptStarted = time.Now()
-				rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
-				uerr = nil
-				if errors.As(terr, &uerr) {
-					status = uerr.Status
-				}
+		// 只做一次：adapt.sysConverted 置位后，再撞 11-128 走下方终止分支（层 4）。
+		if moved, ok := adapt.TrySystemAsUser(body, status, respBody, uerr); ok {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+			body = moved
+			log.Printf("INFO: [server] channel refused acct=%s model=%s -> systemAsUser retry (sys=%s)",
+				logfmt.Label(acct.UID, acct.Nickname), bareModel, systemModeKeyShort(adapt.sysKey))
+			attemptStarted = time.Now()
+			rc, status, respBody, terr = h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+			uerr = nil
+			if errors.As(terr, &uerr) {
+				status = uerr.Status
 			}
 		}
 		if uerr == nil && terr != nil {
@@ -1165,15 +1147,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 判定三态：net.Error.Timeout()（ResponseHeaderTimeout / Client.Timeout）、
 			// 显式 deadline（DeadlineExceeded / os.ErrDeadlineExceeded）、以及
 			// **客户端仍在但 ctx 被取消**——那只能是我们自己的空闲看门狗掐的流，
-			// 也就是上游停滞。客户端主动断连时 r.Context() 已取消，走下面的抖动分支。
+			// 也就是上游停滞。客户端主动断连时 r.Context() 已取消，走下面的断连分支。
 			if isUpstreamTimeout(terr, r.Context().Err() != nil) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				st.fail("timeout")
-				h.noteEvent("timeout")
+				h.noteEvent(channelstat.KindTimeout)
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
+				break
+			}
+			// 客户端已断连：上游调用被 ctx 取消，不是账号/上游的问题。只结束轮转，
+			// 不罚号、不喂连败、不记失败归因（人已走，没有可服务的对象）。
+			// 此前这里落到下面的「网络抖动」分支：5 次 Ctrl-C 就把健康号连败降权
+			// 10 分钟，且归档记一条 transport_error。
+			if r.Context().Err() != nil {
+				clientGone = true
+				st.outcome = reqlog.OutcomeInterrupted
+				st.status = http.StatusOK
 				break
 			}
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
@@ -1207,26 +1199,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 学习（层 3）：伪装后通道校验不再被拒（任何非 11-128 的结果都说明
 			// 通道过了）→ 记住这段 system 原文。反向不学：伪装后仍是 11-128 说明
 			// 指纹在 assistant/tool 历史里搬不走，记下来只会让后续请求白走伪装。
-			if systemConverted && kind != upstream.ErrChannelRefused && sysKey != "" {
-				h.rememberSystem(sysKey)
-			}
+			adapt.RememberOnPass(kind)
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
 			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
-				h.degrade.Trigger()
-				// 降级触发时刻落盘：进程内状态重启清零，看板需要「上次触发」。
-				if h.cfg.ChannelStats != nil {
-					h.cfg.ChannelStats.MarkDegrade(time.Now())
-				}
-				h.noteEvent("degrade_trigger")
-				body = prompt.Rewrite(body, prompt.Degraded)
-				degradedApplied = true
-				// system 已整段换成 Degraded → 学习键必须重算：否则 11-128 分支会拿
-				// 旧 system 的键去判断/记录新形态，学习表与实际出站 body 脱节。
-				sysKey = systemModeKey(prompt.SystemText(body))
+			if out, ok := adapt.TryDegraded(body, kind); ok {
+				body = out
+				// 记下本次内容拦截：若循环耗尽（MaxRotate=1 或抢不到号），末端要回
+				// 400 content_blocked，而不是把确定的内容拦截报成 503 无号可用。
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
 				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 				releaseHeld()
 				log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
@@ -1349,7 +1332,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-				channelRefusedConverted = systemConverted
 				break
 			}
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
@@ -1371,9 +1353,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 学习（层 3，成功路径）：伪装后这一跳真的成功了 → 同样记住这段 system。
 		// 已学习的键在这里刷新 TTL（滑窗：还在用的提示词不因过期被重新撞一次 400）。
-		if systemConverted && sysKey != "" {
-			h.rememberSystem(sysKey)
-		}
+		adapt.RememberOnPass(upstream.ErrNone)
 		// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 		// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核），
 		// 此前在读第一帧之前就 NoteSuccess + 清 11102 负缓存 + 绑粘性 → 被限流的号
@@ -1407,7 +1387,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				st.outcome = reqlog.OutcomeStreamError
 				st.fail("empty_stream")
-				h.noteEvent("empty_stream")
+				h.noteEvent(channelstat.KindEmptyStream)
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			case errFrame != "":
 				// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并
@@ -1418,11 +1398,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, errFrame, bareModel, nil)
 				st.status = http.StatusServiceUnavailable
 				st.outcome = reqlog.OutcomeStreamError
-				st.fail(kind.String())
+				errKind := kind.String()
+				if kind == upstream.ErrNone {
+					// 判不出分类的 error 帧：归档归 stream_error，不要制造 "none" 分类
+					// （事件表里没有对应标签，读起来像 bug）。
+					errKind = "stream_error"
+				}
+				st.fail(errKind)
 				// 通道事件：流内 11-128 / 限流 / 内容拦截同样计入——这类拒绝发生在
 				// 已经 200 之后，归档里是 stream_error，看板不数就永远看不见。
 				h.noteKind(kind)
-				h.noteEvent("stream_error")
+				h.noteEvent(channelstat.KindStreamError)
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
 			case sErr != nil:
@@ -1432,14 +1418,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					st.status = http.StatusBadGateway
 					st.outcome = reqlog.OutcomeStreamError
 					st.fail("stream_read_error")
-					h.noteEvent("stream_read_error")
+					h.noteEvent(channelstat.KindStreamReadError)
 					log.Printf("WARN: [server] stream acct=%s model=%s: upstream read error: %v",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
 					break
 				}
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
+				// 清掉前一轮失败分类：否则归档会同时记 Interrupted 和一条旧 err_kind。
 				st.outcome = reqlog.OutcomeInterrupted
+				st.succeed()
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				if sessKey != "" && h.cfg.Session != nil {
@@ -1467,7 +1455,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 			if st.hasCache {
 				if cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss) {
-					h.noteEvent("cache_miss")
+					h.noteEvent(channelstat.KindCacheMiss)
 				}
 			}
 			if n := repair.Converted(); n > 0 {
@@ -1508,6 +1496,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.As(err, &ue) {
 				// 上游 200 + error 帧（Aggregate 已识别并上抛）：按分类处置账号。
 				// 可重试类（6004/账号故障/5xx/硬额度）继续换号；请求级错误立即回。
+				// 通道事件与流式路径同口径：同样的 11-128/限流/内容拦截，流式会计、
+				// 非流式也必须计（否则同一类劣化在两种 wire 形态下统计不一致）。
+				h.noteKind(ue.Kind)
 				h.applyErrorPolicy(acct.UID, ue.Kind, upstreamBody(ue), bareModel, ue)
 				fail(acct.UID)
 				if terminalUpstreamError(ue.Kind) {
@@ -1552,7 +1543,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
 		if st.hasCache {
 			if cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss) {
-				h.noteEvent("cache_miss")
+				h.noteEvent(channelstat.KindCacheMiss)
 			}
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -1572,6 +1563,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.hasCredit = true
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 		}
+		return
+	}
+	// 客户端中途断连：上游调用被 ctx 取消，不是账号/上游问题。没有可服务的对象，
+	// 不写响应、不记失败归因（trace 已记 Interrupted，见传输层断连分支）。
+	if clientGone {
 		return
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。
@@ -1600,10 +1596,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		hint = h.hintOf(ue.Kind, upstreamBody(ue), bareModel, reqHasImage, ue)
 		// system→user 伪装已尝试仍被拒：指纹在 assistant/tool 历史里搬不走，
 		// 给可操作指向（不改写上游原文 message，只并列补充 gateway_hint）。
-		if ue.Kind == upstream.ErrChannelRefused && channelRefusedConverted {
+		if ue.Kind == upstream.ErrChannelRefused && adapt.SysConverted() {
 			hint += "; the system prompt was moved into a user message but the request was still rejected — the fingerprint is likely in assistant/tool history; trim those messages or keep fingerprint sanitizing enabled"
 		}
 		switch ue.Kind {
+		case upstream.ErrContentBlocked:
+			// 降级重试已排队但循环耗尽（MaxRotate=1 / 抢不到号）：这是确定的
+			// 内容拦截，换号无意义，回 400 而不是 503「无号可用」。
+			status = http.StatusBadRequest
+			code = "content_blocked"
 		case upstream.ErrSoftRate:
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"

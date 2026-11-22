@@ -530,7 +530,7 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', channel: '反代劣化', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', channel: '通道健康', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -3997,55 +3997,63 @@ if ($('btnExpFold')) {
 }
 applyExpFold();
 
-/* ══ 反代劣化看板 ═══════════════════════════════════════════════════════
-   看的是「上游怎么对待我们」，不是「请求最终成功没有」。
+/* ══ 通道健康（反代劣化）看板 ═══════════════════════════════════════════
+   看的是「上游怎么对待我们」+「我们为了让请求过通道改了多少东西」。
 
-   11-128 被 system→user 搬移救回后终态是 200，用请求归档画成功率永远看不出劣化；
-   这里改用网关决策点上的事件计数（channel_health 的 events 段）：主图是拦截事件
-   堆叠柱，副图是失败率折线（量程固定小，0.3% 也看得见）。 */
+   两条曲线分工：
+     - 拦截事件：channel_refused / 限流 / 流中断 / 其他，按请求计（可切每千请求）；
+     - 出站改写：role_normalized / sanitize，按消息条数计，独立 y 轴。
+   11-128 被 system→user 搬移救回后终态是 200，用终态成功率永远看不出劣化；
+   这里用网关决策点上的事件计数（channel_health 的 events 段）。
+
+   口径与容错：
+     - x 轴用窗口边界定域（不是数据首末点），停机断档不会被画成连续曲线；
+     - 窗口起点到 events.since 之间画覆盖带，明确「这段时间没有事件数据」；
+     - 桶时间按服务端时区（API 的 tz）解析，标签按浏览器本地时区显示；
+     - 每桶一个透明命中区，tooltip 汇总全部系列 + 请求/失败 + 改写量。 */
 
 let channelData = null;
+let chMeasure = 'intercept';       // intercept | rewrite
+let chMode = 'abs';                // abs | per1k（仅拦截视图）
+let chSortKey = '';                // '' = 注册表顺序
+let chSortDir = 1;
+let chAutoSec = 60;
+let chTimer = null;
 
-/* CH_EVENT_SERIES 事件分组：只放「上游动作 + 本地观测」里量级相近的几类。
-   刻意不放两类：① sys_as_user 与 channel_refused 几乎一一对应（每次拦截都尝试搬移），
-   叠在一起等于把同一件事画两遍；② sanitize / role_normalized 是**按消息条数**计的工作量
-   （7 天 7k+），和「按请求计」的拦截事件差两个数量级，混进来会把柱子压平。
-   两者都在 KPI 与事件表里。kinds=null 表示「其余」= 桶内 total − 已列 kinds 之和。 */
-const CH_EVENT_SERIES = [
-  { key: 'channel_refused', label: '通道拒绝', color: 'var(--bad)', kinds: ['channel_refused'] },
-  { key: 'throttled', label: '限流·容量', color: 'var(--chart-4)',
-    kinds: ['soft_rate', 'hard_credit', 'model_busy', 'upstream_busy', 'waf_block', 'model_blocked'] },
-  { key: 'stream', label: '流中断·超时', color: 'var(--chart-2)',
-    kinds: ['stream_error', 'stream_read_error', 'empty_stream', 'timeout'] },
-  { key: 'other', label: '其他', color: 'var(--ink-3)', kinds: null },
-];
+try {
+  chMeasure = localStorage.getItem('wb2api.ch.measure') || 'intercept';
+  chMode = localStorage.getItem('wb2api.ch.mode') || 'abs';
+  chAutoSec = Number(localStorage.getItem('wb2api.ch.auto') || 60);
+} catch (e) { /* 隐私模式：用默认值 */ }
+if (chMeasure !== 'intercept' && chMeasure !== 'rewrite') chMeasure = 'intercept';
+if (chMode !== 'abs' && chMode !== 'per1k') chMode = 'abs';
+if ([0, 30, 60, 300].indexOf(chAutoSec) < 0) chAutoSec = 60;
 
-/* chOtherKinds 不进图的类型：由 KPI / 事件表单独呈现（见上面的取舍说明）。 */
-const CH_OFFCHART_KINDS = ['sys_as_user', 'sanitize', 'role_normalized'];
+/* CH_GROUP_COLOR 进图组配色（颜色是展示层，留在前端；后端只下发 key/label）。 */
+const CH_GROUP_COLOR = {
+  refusal: 'var(--bad)',
+  throttle: 'var(--chart-4)',
+  stream: 'var(--chart-2)',
+  other: 'var(--ink-3)',
+};
+function chGroupColor(key) { return CH_GROUP_COLOR[key] || 'var(--ink-3)'; }
 
-/* chSeriesCount 取某个桶里某系列的数量（other 走「剩余」口径：桶内 total 减掉
-   所有已列 kinds 与不进图的 kinds，见 CH_OFFCHART_KINDS）。 */
-function chSeriesCount(pt, s) {
-  const kinds = (pt && pt.kinds) || {};
-  if (s.kinds) {
-    let n = 0;
-    for (const k of s.kinds) n += Number(kinds[k] || 0);
-    return n;
-  }
-  let listed = 0;
-  for (const x of CH_EVENT_SERIES) {
-    if (!x.kinds) continue;
-    for (const k of x.kinds) listed += Number(kinds[k] || 0);
-  }
-  for (const k of CH_OFFCHART_KINDS) listed += Number(kinds[k] || 0);
-  return Math.max(0, Number(pt && pt.total || 0) - listed);
+/* chGroupCount 取某个桶里某组的数量；groups 由后端算好（other 已倒推并 clamp）。 */
+function chGroupCount(pt, key) {
+  return Number(((pt && pt.groups) || {})[key] || 0);
 }
 
-/* chChartTotal 桶内「进图的事件数」合计（不含脱敏改写与搬移重试）。 */
+/* chChartTotal 桶内「进图事件数」合计（不含出站改写）。 */
 function chChartTotal(pt) {
+  const g = (pt && pt.groups) || {};
   let n = 0;
-  for (const s of CH_EVENT_SERIES) n += chSeriesCount(pt, s);
+  for (const k in g) n += Number(g[k] || 0);
   return n;
+}
+
+function chNum(v) {
+  const n = Number(v || 0);
+  return n > 0 ? fmtTok(n) : '0';
 }
 
 function chPct(part, total) {
@@ -4054,315 +4062,718 @@ function chPct(part, total) {
   return (Number(part || 0) / t * 100).toFixed(1) + '%';
 }
 
-function chNum(v) {
-  const n = Number(v || 0);
-  return n > 0 ? fmtTok(n) : '0';
-}
-
 /* chNarrow 窄屏判定：440 宽 viewBox + 更少刻度（与用量图同口径）。 */
 function chNarrow() {
   return typeof matchMedia === 'function' && matchMedia('(max-width: 760px)').matches;
 }
 
-/* chTicks 取等距目标最近的真实点（去重），用于 x 轴标签。 */
-function chTicks(pts, count) {
-  const out = [];
-  if (!pts.length) return out;
-  const t0 = pts[0].t;
-  const span = Math.max(1, pts[pts.length - 1].t - t0);
-  const used = new Set();
-  for (let k = 0; k < count; k++) {
-    const target = t0 + span * (count === 1 ? 0.5 : k / (count - 1));
-    let bi = 0, best = Infinity;
-    for (let i = 0; i < pts.length; i++) {
-      const dd = Math.abs(pts[i].t - target);
-      if (dd < best) { best = dd; bi = i; }
+/* chTZOffsetMin 把 "+08:00"/"-05:00" 解析成分钟；非法返回 null。 */
+function chTZOffsetMin(tz) {
+  const m = /^([+-])(\d{2}):(\d{2})$/.exec(String(tz || ''));
+  if (!m) return null;
+  return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+}
+
+function chLocalOffsetMin() { return -new Date().getTimezoneOffset(); }
+
+/* chPointTime 把桶键按**服务端时区**解析成绝对毫秒。
+   桶键是服务端本地时间（不带偏移），直接 new Date 会按浏览器时区解释；
+   生产宿主是 UTC、浏览器是 UTC+8 时会整体差 8 小时。tz 缺失/非法时回落旧行为。 */
+function chPointTime(p, tz) {
+  const off = String(tz || '');
+  const s = p.t.length === 13 ? p.t + ':00:00' + off : p.t + 'T00:00:00' + off;
+  const ms = Date.parse(s);
+  if (Number.isFinite(ms)) return ms;
+  return parsePointTime(p);
+}
+
+/* chBucketTitle 桶的完整时间（日桶按服务端日历日标注）。 */
+function chBucketTitle(p, tz) {
+  const server = chTZOffsetMin(tz);
+  if (p.scope === 'day') {
+    return p.t + (server !== null && server !== chLocalOffsetMin() ? '（服务端日）' : '');
+  }
+  const d = new Date(chPointTime(p, tz));
+  return fmtLocalDateTime(d.getTime());
+}
+
+/* chAxisLabel x 轴刻度：日桶按**服务端日历日**（MM-DD），小时桶按浏览器本地时区
+   （MM-DD HH:00）。日桶是一个服务端日历日，用浏览器时区取日期会在 UTC-5 之类
+   的时区把「11-21 日桶」标成 11-20，和 tooltip/柱子的语义对不上。 */
+function chAxisLabel(ms, bucket, tz) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  if (bucket === 'day') {
+    const off = chTZOffsetMin(tz);
+    if (off !== null) {
+      const sd = new Date(ms + off * 60000);
+      return p(sd.getUTCMonth() + 1) + '-' + p(sd.getUTCDate());
     }
-    if (used.has(bi)) continue;
-    used.add(bi);
-    out.push(pts[bi]);
+    return p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':00';
+}
+
+/* chNiceMax 把最大值抬到 1/2/5×10^n 的「好看刻度」，避免 6→0,2,3,5,6 这种重复刻度。
+   4 格网格：小整数向上取到 4 的倍数，保证每格都是整数（0/2/4/6/8 而不是 0/3/5/8）。 */
+function chNiceMax(max) {
+  const m = Math.max(1, Math.ceil(Number(max) || 1));
+  if (m <= 40) return Math.ceil(m / 4) * 4;
+  if (m <= 100) return Math.ceil(m / 20) * 20;
+  const pow = Math.pow(10, Math.floor(Math.log10(m)));
+  for (const k of [1, 2, 5, 10]) {
+    if (m <= k * pow) return k * pow;
+  }
+  return 10 * pow;
+}
+
+/* chNiceMax1k 每千请求的 y 上限：值可能 <1（低拦截率），按 1/2/5×10^n 取小数刻度。 */
+function chNiceMax1k(max) {
+  const m = Math.max(0.1, Number(max) || 0);
+  const pow = Math.pow(10, Math.floor(Math.log10(m)));
+  for (const k of [1, 2, 5, 10]) {
+    if (m <= k * pow) return k * pow;
+  }
+  return 10 * pow;
+}
+
+/* chNicePct 失败率 y 轴上限：2/5/10/20/25/30/40/50/100，超出按 100 的倍数抬。 */
+function chNicePct(max) {
+  const m = Math.max(0.1, Number(max) || 0);
+  for (const k of [2, 5, 10, 20, 25, 30, 40, 50, 100]) {
+    if (m <= k) return k;
+  }
+  return Math.ceil(m / 100) * 100;
+}
+
+/* chTickText 趋势图 y 轴刻度文案：拦截视图按次数/千分比，改写视图按条数。 */
+function chTickText(v, per1k) {
+  if (per1k) {
+    if (v >= 10) return String(Math.round(v));
+    if (v >= 1) return v.toFixed(1);
+    return v.toFixed(2);
+  }
+  return fmtTok(Math.round(v));
+}
+
+/* chSegments 把折线按断档切段：相邻点间隔 > 1.8 个桶就断开，不连成假曲线。 */
+function chSegments(pts, valueOf, bucket) {
+  const step = bucket === 'day' ? 24 * 3600 * 1000 : 3600 * 1000;
+  const segs = [];
+  let cur = [];
+  for (const pt of pts) {
+    const v = valueOf(pt);
+    if (v === null || v === undefined) {
+      if (cur.length) segs.push(cur);
+      cur = [];
+      continue;
+    }
+    if (cur.length && pt.t - cur[cur.length - 1].t > step * 1.8) {
+      segs.push(cur);
+      cur = [];
+    }
+    cur.push({ t: pt.t, v: v });
+  }
+  if (cur.length) segs.push(cur);
+  return segs;
+}
+
+/* chReqMap 把 usage 的请求序列按桶键索引，供每千请求/失败率 join。 */
+function chReqMap(d) {
+  const m = new Map();
+  for (const p of (d && d.requests) || []) m.set(p.t, p);
+  return m;
+}
+
+/* chWinLabel 窗口粒度标签。 */
+function chWinLabel(d) {
+  return (d && d.bucket === 'day') ? '按日' : '按小时';
+}
+
+/* chCoverText 覆盖条：窗口 + 三源起点 + 服务端分桶时区提示。 */
+function chCoverText(d) {
+  const s = (d && d.sources) || {};
+  const parts = [];
+  const wf = parseAPITime(d && d.window_from), wt = parseAPITime(d && d.window_to);
+  if (wf && wt) parts.push('窗口 ' + fmtLocalDateTime(wf) + ' → ' + fmtLocalDateTime(wt) + ' · ' + chWinLabel(d));
+  const ev = s.events || {};
+  parts.push('事件 ' + (ev.since ? '自 ' + fmtStampShort(parseAPITime(ev.since)) : '无数据'));
+  const us = s.usage || {};
+  parts.push('用量 ' + (us.since ? '自 ' + fmtStampShort(parseAPITime(us.since)) : '未启用'));
+  const ar = s.archive || {};
+  parts.push('归档 ' + (ar.since ? '自 ' + fmtStampShort(parseAPITime(ar.since)) : '未启用'));
+  let out = parts.map(esc).join('<span class="ch-sep">·</span>');
+  const server = chTZOffsetMin(d && d.tz);
+  if (server !== null && server !== chLocalOffsetMin()) {
+    const sign = server < 0 ? '-' : '+';
+    const abs = Math.abs(server);
+    out += '<span class="ch-sep">·</span>服务端分桶 UTC' + sign + String(Math.floor(abs / 60)).padStart(2, '0') + ':' + String(abs % 60).padStart(2, '0');
   }
   return out;
 }
 
-/* chTimeLabel 轴标签：日桶 → MM-DD；小时桶跨多天 → MM-DD HH；单天内 → HH:00。
-   7 天窗口用小时桶时只写「22:00」会在图上重复 7 次，读不出是哪一天。
-   注意用 raw（原始字符串）而不是 t（parsePointTime 之后的毫秒数）。 */
-function chTimeLabel(p, spanMs) {
-  const t = String((p && (p.raw || p.t)) || '');
-  if (p && p.scope === 'day') return t.slice(5);
-  if (spanMs > 48 * 3600 * 1000 && t.length >= 13) return t.slice(5, 13).replace('T', ' ');
-  return fmtTokTimeLabel({ t: t, scope: p && p.scope });
-}
-
-/* chXLabels 画 x 轴刻度标签（首尾贴边时改锚点，避免被裁）。 */
-function chXLabels(pts, xOf, W, PL, PR, y) {
+/* chStateChips 状态条：一个语义徽标 + 4 个带解释的事实。
+   st 为 null = handler 未接线，显示「状态不可用」而不是编造「从未触发」。 */
+function chStateChips(st, fallbacks) {
+  if (!st) {
+    return '<span class="ch-badge mute">状态不可用</span>' +
+      '<span class="ch-fact">看板状态源未接线</span>';
+  }
+  const MODE = { custom: '替换（custom）', append: '追加（append）', passthrough: '透传（passthrough）' };
   let out = '';
-  const span = pts.length > 1 ? Math.max(1, pts[pts.length - 1].t - pts[0].t) : 1;
-  for (const p of chTicks(pts, chNarrow() ? 4 : 6)) {
-    const cx = xOf(p.t);
-    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
-    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
-      '" y="' + y + '" text-anchor="' + anchor + '">' + esc(chTimeLabel(p, span)) + '</text>';
+  if (st.active) {
+    const until = parseAPITime(st.until);
+    out += '<span class="ch-badge warn">提示词降级中' + (until ? ' · 至 ' + esc(fmtStampShort(until)) : '') + '</span>';
+  } else {
+    out += '<span class="ch-badge ok">通道正常</span>';
   }
+  out += '<span class="ch-fact">提示词 <b>' + esc(MODE[st.mode] || st.mode || '—') + '</b></span>';
+  const last = parseAPITime(st.degrade_last_at);
+  out += '<span class="ch-fact">上次降级 <b>' +
+    (last ? esc(fmtStampShort(last)) + ' · ' + esc(ago(st.degrade_last_at)) : '从未') + '</b></span>';
+  const learnedNow = Number(st.learned_now || 0);
+  const learnedTotal = Number(st.learned_total || 0);
+  out += '<span class="ch-fact" title="本进程生效条数（重启清零）；历史累计 ' + learnedTotal +
+    ' 次">已学习指纹 <b>' + learnedNow + ' 条</b>' +
+    (learnedTotal > learnedNow ? ' · 历史 ' + learnedTotal : '') + '</span>';
+  out += '<span class="ch-fact">跨域回退 <b>' + Number(fallbacks || 0) + ' 次</b></span>';
   return out;
 }
 
-/* renderChannelEventChart 拦截事件堆叠柱（按次数，不归一化——归一化会让「一天 3 次」
-   和「一天 300 次」长得一样）。 */
-function renderChannelEventChart(points) {
-  const host = $('dgEventChart');
-  if (!host) return;
-  const pts = [];
-  for (const p of points || []) {
-    const t = parsePointTime({ t: p.t, scope: p.scope });
-    if (t === null) continue;
-    pts.push({ t, raw: p.t, scope: p.scope, p });
+/* chThrottleBreakdown 限流·容量卡片的细分文案（只列非零项）。 */
+function chThrottleBreakdown(kinds) {
+  const names = {
+    soft_rate: '软限流', hard_credit: '余额', model_busy: '模型忙',
+    upstream_busy: '渠道满载', waf_block: 'WAF', model_blocked: '模型不可用',
+  };
+  const parts = [];
+  for (const k in names) {
+    const n = Number((kinds || {})[k] || 0);
+    if (n > 0) parts.push(names[k] + ' ' + fmtTok(n));
   }
-  if (!pts.length) {
-    host.innerHTML = '<div class="us-empty">该时间窗内没有事件数据。</div>';
-    return;
-  }
-  let max = 0;
-  for (const p of pts) max = Math.max(max, chChartTotal(p.p));
-  if (!max) {
-    host.innerHTML = '<div class="us-empty">该时间窗内没有拦截事件（请求全部一次通过）。</div>';
-    return;
-  }
-  const narrow = chNarrow();
-  const W = narrow ? 440 : 1200, H = narrow ? 230 : 220;
-  const PL = narrow ? 46 : 56, PR = narrow ? 10 : 14, PT = 16, PB = 30;
-  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
-  const t0 = pts[0].t, span = Math.max(1, pts[pts.length - 1].t - t0);
-
-  let minGap = Infinity;
-  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
-  if (!isFinite(minGap) || minGap <= 0) minGap = span;
-  const bw = Math.max(2, Math.min(narrow ? 16 : 30, iw * (minGap / span) * 0.7));
-  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
-  const yOf = v => yBase - ih * (v / max);
-
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
-  for (let i = 0; i <= 4; i++) {
-    const y = yBase - ih * i / 4;
-    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
-      '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
-      '" text-anchor="end">' + fmtTok(Math.round(max * i / 4)) + '</text>';
-  }
-  for (const p of pts) {
-    const total = chChartTotal(p.p);
-    const x = xOf(p.t) - bw / 2;
-    out += '<g><title>' + esc(p.raw) + '  ' + total + ' 次拦截事件' + '</title>';
-    if (total > 0) {
-      let acc = 0;
-      for (const s of CH_EVENT_SERIES) {
-        const n = chSeriesCount(p.p, s);
-        if (n <= 0) continue;
-        const y = yBase - ih * ((acc + n) / max);
-        out += '<rect class="dbar" x="' + x.toFixed(2) + '" y="' + y.toFixed(2) +
-          '" width="' + bw.toFixed(2) + '" height="' + Math.max(1, ih * n / max).toFixed(2) +
-          '" fill="' + s.color + '"/>';
-        acc += n;
-      }
-    }
-    out += '</g>';
-  }
-  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) + '" y2="' + yBase + '"/>';
-  out += chXLabels(pts, xOf, W, PL, PR, PT + ih + 15);
-  out += '</svg>';
-  host.innerHTML = out;
+  return parts.length ? parts.join(' · ') : '本窗口无';
 }
 
-/* renderChannelRateChart 失败率折线：y 轴固定小量程（默认 0–2%），99.7% 成功率下
-   那 0.3% 也看得见；峰值超量程时抬到峰值 ×1.2。没有请求的桶不画点（避免 0/0 假谷）。 */
-function renderChannelRateChart(points) {
-  const host = $('dgRateChart');
-  if (!host) return;
-  const pts = [];
-  for (const p of points || []) {
-    const req = Number(p.req || 0);
-    if (!req) continue;
-    const t = parsePointTime({ t: p.t, scope: p.scope });
-    if (t === null) continue;
-    pts.push({ t, raw: p.t, scope: p.scope, req, err: Number(p.err || 0),
-               rate: Number(p.err || 0) / req * 100 });
-  }
-  if (!pts.length) {
-    host.innerHTML = '<div class="us-empty">该时间窗内没有请求记录（失败率需要用量账本）。</div>';
-    return;
-  }
-  let peak = 0;
-  for (const p of pts) peak = Math.max(peak, p.rate);
-  const top = Math.max(2, peak * 1.2);
-  const narrow = chNarrow();
-  const W = narrow ? 440 : 1200, H = narrow ? 200 : 190;
-  const PL = narrow ? 40 : 50, PR = narrow ? 10 : 14, PT = 14, PB = 28;
-  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
-  const t0 = pts[0].t;
-  const span = Math.max(1, pts[pts.length - 1].t - t0);
-  const xOf = t => pts.length === 1 ? PL + iw / 2 : PL + (t - t0) / span * iw;
-  const yOf = v => yBase - ih * Math.min(1, v / top);
-
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
-  for (let i = 0; i <= 2; i++) {
-    const y = yBase - ih * i / 2;
-    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
-      '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
-      '" text-anchor="end">' + (top * i / 2).toFixed(top < 10 ? 1 : 0) + '%</text>';
-  }
-  if (pts.length > 1) {
-    let area = 'M' + xOf(pts[0].t).toFixed(1) + ',' + yBase.toFixed(1);
-    for (const p of pts) area += ' L' + xOf(p.t).toFixed(1) + ',' + yOf(p.rate).toFixed(1);
-    area += ' L' + xOf(pts[pts.length - 1].t).toFixed(1) + ',' + yBase.toFixed(1) + ' Z';
-    out += '<path class="ctarea" d="' + area + '"/>';
-    const line = pts.map(p => xOf(p.t).toFixed(1) + ',' + yOf(p.rate).toFixed(1)).join(' ');
-    out += '<polyline class="ctl ctl-total" points="' + line + '"/>';
-  }
-  if (pts.length <= 80) {
-    for (const p of pts) {
-      out += '<g><title>' + esc(p.raw) + '  ' + p.err + '/' + p.req + ' 失败（' +
-        p.rate.toFixed(2) + '%）</title>' +
-        '<circle class="ctdot" cx="' + xOf(p.t).toFixed(1) + '" cy="' + yOf(p.rate).toFixed(1) +
-        '" r="2.6"/></g>';
-    }
-  }
-  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) + '" y2="' + yBase + '"/>';
-  out += chXLabels(pts, xOf, W, PL, PR, PT + ih + 15);
-  out += '</svg>';
-  host.innerHTML = out;
-}
-
-/* renderChannelHealth 画整个看板：KPI、状态条、两张图、事件表、分域表。 */
-function renderChannelHealth(d) {
-  channelData = d || {};
-  const t = channelData.totals || {};
+/* renderChannelKpis 6 张 KPI 卡：单位/口径/数据源覆盖都写在副标题里。 */
+function renderChannelKpis(d) {
+  const t = d.totals || {};
   const kinds = t.kinds || {};
+  const groups = t.groups || {};
   const reqs = Number(t.requests || 0);
+  const errs = Number(t.errors || 0);
   const refused = Number(kinds.channel_refused || 0);
   const moved = Number(kinds.sys_as_user || 0);
-  const rewrite = Number(kinds.sanitize || 0) + Number(kinds.role_normalized || 0);
-  const throttled = ['soft_rate', 'hard_credit', 'model_busy', 'upstream_busy', 'waf_block', 'model_blocked']
-    .reduce((a, k) => a + Number(kinds[k] || 0), 0);
-  const st = channelData.state || {};
-  const src = channelData.sources || {};
-
-  $('dgStats').innerHTML =
-    usKpi(fmtTok(reqs), '请求数', 'c-accent',
-      reqs ? (Number(t.errors || 0) + ' 次失败') : '窗口内无请求') +
-    usKpi(reqs ? Number(t.failure_rate || 0).toFixed(1) + '%' : '—', '失败率', 'c-ok',
-      '终态失败 / 全部请求') +
-    usKpi(chNum(refused), '11-128 拦截', refused ? 'c-warn' : 'c-mute',
-      reqs ? chPct(refused, reqs) + ' 的请求被拦（含已救回）' : '上游通道校验') +
-    usKpi(chNum(moved), '搬移重试', moved ? 'c-warn' : 'c-mute',
-      refused ? '救回率 ' + chPct(moved, refused) + '（按拦截次数）' : 'system→user 救回次数') +
-    usKpi(chNum(rewrite), '脱敏改写', rewrite ? 'c-accent' : 'c-mute',
-      'developer→system 归一 + 指纹清洗') +
-    usKpi(chNum(throttled), '限流·容量', throttled ? 'c-warn' : 'c-mute',
-      '6004 / 14003 / 6021 / 402 / WAF');
-
-  // 状态条：进程内状态与跨重启累计分开标注，避免把「刚重启」读成「从没发生过」。
-  let chips = '';
-  chips += '<span class="dchip">提示词模式 <b>' + esc(st.mode || '—') + '</b></span>';
-  if (st.active) {
-    chips += '<span class="dchip warn">提示词降级中 <b>至 ' + esc(fmtStampShort(st.until)) + '</b></span>';
-  } else {
-    chips += '<span class="dchip ok">降级 <b>本进程未触发</b></span>';
-  }
-  chips += '<span class="dchip">上次触发 <b>' +
-    (st.degrade_last_at ? esc(fmtStampShort(st.degrade_last_at)) : '从未') + '</b></span>';
-  chips += '<span class="dchip">已学习指纹 <b>本进程 ' + Number(st.learned_now || 0) +
-    ' 条 / 累计 ' + Number(st.learned_total || 0) + ' 次</b></span>';
-  let fallbacks = 0;
-  for (const r of Object.values(channelData.realms || {})) fallbacks += Number(r.fallbacks || 0);
-  chips += '<span class="dchip">跨域回退 <b>' + fallbacks + ' 次</b></span>';
-  $('dgState').innerHTML = chips;
-
-  // 口径说明：窗口 + 桶粒度 + 事件数据的起点（1.22.0 才开始累计）。
-  const win = (channelData.window_from || '').replace('T', ' ').slice(0, 16) + ' → ' +
-    (channelData.window_to || '').replace('T', ' ').slice(0, 16);
-  $('dgNote').textContent = win + ' · ' + (channelData.bucket === 'day' ? '按日' : '按小时');
-  $('dgNote').title = $('dgNote').textContent;
-
-  const evSince = (src.events && src.events.since) ? fmtStampShort(src.events.since) : '';
-  $('dgEventNote').textContent = (evSince
-    ? '事件数据自 ' + evSince + ' 起累计'
-    : '事件数据从本版本开始累计') + ' · ' + (channelData.bucket === 'day' ? '按日' : '按小时');
-  $('dgLegend').innerHTML = CH_EVENT_SERIES.map(s =>
-    '<i class="sw" style="background:' + s.color + '"></i>' + esc(s.label)).join('');
-
-  const reqCount = (channelData.requests || []).length;
-  $('dgRateNote').textContent = reqCount
-    ? reqCount + ' 个时间片 · 来自用量账本（90 天）'
-    : '用量账本里没有这段时间的请求';
-  $('dgRateLegend').innerHTML = '<i class="sw" style="background:var(--accent)"></i>失败率';
-
-  renderChannelEventChart(channelData.events || []);
-  renderChannelRateChart(channelData.requests || []);
-
-  // 事件表：类型 / 次数 / 每千请求 / 最近一次。
-  const rows = channelData.kinds || [];
-  if (!rows.length) {
-    $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">' +
-      (src.events && src.events.available ? '该时间窗内没有拦截事件。' : '事件数据从本版本开始累计，稍后即可看到。') +
-      '</div></td></tr>';
-    $('dgKindNote').textContent = '—';
-  } else {
-    $('dgKindBody').innerHTML = rows.map(k =>
-      '<tr><td>' + esc(k.label || k.kind) + '</td>' +
-      '<td class="num">' + fmtTok(k.count) + '</td>' +
-      '<td class="num">' + (Number(k.per_1k || 0) ? Number(k.per_1k).toFixed(2) : '—') + '</td>' +
-      '<td>' + esc(k.last_at ? fmtStampShort(k.last_at) : '—') + '</td></tr>').join('');
-    $('dgKindNote').textContent = rows.length + ' 类 · 每千请求 = 次数 / 请求数 × 1000';
-  }
-
-  // 分域表：只有 1.21.0+ 的事件带 realm，不足 100 条时显示「积累中」而不是把历史全算进未标注。
-  const labeled = Number(channelData.realm_labeled || 0);
-  const realmRows = ['cn', 'global', 'unknown'].filter(r => channelData.realms && channelData.realms[r]);
-  if (labeled < 100 || !realmRows.length) {
-    $('dgRealmBody').innerHTML = '<tr><td colspan="5"><div class="empty inline">' +
-      (realmRows.length
-        ? '数据积累中：1.22.0 之前的事件没有域字段，已有域标记 ' + labeled + ' 条。'
-        : '该时间窗内没有带域标记的请求记录。') + '</div></td></tr>';
-    $('dgRealmNote').textContent = '仅统计带域标记的事件（1.22.0 起）';
-  } else {
-    $('dgRealmBody').innerHTML = realmRows.map(r => {
-      const a = channelData.realms[r] || {};
-      const n = Number(a.requests || 0);
-      return '<tr><td>' + esc(r === 'unknown' ? '未标注' : r) + '</td>' +
-        '<td class="num">' + fmtTok(n) + '</td>' +
-        '<td class="num">' + fmtTok(a.success) + '</td>' +
-        '<td class="num">' + (n ? Number(a.success_rate || 0).toFixed(1) + '%' : '—') + '</td>' +
-        '<td class="num">' + fmtTok(a.fallbacks) + '</td></tr>';
-    }).join('');
-    $('dgRealmNote').textContent = '仅统计带域标记的事件（1.22.0 起）';
-  }
+  const rewrites = Number(kinds.role_normalized || 0) + Number(kinds.sanitize || 0);
+  const throttled = Number(groups.throttle || 0);
+  const per1k = reqs > 0 ? refused / reqs * 1000 : 0;
+  const rate = Number(t.failure_rate || 0);
+  const rateCls = !reqs ? 'c-mute' : rate >= 10 ? 'c-bad' : rate >= 2 ? 'c-warn' : 'c-ok';
+  const ev = (d.sources || {}).events || {};
+  const evCover = ev.since ? '事件自 ' + fmtStampShort(parseAPITime(ev.since)) + ' 起' : '事件无数据';
+  let out = '';
+  out += usKpi(chNum(reqs), '请求（尝试）', 'c-accent', errs + ' 次失败 · 用量账本 · ' + chWinLabel(d));
+  out += usKpi(rate.toFixed(1) + '%', '失败率', rateCls, '终态失败 / 全部尝试');
+  out += usKpi(chNum(refused), '通道拦截（11-128）', refused > 0 ? 'c-warn' : 'c-ok',
+    '每千请求 ' + per1k.toFixed(2) + ' · ' + evCover);
+  out += usKpi(chNum(moved), 'system→user 搬移', moved > 0 ? 'c-warn' : 'c-ok', '每次拦截都会尝试一次');
+  out += usKpi(chNum(rewrites), '出站改写', rewrites > 0 ? 'c-accent' : 'c-mute', '按消息条数计，不是请求');
+  out += usKpi(chNum(throttled), '限流·容量', throttled > 0 ? 'c-warn' : 'c-ok', chThrottleBreakdown(kinds));
+  $('dgStats').innerHTML = out;
 }
 
-async function loadChannelHealth() {
+/* chTrendSeries 当前度量的系列定义。 */
+function chTrendSeries(d) {
+  if (chMeasure === 'rewrite') {
+    return [
+      { key: 'role_normalized', label: '归一（developer→system）', color: 'var(--chart-2)' },
+      { key: 'sanitize', label: '指纹清洗', color: 'var(--chart-3)' },
+    ];
+  }
+  return ((d && d.groups) || []).map(g => ({ key: g.key, label: g.label, color: chGroupColor(g.key) }));
+}
+
+/* chTrendValue 某个桶某个系列的值；每千请求模式下无请求的桶返回 null（留空）。 */
+function chTrendValue(pt, s, reqs) {
+  if (chMeasure === 'rewrite') {
+    return Number(((pt.pt.kinds || {})[s.key]) || 0);
+  }
+  const v = chGroupCount(pt.pt, s.key);
+  if (chMode === 'per1k') {
+    const r = reqs.get(pt.raw);
+    const n = r ? Number(r.req || 0) : 0;
+    // 分母太小时 1 个事件就能放大成 500‰（2 请求 1 拦截），失去可比性：
+    // 桶内请求数 <10 不画，宁可留空也不画假峰值。
+    if (n < 10) return null;
+    return v / n * 1000;
+  }
+  return v;
+}
+
+/* chTipForBucket 每桶 tooltip：时间 + 各系列 + 请求/失败 + 改写另计。 */
+function chTipForBucket(pt, d, series, reqs) {
+  const lines = [chBucketTitle({ t: pt.raw, scope: pt.scope }, d.tz)];
+  if (chMeasure === 'rewrite') {
+    for (const s of series) lines.push(s.label + ' ' + fmtTok(Number(((pt.pt.kinds || {})[s.key]) || 0)) + ' 条');
+  } else {
+    const parts = [];
+    for (const s of series) {
+      const v = chGroupCount(pt.pt, s.key);
+      if (v > 0) parts.push(s.label + ' ' + v);
+    }
+    lines.push('拦截：' + (parts.length ? parts.join(' · ') : '0'));
+    const r = reqs.get(pt.raw);
+    if (chMode === 'per1k' && r && Number(r.req || 0) > 0) {
+      lines.push('每千请求：' + (chChartTotal(pt.pt) / Number(r.req) * 1000).toFixed(2) + '‰');
+    }
+  }
+  const r = reqs.get(pt.raw);
+  if (r) {
+    const n = Number(r.req || 0), e = Number(r.err || 0);
+    lines.push('请求 ' + fmtTok(n) + ' · 失败 ' + fmtTok(e) + '（' + (n ? (e / n * 100).toFixed(1) : '0.0') + '%）');
+  }
+  const rw = Number((pt.pt.kinds || {}).role_normalized || 0) + Number((pt.pt.kinds || {}).sanitize || 0);
+  if (chMeasure !== 'rewrite' && rw > 0) lines.push('另：出站改写 ' + fmtTok(rw) + ' 条');
+  return lines.join('\n');
+}
+
+/* renderChannelTrend 主图：拦截事件（堆叠柱 / 每千请求）或出站改写（双折线）。
+   x 轴用窗口边界定域；窗口起点到 events.since 之间画覆盖带。 */
+function renderChannelTrend(d) {
+  const host = $('dgTrendChart');
+  if (!host) return;
+  const tz = d.tz || '';
+  const pts = [];
+  for (const p of d.events || []) {
+    const t = chPointTime(p, tz);
+    if (t === null) continue;
+    pts.push({ t: t, raw: p.t, scope: p.scope, pt: p });
+  }
+  const series = chTrendSeries(d);
+  const reqs = chReqMap(d);
+  $('dgTrendLegend').innerHTML = series.map(s =>
+    '<span class="legend"><i class="sw" style="background:' + s.color + '"></i>' + esc(s.label) + '</span>').join('');
+  const modeBox = $('dgMode');
+  if (modeBox) modeBox.hidden = chMeasure !== 'intercept';
+
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">该窗口内没有事件数据。事件计数器启用后才会产生数据。</div>';
+    $('dgTrendNote').textContent = '—';
+    return;
+  }
+
+  // x 域：优先窗口边界；窗口缺失/非法时回落数据首末点。
+  let t0 = parseAPITime(d.window_from), t1 = parseAPITime(d.window_to);
+  if (!t0 || !t1 || t1 <= t0) {
+    t0 = pts[0].t;
+    t1 = pts[pts.length - 1].t;
+  }
+  if (t1 <= t0) t1 = t0 + 1;
+
+  // y 轴上限：堆叠柱按桶内合计（每千请求也是各系列之和），折线按单系列峰值。
+  let max = 0;
+  for (const pt of pts) {
+    if (chMeasure === 'rewrite') {
+      for (const s of series) max = Math.max(max, chTrendValue(pt, s, reqs) || 0);
+    } else if (chMode === 'abs') {
+      max = Math.max(max, chChartTotal(pt.pt));
+    } else {
+      let sum = 0;
+      for (const s of series) {
+        const v = chTrendValue(pt, s, reqs);
+        if (v !== null) sum += v;
+      }
+      max = Math.max(max, sum);
+    }
+  }
+  const nice = chMeasure === 'intercept' && chMode === 'per1k' ? chNiceMax1k(max) : chNiceMax(max);
+
+  const narrow = chNarrow();
+  const W = narrow ? 440 : 1200, H = narrow ? 220 : 260;
+  const PL = narrow ? 46 : 56, PR = 16, PT = 16, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const xOf = t => PL + (t - t0) / (t1 - t0) * iw;
+  const yOf = v => PT + ih - ih * (v / nice);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' +
+    (chMeasure === 'rewrite' ? '出站改写趋势' : '拦截事件趋势') + '" preserveAspectRatio="xMidYMid meet">';
+
+  // 覆盖带：窗口起点 → 事件数据起点，说明这段空白不是「一切正常」。
+  const since = parseAPITime(((d.sources || {}).events || {}).since);
+  if (since && since > t0 && since < t1) {
+    const x = xOf(since);
+    if (x > PL + 2) {
+      out += '<rect class="chgap" x="' + PL.toFixed(2) + '" y="' + PT.toFixed(2) + '" width="' + (x - PL).toFixed(2) + '" height="' + ih.toFixed(2) + '"/>';
+      out += '<line class="chmark" x1="' + x.toFixed(2) + '" y1="' + PT.toFixed(2) + '" x2="' + x.toFixed(2) + '" y2="' + yBase.toFixed(2) + '"/>';
+      // 数据起点贴近右边缘时标签放线的左侧，否则会被 viewBox 裁掉。
+      const labelLeft = x > W - PR - 70;
+      out += '<text class="tk" x="' + (labelLeft ? x - 4 : x + 4).toFixed(2) + '" y="' + (PT + 12).toFixed(2) +
+        '"' + (labelLeft ? ' text-anchor="end"' : '') + '>数据起点</text>';
+    }
+  }
+
+  // y 网格 + 刻度（4 格）
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - ih * i / 4;
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(2) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(2) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end">' +
+      chTickText(nice * i / 4, chMode === 'per1k' && chMeasure === 'intercept') + '</text>';
+  }
+
+  // x 刻度：窄屏 3 个（标签是「MM-DD HH:00」，4 个就会互相压字）。
+  const ticks = narrow ? 3 : 6;
+  for (let k = 0; k < ticks; k++) {
+    const target = t0 + (t1 - t0) * (ticks === 1 ? 0.5 : k / (ticks - 1));
+    const x = Math.min(W - PR, Math.max(PL, xOf(target)));
+    const anchor = k === 0 ? 'start' : (k === ticks - 1 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + x.toFixed(2) + '" y="' + (yBase + 16).toFixed(2) + '" text-anchor="' + anchor + '">' +
+      esc(chAxisLabel(target, d.bucket, tz)) + '</text>';
+  }
+
+  if (chMeasure === 'rewrite') {
+    // 双折线：断档分段（相邻点 > 1.8 个桶断开）。
+    for (const s of series) {
+      const segs = chSegments(pts, pt => chTrendValue(pt, s, reqs), d.bucket);
+      for (const seg of segs) {
+        if (seg.length === 1) {
+          out += '<circle cx="' + xOf(seg[0].t).toFixed(2) + '" cy="' + yOf(seg[0].v).toFixed(2) + '" r="2.5" fill="' + s.color + '"/>';
+        } else {
+          out += '<polyline fill="none" stroke="' + s.color + '" stroke-width="1.8" stroke-linejoin="round" points="' +
+            seg.map(p => xOf(p.t).toFixed(2) + ',' + yOf(p.v).toFixed(2)).join(' ') + '"/>';
+        }
+      }
+    }
+  } else {
+    // 堆叠柱：桶宽按最小桶间距算，clamp 到绘图区。
+    let minGap = Infinity;
+    for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+    const bucketSpan = d.bucket === 'day' ? 24 * 3600 * 1000 : 3600 * 1000;
+    if (!isFinite(minGap) || minGap <= 0) minGap = bucketSpan;
+    const bw = Math.max(2, Math.min(30, iw * (minGap / (t1 - t0)) * 0.72));
+    for (const pt of pts) {
+      const x = Math.min(W - PR - bw, Math.max(PL, xOf(pt.t) - bw / 2));
+      let acc = 0;
+      for (const s of series) {
+        const v = chTrendValue(pt, s, reqs);
+        if (v === null || v <= 0) continue;
+        const h = ih * (v / nice);
+        const y = yBase - ih * ((acc + v) / nice);
+        out += '<rect class="dbar" x="' + x.toFixed(2) + '" y="' + y.toFixed(2) + '" width="' + bw.toFixed(2) +
+          '" height="' + Math.max(0.6, h).toFixed(2) + '" fill="' + s.color + '"/>';
+        acc += v;
+      }
+    }
+  }
+
+  // 每桶命中区：透明整列，tooltip 汇总全部系列（比挂每段柱子看得全）。
+  let step = pts.length > 1 ? Math.min((t1 - t0) / pts.length, pts[1].t - pts[0].t) : (t1 - t0);
+  if (!isFinite(step) || step <= 0) step = 3600 * 1000;
+  const hitW = Math.max(4, step * 0.9);
+  for (const pt of pts) {
+    const x = Math.max(PL, Math.min(W - PR - hitW, xOf(pt.t) - hitW / 2));
+    out += '<rect class="chhit" x="' + x.toFixed(2) + '" y="' + PT.toFixed(2) + '" width="' + hitW.toFixed(2) +
+      '" height="' + ih.toFixed(2) + '" data-tip="' + esc(chTipForBucket(pt, d, series, reqs)) + '"/>';
+  }
+  out += '</svg>';
+  host.innerHTML = out;
+
+  // 图注：合计/峰值 + 桶数 + 口径
+  let note;
+  if (chMeasure === 'rewrite') {
+    let sum = 0;
+    for (const pt of pts) for (const s of series) sum += Number(((pt.pt.kinds || {})[s.key]) || 0);
+    note = '合计 ' + fmtTok(sum) + ' 条 · ' + pts.length + ' 个桶 · ' + chWinLabel(d);
+  } else if (chMode === 'per1k') {
+    let peak = 0;
+    for (const pt of pts) {
+      let sum = 0;
+      for (const s of series) {
+        const v = chTrendValue(pt, s, reqs);
+        if (v !== null) sum += v;
+      }
+      if (sum > peak) peak = sum;
+    }
+    const peakText = peak >= 10 ? peak.toFixed(0) : peak >= 1 ? peak.toFixed(1) : peak.toFixed(2);
+    note = '峰值 ' + peakText + '‰ · ' + pts.length + ' 个桶 · 每千请求（桶内 <10 请求不计）';
+  } else {
+    let sum = 0;
+    for (const pt of pts) sum += chChartTotal(pt.pt);
+    note = '合计 ' + fmtTok(sum) + ' 次 · ' + pts.length + ' 个桶 · ' + chWinLabel(d);
+  }
+  $('dgTrendNote').textContent = note;
+}
+
+/* renderChannelRateChart 失败率折线：与主图同粒度/同 x 域；无请求的桶不画点，
+   断档分段（不把停机连成一段连续曲线）；均值参考线 + 均值/峰值/当前。 */
+function renderChannelRateChart(d) {
+  const host = $('dgRateChart');
+  if (!host) return;
+  const tz = d.tz || '';
+  const pts = [];
+  for (const p of d.requests || []) {
+    const n = Number(p.req || 0);
+    if (n <= 0) continue;
+    const t = chPointTime({ t: p.t, scope: p.scope }, tz);
+    if (t === null) continue;
+    pts.push({ t: t, raw: p.t, scope: p.scope, req: n, err: Number(p.err || 0), rate: Number(p.err || 0) / n * 100 });
+  }
+  $('dgRateLegend').innerHTML = '<span class="legend"><i class="sw" style="background:var(--accent)"></i>失败率</span>';
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">该窗口内没有请求数据（用量账本未启用或窗口内无请求）。</div>';
+    $('dgRateNote').textContent = '—';
+    return;
+  }
+  let t0 = parseAPITime(d.window_from), t1 = parseAPITime(d.window_to);
+  if (!t0 || !t1 || t1 <= t0) {
+    t0 = pts[0].t;
+    t1 = pts[pts.length - 1].t;
+  }
+  if (t1 <= t0) t1 = t0 + 1;
+  const totalReq = pts.reduce((s, p) => s + p.req, 0);
+  const avg = totalReq ? pts.reduce((s, p) => s + p.req * p.rate, 0) / totalReq : 0;
+  const peak = pts.reduce((a, b) => (b.rate > a.rate ? b : a), pts[0]);
+  const nice = chNicePct(Math.max(2, peak.rate * 1.15));
+
+  const narrow = chNarrow();
+  const W = narrow ? 440 : 1200, H = narrow ? 170 : 220;
+  const PL = narrow ? 46 : 56, PR = 16, PT = 14, PB = 26;
+  const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
+  const xOf = t => PL + (t - t0) / (t1 - t0) * iw;
+  const yOf = v => PT + ih - ih * (v / nice);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="失败率趋势" preserveAspectRatio="xMidYMid meet">';
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - ih * i / 4;
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(2) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(2) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 4).toFixed(2) + '" text-anchor="end">' + (nice * i / 4).toFixed(1) + '%</text>';
+  }
+  const ticks = narrow ? 3 : 6;
+  for (let k = 0; k < ticks; k++) {
+    const target = t0 + (t1 - t0) * (ticks === 1 ? 0.5 : k / (ticks - 1));
+    const x = Math.min(W - PR, Math.max(PL, xOf(target)));
+    const anchor = k === 0 ? 'start' : (k === ticks - 1 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + x.toFixed(2) + '" y="' + (yBase + 16).toFixed(2) + '" text-anchor="' + anchor + '">' +
+      esc(chAxisLabel(target, d.bucket, tz)) + '</text>';
+  }
+  // 均值参考线
+  if (avg > 0) {
+    const y = yOf(avg);
+    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(2) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(2) + '"/>';
+  }
+  // 折线（断档分段）
+  for (const seg of chSegments(pts, p => p.rate, d.bucket)) {
+    if (seg.length === 1) {
+      out += '<circle cx="' + xOf(seg[0].t).toFixed(2) + '" cy="' + yOf(seg[0].v).toFixed(2) + '" r="2.5" fill="var(--accent)"/>';
+    } else {
+      out += '<polyline fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linejoin="round" points="' +
+        seg.map(p => xOf(p.t).toFixed(2) + ',' + yOf(p.v).toFixed(2)).join(' ') + '"/>';
+    }
+  }
+  // 每桶命中区（只对有请求的桶）
+  let step = pts.length > 1 ? Math.min((t1 - t0) / pts.length, pts[1].t - pts[0].t) : (t1 - t0);
+  if (!isFinite(step) || step <= 0) step = 3600 * 1000;
+  const hitW = Math.max(4, step * 0.9);
+  for (const p of pts) {
+    const x = Math.max(PL, Math.min(W - PR - hitW, xOf(p.t) - hitW / 2));
+    const tip = chBucketTitle({ t: p.raw, scope: p.scope }, tz) + '\n请求 ' + fmtTok(p.req) +
+      ' · 失败 ' + fmtTok(p.err) + '\n失败率 ' + p.rate.toFixed(2) + '%';
+    out += '<rect class="chhit" x="' + x.toFixed(2) + '" y="' + PT.toFixed(2) + '" width="' + hitW.toFixed(2) +
+      '" height="' + ih.toFixed(2) + '" data-tip="' + esc(tip) + '"/>';
+  }
+  out += '</svg>';
+  host.innerHTML = out;
+  $('dgRateNote').textContent = '均值 ' + avg.toFixed(1) + '% · 峰值 ' + peak.rate.toFixed(1) + '% @ ' +
+    chBucketTitle({ t: peak.raw, scope: peak.scope }, tz) + ' · ' + pts.length + ' 个有请求的桶';
+}
+
+/* chSortedKinds 事件表排序：默认注册表顺序；点表头后按次数/每千/最近一次排。 */
+function chSortedKinds(d) {
+  const rows = ((d && d.kinds) || []).slice();
+  if (!chSortKey) return rows;
+  const key = chSortKey, dir = chSortDir;
+  const num = v => Number(v || 0);
+  rows.sort((a, b) => {
+    let d2;
+    if (key === 'count') d2 = num(a.count) - num(b.count);
+    else if (key === 'per1k') d2 = num(a.per_1k) - num(b.per_1k);
+    else if (key === 'last') d2 = parseAPITime(a.last_at) - parseAPITime(b.last_at);
+    else d2 = String(a.label || a.kind).localeCompare(String(b.label || b.kind), 'zh-Hans-CN');
+    if (d2 === 0) d2 = String(a.kind).localeCompare(String(b.kind));
+    return d2 * dir;
+  });
+  return rows;
+}
+
+/* chKindRowsHtml 事件分类表：注册表标签 + 分组 + 单位 + Hint。
+   unit=work 的事件（归一/清洗/目录探测）不换算每千请求，显示「—」。 */
+function chKindRowsHtml(rows) {
+  if (!rows || !rows.length) {
+    return '<tr><td colspan="5"><div class="empty inline">该窗口内没有通道事件。事件计数器启用后才会产生数据。</div></td></tr>';
+  }
+  return rows.map(k => {
+    const per1k = k.unit === 'request' && Number(k.per_1k || 0) > 0 ? Number(k.per_1k).toFixed(2) : '—';
+    const last = parseAPITime(k.last_at);
+    const hint = k.hint || '';
+    return '<tr data-kind="' + esc(k.kind) + '">' +
+      '<td>' + esc(k.label || k.kind) + '</td>' +
+      '<td class="num">' + fmtTok(Number(k.count || 0)) + '</td>' +
+      '<td class="num">' + per1k + '</td>' +
+      '<td>' + (last ? esc(fmtStampShort(last)) : '—') + '</td>' +
+      '<td class="ch-hint" title="' + esc(hint) + '">' + esc(hint) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+/* chRealmRowsHtml 分域对比：只比较 cn/global，未标注不占一行。
+   覆盖率低于 10% 时也照常渲染（低流量部署不该永远显示「积累中」），
+   由表头 note 说明带域标记占比。 */
+function chRealmRowsHtml(d) {
+  const realms = (d && d.realms) || {};
+  const labeled = Number((d && d.realm_labeled) || 0);
+  const total = Number((d && d.realm_total) || 0);
+  if (!labeled) {
+    return '<tr><td colspan="5"><div class="empty inline">该窗口内没有带域标记的请求' +
+      (total ? '（共 ' + fmtTok(total) + ' 条归档，1.21.0 之前没有域字段）' : '') + '。</div></td></tr>';
+  }
+  const order = ['cn', 'global'];
+  const keys = order.filter(k => realms[k]).concat(Object.keys(realms).filter(k => order.indexOf(k) < 0 && k !== 'unknown'));
+  return keys.map(k => {
+    const r = realms[k] || {};
+    const rate = Number(r.success_rate || 0);
+    const pct = Math.max(0, Math.min(100, rate));
+    return '<tr>' +
+      '<td>' + esc(k) + '</td>' +
+      '<td class="num">' + fmtTok(Number(r.requests || 0)) + '</td>' +
+      '<td class="num">' + fmtTok(Number(r.success || 0)) + '</td>' +
+      '<td class="num"><span class="ch-rate"><i style="width:' + pct.toFixed(1) + '%"></i></span>' + rate.toFixed(1) + '%</td>' +
+      '<td class="num">' + fmtTok(Number(r.fallbacks || 0)) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+/* chBindKindSort 事件表表头排序（点击切换升/降序）。 */
+function chBindKindSort() {
+  const ths = document.querySelectorAll('#dgKindTable th[data-sort]');
+  if (!ths.length) return;
+  ths.forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.sort;
+      if (chSortKey === key) chSortDir = -chSortDir; else { chSortKey = key; chSortDir = 1; }
+      ths.forEach(x => x.removeAttribute('aria-sort'));
+      th.setAttribute('aria-sort', chSortDir > 0 ? 'ascending' : 'descending');
+      if (channelData) $('dgKindBody').innerHTML = chKindRowsHtml(chSortedKinds(channelData));
+    };
+  });
+}
+
+/* renderChannelHealth 看板总装：状态条 / 覆盖条 / KPI / 两张图 / 两张表。 */
+function renderChannelHealth(d) {
+  channelData = d || {};
+  const realms = channelData.realms || {};
+  let fallbacks = 0;
+  for (const k in realms) fallbacks += Number(realms[k].fallbacks || 0);
+  $('dgState').innerHTML = chStateChips(channelData.state || null, fallbacks);
+  $('dgCover').innerHTML = chCoverText(channelData);
+  renderChannelKpis(channelData);
+  renderChannelTrend(channelData);
+  renderChannelRateChart(channelData);
+  $('dgKindBody').innerHTML = chKindRowsHtml(chSortedKinds(channelData));
+  $('dgRealmBody').innerHTML = chRealmRowsHtml(channelData);
+
+  const kinds = channelData.kinds || [];
+  $('dgKindNote').textContent = kinds.length + ' 类 · 每千请求只对按请求计的事件换算';
+  const labeled = Number(channelData.realm_labeled || 0);
+  const total = Number(channelData.realm_total || 0);
+  $('dgRealmNote').textContent = total
+    ? '带域标记 ' + fmtTok(labeled) + ' / ' + fmtTok(total) + '（' + (total ? (labeled / total * 100).toFixed(0) : 0) + '%）'
+    : '—';
+  $('dgUpdated').textContent = '最后更新 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+/* chSyncSeg 同步分段控件的选中态。 */
+function chSyncSeg() {
+  const m = $('dgMeasure');
+  if (m) m.querySelectorAll('button[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === chMeasure));
+  const mode = $('dgMode');
+  if (mode) mode.querySelectorAll('button[data-mode]').forEach(b => b.classList.toggle('on', b.dataset.mode === chMode));
+}
+
+/* chStartAuto 启动自动刷新（隐藏标签页/非本视图时跳过）。 */
+function chStartAuto() {
+  if (chTimer) { clearInterval(chTimer); chTimer = null; }
+  if (!(chAutoSec > 0)) return;
+  chTimer = setInterval(() => {
+    if (document.hidden || view !== 'channel') return;
+    loadChannelHealth(true);
+  }, chAutoSec * 1000);
+}
+
+async function loadChannelHealth(quiet) {
   const q = trangeQuery('dgRange', false);
+  // 「全部历史」预设不发区间；本接口缺省是近 7 天，这里显式从 1970 起，
+  // 由后端按 90 天保留期截断（与账本保留时长一致）。
+  if (!q.has('from') && !q.has('to')) q.set('from', '1');
+  const btn = $('btnDg');
+  const done = !quiet && btn ? setBusy(btn, '刷新中…') : null;
   try {
     const d = await api('channel_health?' + q.toString());
     renderChannelHealth(d);
   } catch (e) {
+    if (quiet) return; // 自动刷新失败保留旧数据，不闪屏
     channelData = null;
-    $('dgStats').innerHTML = '';
-    $('dgState').innerHTML = '';
-    $('dgKindBody').innerHTML = '<tr><td colspan="4"><div class="empty inline">读取失败</div></td></tr>';
+    $('dgState').innerHTML = '<span class="ch-badge mute">读取失败</span>';
+    $('dgCover').textContent = '—';
+    $('dgStats').innerHTML = '<div class="ch-error">读取失败：' + esc(shortErr(e.message)) +
+      ' <button class="xs" id="dgRetry">重试</button></div>';
+    $('dgKindBody').innerHTML = '<tr><td colspan="5"><div class="empty inline">读取失败</div></td></tr>';
     $('dgRealmBody').innerHTML = '<tr><td colspan="5"><div class="empty inline">读取失败</div></td></tr>';
-    $('dgEventChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
+    $('dgTrendChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
     $('dgRateChart').innerHTML = '<div class="us-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
-    $('dgNote').textContent = '读取失败';
-    $('dgEventNote').textContent = '—';
+    $('dgTrendNote').textContent = '—';
     $('dgRateNote').textContent = '—';
     $('dgKindNote').textContent = '—';
-    $('dgLegend').innerHTML = '';
+    $('dgRealmNote').textContent = '—';
+    $('dgTrendLegend').innerHTML = '';
     $('dgRateLegend').innerHTML = '';
+    if ($('dgRetry')) $('dgRetry').onclick = () => loadChannelHealth();
+  } finally {
+    if (done) done('刷新');
   }
 }
-if ($('btnDg')) $('btnDg').onclick = loadChannelHealth;
-if ($('dgRange')) trangeBind('dgRange', loadChannelHealth, '168');
+
+/* 分段控件：切换度量/量纲只重画主图，不重新打接口。 */
+if ($('dgMeasure')) {
+  $('dgMeasure').onclick = e => {
+    const b = e.target.closest('button[data-m]');
+    if (!b) return;
+    chMeasure = b.dataset.m;
+    try { localStorage.setItem('wb2api.ch.measure', chMeasure); } catch (err) {}
+    chSyncSeg();
+    if (channelData) renderChannelTrend(channelData);
+  };
+}
+if ($('dgMode')) {
+  $('dgMode').onclick = e => {
+    const b = e.target.closest('button[data-mode]');
+    if (!b) return;
+    chMode = b.dataset.mode;
+    try { localStorage.setItem('wb2api.ch.mode', chMode); } catch (err) {}
+    chSyncSeg();
+    if (channelData) renderChannelTrend(channelData);
+  };
+}
+if ($('dgAuto')) {
+  $('dgAuto').value = String(chAutoSec);
+  $('dgAuto').onchange = () => {
+    chAutoSec = Number($('dgAuto').value) || 0;
+    try { localStorage.setItem('wb2api.ch.auto', String(chAutoSec)); } catch (err) {}
+    chStartAuto();
+  };
+}
+chSyncSeg();
+chBindKindSort();
+chStartAuto();
+if ($('btnDg')) $('btnDg').onclick = () => loadChannelHealth();
+if ($('dgRange')) trangeBind('dgRange', loadChannelHealth, '24');
 
 /* ══ 剩余积分走势（积分构成页顶部）═══════════════════════════════════════
    采样点是「余额后台刷新 / 签到结束时」落的（后端 creditline），所以这张图不需要

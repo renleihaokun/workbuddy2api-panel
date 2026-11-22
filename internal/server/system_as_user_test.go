@@ -261,9 +261,9 @@ func TestSystemModeGateLifecycle(t *testing.T) {
 	if g.Known("") || systemModeKey("") != "" {
 		t.Fatal("empty key must never be learned")
 	}
-	g.Remember("k1")
+	g.Learn("k1")
 	if !g.Known("k1") {
-		t.Fatal("k1 should be known after Remember")
+		t.Fatal("k1 should be known after Learn")
 	}
 	// 手动把时间戳推过 TTL：Known 应删除并返回 false。
 	g.mu.Lock()
@@ -273,7 +273,7 @@ func TestSystemModeGateLifecycle(t *testing.T) {
 		t.Fatal("expired key should not be known")
 	}
 	for i := 0; i < systemModeMax+10; i++ {
-		g.Remember(fmt.Sprintf("key-%04d", i))
+		g.Learn(fmt.Sprintf("key-%04d", i))
 	}
 	g.mu.Lock()
 	n := len(g.m)

@@ -221,3 +221,165 @@ func TestNilLedgerSafe(t *testing.T) {
 		t.Error("nil 账本 Snapshot 应为零值")
 	}
 }
+
+// Stop 未 Start 必须立即返回：此前 done 永远不会 close，Stop 会永久阻塞。
+func TestStopWithoutStart(t *testing.T) {
+	l := New("")
+	done := make(chan struct{})
+	go func() {
+		l.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop without Start blocked")
+	}
+}
+
+// Start 幂等：重复调用只起一个 goroutine，Stop 不 panic（双 close(done)）。
+func TestStartTwiceIdempotent(t *testing.T) {
+	l := New("")
+	l.Start()
+	l.Start()
+	l.Inc(KindChannelRefused)
+	l.Stop()
+	l.Stop() // 重复 Stop 也必须安全
+	if _, totals := l.Series(time.Now().Add(-time.Hour), time.Now().Add(time.Hour), false); totals.Total != 1 {
+		t.Errorf("totals.total=%d want 1", totals.Total)
+	}
+}
+
+// 未来 from 收敛到当前窗口末尾，不返回一串未来空点。
+func TestSeriesFutureWindowClamped(t *testing.T) {
+	l := New("")
+	now := time.Now()
+	l.AddAt(now, KindChannelRefused, 1)
+
+	points, totals := l.Series(now.Add(24*time.Hour), now, false)
+	if totals.Total != 1 {
+		t.Fatalf("totals.total=%d want 1（窗口应收敛到 now）", totals.Total)
+	}
+	if len(points) != 1 {
+		t.Fatalf("points=%d want 1（未来起点不应展开成未来窗口）", len(points))
+	}
+	want := truncate(now, false).Format(hourLayout)
+	if points[0].T != want {
+		t.Errorf("point.t=%q want %q", points[0].T, want)
+	}
+}
+
+// 磁盘里的 last_at 是 UTC、查询窗口是本地时区：不能因为时区不同把「最近一次」
+// 全部过滤掉（生产 6/7 行显示「—」的根因）。
+func TestSeriesLastAtNormalizesTimezone(t *testing.T) {
+	l := New("")
+	// 固定 +08:00 的事件时刻；在 UTC 机器上等价于 02:27 UTC。
+	at := time.Date(2026, 11, 22, 10, 27, 0, 0, time.FixedZone("CST", 8*3600))
+	l.mu.Lock()
+	l.last[string(KindChannelRefused)] = at
+	l.mu.Unlock()
+
+	from := time.Date(2026, 11, 22, 0, 0, 0, 0, time.Local)
+	to := time.Date(2026, 11, 22, 23, 59, 0, 0, time.Local)
+	_, totals := l.Series(from, to, true)
+	raw := totals.LastAt[string(KindChannelRefused)]
+	if raw == "" {
+		t.Fatal("last_at 被时区比较吞掉（B26 回归）")
+	}
+	got, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("last_at %q 不是 RFC3339: %v", raw, err)
+	}
+	if !got.Equal(at) {
+		t.Errorf("last_at=%v want %v（应按绝对时刻返回）", got, at)
+	}
+}
+
+// 种子导入不能覆盖主账本元信息：since 取最早、degrade_last_at 取最晚、
+// learned_total 累加、last_at 每 kind 取最晚；桶照常累加。
+func TestSeedImportPreservesMainMetadata(t *testing.T) {
+	cst := time.FixedZone("CST", 8*3600)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "channel-stats.json")
+	mainRaw := `{"version":1,"since":"2026-11-21T10:00:00+08:00",` +
+		`"buckets":[{"s":"h:2026-11-21T10","k":{"channel_refused":2}}],` +
+		`"last_at":{"channel_refused":"2026-11-21T10:30:00+08:00"},` +
+		`"degrade_last_at":"2026-11-21T11:00:00+08:00","learned_total":7}`
+	seedRaw := `{"version":1,"since":"2026-11-14T00:00:00+08:00",` +
+		`"buckets":[{"s":"h:2026-11-14T10","k":{"channel_refused":5}}],` +
+		`"last_at":{"channel_refused":"2026-11-14T10:30:00+08:00","sanitize":"2026-11-14T10:00:00+08:00"},` +
+		`"learned_total":3}`
+	if err := os.WriteFile(path, []byte(mainRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(seedPath(path), []byte(seedRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l := New(path)
+	since, degrade, learned := l.Snapshot()
+	if want := time.Date(2026, 11, 14, 0, 0, 0, 0, cst); !since.Equal(want) {
+		t.Errorf("since=%v want %v（种子更早，取最早）", since, want)
+	}
+	if want := time.Date(2026, 11, 21, 11, 0, 0, 0, cst); !degrade.Equal(want) {
+		t.Errorf("degrade_last_at=%v want %v（不能被更旧的种子回滚）", degrade, want)
+	}
+	if learned != 10 {
+		t.Errorf("learned_total=%d want 10（主账本 7 + 种子 3）", learned)
+	}
+
+	_, totals := l.Series(
+		time.Date(2026, 11, 14, 0, 0, 0, 0, cst),
+		time.Date(2026, 11, 22, 0, 0, 0, 0, cst), true)
+	if totals.Kinds["channel_refused"] != 7 {
+		t.Errorf("channel_refused=%d want 7（桶照常累加）", totals.Kinds["channel_refused"])
+	}
+	if got, err := time.Parse(time.RFC3339, totals.LastAt["channel_refused"]); err != nil ||
+		!got.Equal(time.Date(2026, 11, 21, 10, 30, 0, 0, cst)) {
+		t.Errorf("channel_refused last_at=%q want 11-21 10:30（主账本更新，胜出）", totals.LastAt["channel_refused"])
+	}
+	if got, err := time.Parse(time.RFC3339, totals.LastAt["sanitize"]); err != nil ||
+		!got.Equal(time.Date(2026, 11, 14, 10, 0, 0, 0, cst)) {
+		t.Errorf("sanitize last_at=%q want 11-14 10:00（来自种子）", totals.LastAt["sanitize"])
+	}
+}
+
+// 每点 groups：未登记 kind 落 other、offchart 不计、空桶四组零值。
+func TestSeriesGroups(t *testing.T) {
+	l := New("")
+	base := time.Date(2026, 11, 21, 10, 0, 0, 0, time.Local)
+	l.AddAt(base, KindChannelRefused, 3)
+	l.AddAt(base, KindSoftRate, 1)
+	l.AddAt(base, KindStreamError, 2)
+	l.AddAt(base, KindRoleNormalized, 10) // offchart
+	l.AddAt(base, KindCacheMiss, 4)       // 显式 other
+	l.AddAt(base, Kind("weird_kind"), 5)  // 未登记 → other
+
+	points, totals := l.Series(base.Add(-time.Hour), base.Add(time.Hour), false)
+	if len(points) != 3 {
+		t.Fatalf("points=%d want 3", len(points))
+	}
+	pt := points[1]
+	if pt.Total != 25 {
+		t.Errorf("point.total=%d want 25", pt.Total)
+	}
+	want := map[string]int64{"refusal": 3, "throttle": 1, "stream": 2, "other": 9}
+	for k, v := range want {
+		if pt.Groups[k] != v {
+			t.Errorf("point.groups[%s]=%d want %d (all=%v)", k, pt.Groups[k], v, pt.Groups)
+		}
+		if totals.Groups[k] != v {
+			t.Errorf("totals.groups[%s]=%d want %d", k, totals.Groups[k], v)
+		}
+	}
+	// 空桶：四组零值而不是 nil。
+	empty := points[0].Groups
+	if len(empty) != 4 {
+		t.Fatalf("empty groups=%v want 4 entries", empty)
+	}
+	for k, v := range empty {
+		if v != 0 {
+			t.Errorf("empty groups[%s]=%d want 0", k, v)
+		}
+	}
+}

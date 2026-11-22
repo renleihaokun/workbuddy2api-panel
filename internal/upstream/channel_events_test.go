@@ -4,6 +4,8 @@ package upstream
 
 import (
 	"testing"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 )
 
 // 归一与清洗各自计数，sanitize=false 时清洗恒为 0（归一不受开关影响）。
@@ -46,8 +48,8 @@ func TestPrepareBodyStatsCleanRequest(t *testing.T) {
 func TestClientChannelEventsHook(t *testing.T) {
 	c := &Client{}
 	c.SanitizeFingerprints.Store(true) // 生产默认 true（main 从配置注入）
-	got := map[string]int{}
-	c.SetChannelEvents(func(kind string, n int) { got[kind] += n })
+	got := map[channelstat.Kind]int{}
+	c.SetChannelEvents(func(kind channelstat.Kind, n int) { got[kind] += n })
 
 	fp := "You are Claude Code, Anthropic's official CLI for Claude."
 	body := `{"model":"glm-5.2","messages":[` +
