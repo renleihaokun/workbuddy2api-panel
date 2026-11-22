@@ -802,12 +802,26 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 - 存储：`data/channel-stats.json`，小时桶保留 90 天后折叠为日桶，5 分钟防抖落盘；重启后继续累计（`since` / 上次降级触发 / 累计学习次数一并持久化）。
 - 分组：`refusal` / `throttle` / `stream` / `other` 四个进图组由后端按「总数 − 进图组 − offchart」倒推 `other`（未登记的新事件不会丢，落进 other）；`offchart`（搬移 / 归一 / 清洗 / 降级）只进 KPI 与事件表，不画柱。
 - 口径：`sys_as_user` 与 `channel_refused` 几乎一一对应，看板上**只把 channel_refused 画进拦截柱**；`sanitize` / `role_normalized` 是按消息条数计的工作量，和按请求计的拦截事件差两个数量级，走「出站改写」度量（独立 y 轴），不参与每千请求换算。
-- 时区：桶键是**服务端本地时间**（不带偏移）。面板接口回 `tz`（如 `+00:00`），前端据此把小时桶换算成浏览器本地时间显示，并在覆盖条标注「服务端分桶 UTC±HH:MM」；日桶按服务端日历日标注。生产宿主是 UTC、用户在 UTC+8 时，图上的小时标签是本地时间、日标签是服务端日期，tooltip 与覆盖条会说明口径。若要统一到 `Asia/Shanghai`，需在部署侧设 `TZ`，并注意**存量桶键会按新时区重新解释（8 小时偏移）**——历史数据迁移要单独处理。
+- 时区：桶键是**服务端本地时间**（不带偏移）。面板接口回 `tz`（如 `+08:00`），前端据此把小时桶换算成浏览器本地时间显示，并在覆盖条标注「服务端分桶 UTC±HH:MM」；日桶按服务端日历日标注。**部署侧应显式设 `TZ`**（见 [定时任务](#定时任务) 一节的告警），否则日桶会切在当地时间 08:00 而不是 00:00。若已有存量数据是从别的时区写下的，用 `scripts/migrate_tz.py` 平移桶键（**先停服**）。
 - 回填：把历史数据写成 `data/channel-stats.seed.json`，服务启动时合并一次并改名 `.imported`（先落盘再改名，避免「改名成功 + 落盘失败」丢数据）；合并时 `since` 取最早、`degrade_last_at` 取最晚、`learned_total` 累加、`last_at` 每 kind 取最晚，不会让种子回滚主账本元信息。
 
 ### 定时任务
 
 六类 hourly 任务各自独立排程、各有开关，互不影响；另有余额刷新与任务补领清扫两个分钟级任务。容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
+
+> ⚠️ **裸机部署务必显式设置 `TZ`**。任务时刻（`checkin_hours` 等）按**进程本地时区**解释；宿主系统时区是 `Etc/UTC` 且服务没设 `TZ` 时，`[9, 21]` 实际会在北京时间 17:00 / 次日 05:00 执行，整体晚 8 小时，看板的小时/日桶也会切在北京时间 08:00 而不是 00:00。systemd 部署加一个 drop-in 即可：
+>
+> ```ini
+> # /etc/systemd/system/workbuddy-panel.service.d/50-timezone.conf
+> [Service]
+> Environment=TZ=Asia/Shanghai
+> ```
+>
+> `sudo systemctl daemon-reload && sudo systemctl restart workbuddy-panel`。
+> 若此前一直跑在 UTC，`data/usage.json` 与 `data/channel-stats.json` 的小时桶键是 UTC 表示，
+> 需要**先停服再迁移**（否则运行中的进程会把内存快照写回）：
+> `python3 scripts/migrate_tz.py <data-dir>` 演练、加 `--apply` 应用。脚本只平移 `h:` 桶键，
+> 合计与元信息不变；遇到日桶会拒绝执行（日桶横跨两个时区日，需另行折叠）。
 
 | 任务 | 开关（默认 true） | 时刻（默认） | 行为 |
 |---|---|---|---|
