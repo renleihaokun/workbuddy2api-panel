@@ -1,22 +1,22 @@
-/* mobile.css — 手机端（≤760px）适配层。
+/* mobile.css — 手机端（≤1000px）适配层。
  *
  * 本文件是本仓库自有文件，上游不维护：以后同步上游（git fetch && git rebase）时它不参与冲突，
  * 移动端样式改动只落在这一处。index.html 里只留一行 <link rel="stylesheet" href="mobile.css">，
  * 且必须排在主 <style> 之后 —— @media 块要能覆盖基础规则。
  *
- * 约束：只放 ≤760px 生效的规则。>760px（桌面）必须与上游逐像素一致，
+ * 约束：只放 ≤1000px 生效的规则。>1000px（桌面）必须与上游逐像素一致，
  * 故「块外」只允许一条新增 DOM 默认不渲染的声明（.nav-btn / .nav-veil）。
  */
 
-/* ══ 移动端适配（≤760px）═════════════════════════════════════════════════
+/* ══ 移动端适配（≤1000px）═════════════════════════════════════════════════
    全部手机端规则集中在这一块，追加在既有 CSS 的末尾：不插进上游规则中间，
-   以后同步上游时冲突面积最小。>760px 时整块不生效 → 桌面端与改动前逐像素一致。
+   以后同步上游时冲突面积最小。>1000px 时整块不生效 → 桌面端与改动前逐像素一致。
 
    块外只多了一条"新元素默认不渲染"的声明：.nav-btn（顶栏汉堡）与 .nav-veil
    （抽屉遮罩）是本方案新增的 DOM，桌面端必须完全不出现。它不覆盖任何既有选择器，
    故不影响任何现存样式。 */
 .nav-btn, .nav-veil { display: none; }
-@media (max-width: 760px) {
+@media (max-width: 1000px) {
   /* ── 0. 明暗主题跟随面板设置（不再强制深色）────────────────────────
      手机端与桌面端共用同一套主题变量：顶栏主题按钮照常可用，选浅色就是浅色。
 
@@ -89,8 +89,8 @@
   .topbar h2 { font-size: 16px; }
   .topbar .meta { font-size: 11px; padding: 1px 7px; }
   .topbar .sep, .topbar .meta { display: none; }
-  .topbar button { padding: 5px 9px; font-size: 12.5px; border-radius: 8px; }
-  .topbar button.icon { padding: 5px 8px; }
+  .topbar button { padding: 5px 9px; font-size: 12.5px; border-radius: 8px; min-height: 40px; }
+  .topbar button.icon { padding: 5px 8px; min-width: 40px; }
   .topbar #btnAdd { padding: 5px 12px; }
 
   /* ── 3. 宽表 → 卡片 ────────────────────────────────────────────────
@@ -130,7 +130,7 @@
      没有标签的单元格（行首色条、跨列提示、账号/模型名）保持干净。 */
   .acc td::before {
     content: attr(data-l); flex: none; color: var(--ink-3);
-    font-size: 9.5px; line-height: 1.2; margin-right: 3px;
+    font-size: 10.5px; line-height: 1.2; margin-right: 3px;
     white-space: nowrap; letter-spacing: .2px;
   }
   .acc td:not([data-l])::before, .acc td.who::before { content: none; }
@@ -145,19 +145,19 @@
   .acc tr > td { grid-column: span 4; }
   .acc .who { display: block; min-width: 0; max-width: none; }
   .acc .who .nm { font-size: 13.5px; line-height: 1.25; }
-  .acc .who .id { font-size: 10px; line-height: 1.3; margin-top: 1px; }
+  .acc .who .id { font-size: 10.5px; line-height: 1.3; margin-top: 1px; }
   .acc .num { white-space: normal; }
   /* 桌面端限流 chip 有 186px 下限；卡片里必须放开，否则会伸出卡片边界 */
   .rate-limits { min-width: 0; max-width: 100%; }
   .rate-limit { max-width: 100%; }
   /* 桌面端数值列右对齐；卡片模式每格是「字段名 + 值」的行内组合，必须回左对齐 */
   .acc th.num, .acc td.num, .acc td.num:not(.usage-cell) { text-align: left; }
-  .acc .tag { font-size: 10px; padding: 1px 7px; }
+  .acc .tag { font-size: 10.5px; padding: 1px 7px; }
   .acc .bar { flex: 1 1 auto; min-width: 18px; max-width: none; height: 2px; margin-top: 0; border-radius: 2px; }
   .acc .usage-line { display: flex; flex-wrap: wrap; gap: 3px; white-space: normal; }
   .acc .usage-item { padding: 1px 5px; border-radius: 5px; }
-  .acc .usage-item b { font-size: 10px; }
-  .acc .usage-item em { font-size: 8.5px; }
+  .acc .usage-item b { font-size: 11px; }
+  .acc .usage-item em { font-size: 10.5px; }
   /* ④ 操作按钮：固定占满一行并平分宽度 → 全部按钮永远一行（主按钮蓝） */
   /* 操作按钮：5 个（签到/余额/任务/暂停/更多）在 390px 卡片里正好一行；
      极窄屏（320）自动折成 4+1，不会把「更多」挤出卡片。 */
@@ -172,7 +172,7 @@
      只给 4 格会把标签顶到卡片外面去 */
   #accBody tr > td:nth-child(3) { grid-column: 7 / 13; grid-row: 1; flex-direction: column; align-items: flex-end; gap: 2px; align-self: start; width: auto; max-width: none; }
   #accBody tr > td:nth-child(3)::before { content: none; }
-  #accBody tr > td:nth-child(3) .hint { font-size: 9.5px; margin-top: 0; text-align: right; }
+  #accBody tr > td:nth-child(3) .hint { font-size: 10.5px; margin-top: 0; text-align: right; }
   /* 积分独占一行：数字 + 进度条，跟其它字段不再挤成一段 */
   #accBody tr > .cred { grid-column: 1 / 13; grid-row: 2; gap: 7px; text-align: left; }
   #accBody tr > .cred .n { text-align: left; }
@@ -201,6 +201,9 @@
   #mdBody tr > td:nth-child(3), #mdBody tr > td:nth-child(4),
   #mdBody tr > td:nth-child(6), #mdBody tr > td:nth-child(7) { grid-column: span 3; }
   #mdBody tr > .efs { grid-column: 1 / 13; order: 2; min-width: 0; flex-wrap: wrap; gap: 3px; }
+  /* 模型 ID 是主键：允许两行，不再截成无法区分的 cn/deepseek-v4-fl... */
+  #mdBody .who .mid { white-space: normal; overflow-wrap: anywhere; }
+  .md-more-wrap { display: block; padding: 10px 12px 2px; text-align: center; }
 
   /* 用量明细 / 积分扣除（.acc.zebra）：列由 JS 按维度动态生成（账号/模型/域列数不同），
      不能写死 nth-child。第一个可见列（名称）整行，其余指标每格 3/12 自动流式排布。
@@ -236,14 +239,25 @@
   #reqBody tr > td:nth-child(8),
   #reqBody tr > td:nth-child(9) { grid-column: span 4; }
   #reqBody tr > td:nth-child(10) { grid-column: 1 / 13; }
+  /* 手机卡片只留 4 行（时间+结果 / 模型 / 账号 / 指标）；取证字段（IP/UA/请求 ID）
+     在桌面或归档里看，避免每张卡再占 3 行。 */
+  #reqBody tr > td:nth-child(5),
+  #reqBody tr > td:nth-child(6),
+  #reqBody tr > td:nth-child(10) { display: none; }
+  #reqBody tr > td:nth-child(4) { grid-column: 1 / 13; }
   /* 卡片模式给外层 .tbl-wrap 关了滚动（见上面第 3 节），但请求记录必须是「一屏高 +
      内部纵向滚动」：上游 .req-wrap 就是这个语义，overflow 被覆盖后卡片会溢出去压住
      下面的运行日志（实测卡片 bottom 1897 vs box bottom 904）。 */
-  .req-wrap { max-height: 70vh; overflow: auto; -webkit-overflow-scrolling: touch; }
+  /* 卡片模式下请求记录不再做 70vh 内嵌滚动：20 条先渲染，底部「加载更多」，
+     页面自然滚动，避免在手机里套第二个滚动容器。 */
+  .req-wrap { max-height: none; overflow: visible; }
+  .req-more-wrap { display: block; padding: 10px 12px 2px; text-align: center; }
 
   /* 上游新增的筛选栏 / 时间范围 / 维度切换 / KPI 卡：同密度口径收紧 */
   .fbar { padding: 8px 10px; gap: 6px; }
-  .fbar > input, .fbar > select { padding: 5px 8px; font-size: 12px; }
+  /* 右侧给自绘箭头留位置：原来 8px 会把「全部档位」的箭头贴到文字上。 */
+  .fbar > input, .fbar > select { padding: 5px 24px 5px 8px; font-size: 12px; }
+  .fbar > input[type=search] { padding-right: 8px; }
   .fbar > input[type=search] { min-width: 0; flex: 1 1 140px; }
   .trange { gap: 4px; }
   .trange select, .trange input { padding: 4px 7px; font-size: 12px; }
@@ -311,30 +325,37 @@
   /* 配置页：字段行更矮，标签/提示更小 */
   label.fld { margin-bottom: 9px; }
   label.fld > .lb { font-size: 11.5px; margin-bottom: 3px; }
-  label.fld > .hint, .hint { font-size: 10px; margin-top: 2px; }
-  input, select { height: 32px; padding: 0 9px; font-size: 12.5px; border-radius: 8px; }
+  label.fld > .hint, .hint { font-size: 11px; margin-top: 2px; }
+  input, select { height: 32px; min-height: 40px; padding: 0 9px; font-size: 12.5px; border-radius: 8px; }
   button { height: 30px; padding: 0 10px; font-size: 12.5px; border-radius: 8px; }
   .switch input[type=checkbox] { height: 22px; width: 40px; }
   .switch { padding: 6px 0; }
   .switch .lb { font-size: 12.5px; }
   .hr { margin: 2px 0 11px; }
-  legend { font-size: 11px; padding-bottom: 7px; }
+  legend { font-size: 11.5px; padding-bottom: 7px; }
 
   /* ── 5. 其余栅格与列表：全部收紧间距，统一 12px 圆角卡片感 ──────── */
   .view { padding: 10px 10px 40px; }
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+  /* 701–1000 是平板档：三列比两列更省首屏高度；≤700 在文件末尾回落两列。 */
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
   .stat, .kpi { min-width: 0; }
   .stat .v, .kpi .v { font-size: 18px; line-height: 1.15; white-space: normal; overflow-wrap: anywhere; }
   .stat .k, .kpi .k { font-size: var(--fs-kicker); }
-  /* 7 张卡排 2 列会剩下一张孤零零挂在左半边：让末张整行铺满，视觉上收口 */
-  .stats > .stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  /* 7 张卡排 3/2 列都会剩下一张：末张改成整行紧凑横条，而不是一张只有数字的大白卡。 */
+  .stats > .stat:nth-child(6) { grid-column: auto; }
+  .stats > .stat:last-child {
+    grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; min-height: 48px; padding: 10px 14px;
+  }
+  .stats > .stat:last-child .k { margin: 0; }
+  .stats > .stat:last-child .v { font-size: 20px; }
   .box { border-radius: 12px; margin-bottom: 12px; }
   .box > header { flex-wrap: wrap; gap: 6px 8px; padding: 10px 12px; min-height: 0; }
   .box > header h3 { font-size: var(--fs-emph); white-space: normal; flex: 1 1 100%; }
   .box > header .note { flex: 1 1 100%; order: 2; font-size: var(--fs-label); }
   .box > header > button, .box > header > .chips, .box > header > .vtabs, .box > header > .trange,
   .box > header > .sel-note, .box > header > select { order: 3; }
-  .box > header > button, .box > header > button.xs { height: 26px; font-size: var(--fs-ctl); padding: 0 9px; }
+  .box > header > button, .box > header > button.xs { height: 26px; min-height: 36px; font-size: var(--fs-ctl); padding: 0 9px; }
   /* 标题/说明各占满一行后，第一个操作按钮靠右：不会孤零零贴在左侧 */
   .box > header > button:first-of-type { margin-left: auto; }
   #mdReset, #btnReqReload, #btnCreditReload { margin-left: auto; }
@@ -360,12 +381,17 @@
   .qrow .code { flex: 1 1 auto; white-space: normal; overflow-wrap: anywhere; }
   .qrow .prog { flex: none; text-align: left; font-size: 11.5px; }
   .qrow .st { flex: none; font-size: 11.5px; }
-  .qrow .msg { flex: 1 1 100%; font-size: 10.5px; white-space: normal; overflow-wrap: anywhere; }
-  #logBox { padding: 10px; max-height: 60vh; font-size: 11px; }
+  .qrow .msg { flex: 1 1 100%; font-size: 11px; white-space: normal; overflow-wrap: anywhere; }
+  #logBox { padding: 10px; max-height: 50vh; font-size: var(--fs-meta); }
   .pk-grid { grid-template-columns: 1fr; }
   .pk-card { padding: 9px 11px; border-radius: 12px; }
   .pk-card .big { font-size: 19px; }
-  .pk-card .sub { font-size: 10.5px; }
+  .pk-card .sub { font-size: 11px; }
+  /* 平板两列；手机上摘要卡只留“账号 / 剩余 / 构成条”，来源明细点开逐包表再看。 */
+  @media (min-width: 561px) and (max-width: 1000px) {
+    .pk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  .pk-card .pk-legend { display: none; }
   .qprog { padding: 8px 11px 0; }
   .pk-expiry-hdr, .pk-expiry-row { grid-template-columns: 52px minmax(60px, 1fr) 62px; gap: 6px; }
   .pk-expiry-chart { padding-right: 4px; }
@@ -407,7 +433,7 @@
 
 /* ══ 安全区 / 动态视口 / iOS 输入 ═══════════════════════════════════════
    这一段放在最后：不参与上面的密度规则，只补设备级细节。 */
-@media (max-width: 760px) {
+@media (max-width: 1000px) {
   /* iPhone 刘海与 Home 条：不要让保存条、toast、抽屉底部状态压在手势区上 */
   .nav { padding-bottom: env(safe-area-inset-bottom); }
   .topbar { padding-top: env(safe-area-inset-top); }
@@ -424,14 +450,18 @@
     text-overflow: clip;
   }
 }
+/* 真正的小屏手机：统计卡回到两列（平板档保持三列）。 */
+@media (max-width: 700px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @supports (height: 100dvh) {
   .shell { min-height: 100dvh; }
-  @media (max-width: 760px) { .dlg { max-height: 92dvh; } }
+  @media (max-width: 1000px) { .dlg { max-height: 92dvh; } }
 }
 /* iOS Safari 对 font-size < 16px 的输入控件会强制放大页面，只对 iOS 抬高字号；
    安卓保持 12.5px 的密度，不被这条影响。 */
 @supports (-webkit-touch-callout: none) {
-  @media (max-width: 760px) {
+  @media (max-width: 1000px) {
     input, select, textarea { font-size: 16px; }
   }
 }

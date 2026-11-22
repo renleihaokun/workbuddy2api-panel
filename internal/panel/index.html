@@ -160,7 +160,7 @@
 html, body { height: 100%; }
 /* 切页时长短页面不出现滚动条，内容会横向跳一下：给桌面端常驻沟槽，位置就稳了。
    手机端滚动条是浮层，不需要（也不能）预留。 */
-@media (min-width: 761px) { html { scrollbar-gutter: stable; } }
+@media (min-width: 1001px) { html { scrollbar-gutter: stable; } }
 body {
   /* 两团固定环境光 + 底色：给毛玻璃提供"可折射的东西"。fixed 让光晕不随页面
      滚动移动，否则顶栏/侧栏的模糊结果会跟着内容漂移，看起来像在抖。
@@ -473,7 +473,7 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
      第二行因此是 [暂停 1][积分 2][粘性 1]，四格刚好填满。 */
   .stats > .stat:nth-child(6) { grid-column: span 2; }
 }
-@media (max-width: 900px) {
+@media (max-width: 1000px) {
   .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .stats > .stat:nth-child(6) { grid-column: auto; }
   .stats > .stat:last-child:nth-child(3n+1) { grid-column: 1 / -1; }
@@ -721,13 +721,51 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .acc.pool th:nth-child(3), .acc.pool td:nth-child(3) { width: 200px; max-width: 200px; }
 /* 笔记本档：列宽预算按「内容区 = 视口 − 232 侧栏 − 48 边距 − 10 滚动条」算。
    1366 下需要再省 ~95px，先把信息密度最低的「最近成功」整列收起（手机卡片模式不受影响）。 */
-@media (min-width: 761px) and (max-width: 1400px) {
+@media (min-width: 1001px) and (max-width: 1400px) {
   .acc.pool th:nth-child(8), .acc.pool td:nth-child(8) { display: none; }
 }
 /* 1280/1240 档再收一列「在途」：它多数时候是 0，值最大的是在途占满告警，
    而那条告警已经在账号池标题右侧的 note 里单独显示。 */
-@media (min-width: 761px) and (max-width: 1240px) {
+@media (min-width: 1001px) and (max-width: 1240px) {
   .acc.pool th:nth-child(6), .acc.pool td:nth-child(6) { display: none; }
+}
+/* 1001–1150：再收起「用量」列。账号表的固定列宽合计约 823px，而 1024 的
+   可见区只有 732px；收起 140px 后 683px 正好放下，操作列不再被推到屏外。
+   更窄的视口走手机卡片模式（≤1000），不会看到这条规则。 */
+@media (min-width: 1001px) and (max-width: 1150px) {
+  .acc.pool th:nth-child(7), .acc.pool td:nth-child(7) { display: none; }
+  /* 收起「用量」后表格仍差 ~50px：账号/状态列收窄，动作按钮减 padding；
+     1024 下「成功 / 失败」和操作列可同时完整显示，不再出现半截列。 */
+  .acc.pool th:nth-child(2), .acc.pool td:nth-child(2) { width: 150px; }
+  .acc.pool th:nth-child(3), .acc.pool td:nth-child(3) { width: 150px; max-width: 150px; }
+  .acc.pool .acts { gap: 2px; }
+  .acc.pool .acts button { padding: 0 3px; }
+}
+/* 请求记录 10 列在 1001–1400 收起来源 IP / UA / 请求 ID：这三列是取证字段，
+   不该把表格撑出横向滚动；1440 起恢复全列。 */
+@media (min-width: 1001px) and (max-width: 1400px) {
+  .acc.req th:nth-child(5), .acc.req td:nth-child(5),
+  .acc.req th:nth-child(6), .acc.req td:nth-child(6),
+  .acc.req th:nth-child(10), .acc.req td:nth-child(10) { display: none; }
+}
+/* 操作列 sticky：正常宽度没有横向溢出时它不动；一旦字体/缩放让表格略宽，
+   「暂停 / 恢复 / ⋯」仍钉在右侧可点。 */
+@media (min-width: 1001px) {
+  .acc.pool th:last-child, .acc.pool td:last-child {
+    position: sticky; right: 0; z-index: 2; background: var(--surface);
+    box-shadow: -8px 0 12px -12px rgba(0, 0, 0, .45);
+  }
+  .acc.pool thead th:last-child { background: var(--surface-2); }
+  .acc.pool tbody tr:hover td:last-child {
+    background: color-mix(in srgb, var(--accent) 6%, var(--surface-2));
+  }
+}
+/* 触摸设备（含 1024 触摸平板）统一放大可点区域；鼠标设备保持现有密度。 */
+@media (pointer: coarse) {
+  .topbar button, .topbar a.btn { min-height: 40px; }
+  .box > header button { min-height: 36px; }
+  .acc .acts button, .savebar button, .dlg footer button { min-height: 40px; }
+  input, select { min-height: 40px; }
 }
 
 /* 空态：图标 + 标题 + 说明的三段式（任务中心、账号池共用）。表格单元格里的
@@ -747,14 +785,30 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .empty.inline .big { margin-bottom: 0; }
 
 /* ── 日志（终端质感）────────────────────────────────────────────── */
+/* 手机/平板把三块日志拆成子标签，避免 100 条请求卡 + 500 行日志 + 100 条
+   积分历史同时堆在一页（实测 390 下文档 10.9k px）。桌面仍三块并排。 */
+#logTabs { display: none; margin: 0 0 12px; }
+@media (max-width: 1000px) {
+  #logTabs { display: inline-flex; }
+  .log-sec[hidden] { display: none !important; }
+}
 /* 日志区做成"终端面板"：底色退回页面色（v2 实现：--bg）向内凹，
    与外壳卡片形成一层内嵌关系；行高 1.7 保证长行可读。 */
 #logBox {
   max-height: 420px; overflow: auto; margin: 0; padding: 14px var(--pad-x);
-  font: var(--fs-meta)/1.7 var(--mono); white-space: pre-wrap; word-break: break-all; color: var(--ink-2);
+  font: var(--fs-meta)/1.7 var(--mono); white-space: pre-wrap; word-break: normal;
+  overflow-wrap: anywhere; color: var(--ink-2);
   background: var(--bg); box-shadow: inset 0 1px 0 var(--line-soft);
 }
-#logBox .ln { display: block; }
+/* 时间 / 频道 / 消息三列：长 UA 换行时对齐消息列，不再从 token 中间断成两行。 */
+#logBox .ln {
+  display: grid; grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 2px 7px; align-items: start;
+}
+#logBox .ln > * { grid-row: 1; }
+#logBox .ln time { grid-column: 1; color: var(--ink-3); white-space: nowrap; }
+#logBox .ln .lch { grid-column: 2; }
+#logBox .ln .lmsg { grid-column: 3; min-width: 0; }
 #logBox .ln.e { color: var(--bad); }
 #logBox .ln.w { color: var(--warn); }
 #view-logs .box > header { flex-wrap: wrap; }
@@ -812,6 +866,7 @@ legend { font-size: var(--fs-meta); color: var(--ink-3); font-weight: 600; paddi
   box-shadow: 0 -10px 24px -22px rgba(0,0,0,.55);
   position: sticky; bottom: 0; z-index: 5;
 }
+.savebar[hidden] { display: none; }
 .savebar .grow { flex: 1; }
 .restart-note { color: var(--warn); font-size: var(--fs-meta); }
 
@@ -947,7 +1002,7 @@ body[data-view="config"] #toasts { bottom: 84px; }
 
 /* 窄屏兜底：把两列壳层收成一列。真正的手机样式在 mobile.css（抽屉 / 卡片化表），
    这里只保留一条"侧栏不占位"的底线——mobile.css 加载失败时页面也不会被挤成一条窄柱。 */
-@media (max-width: 760px) {
+@media (max-width: 1000px) {
   .shell { grid-template-columns: 1fr; }
   .nav { position: static; height: auto; }
 }
@@ -1121,7 +1176,7 @@ body[data-view="config"] #toasts { bottom: 84px; }
   .ch-error { padding: 14px; color: var(--bad); display: flex; align-items: center; gap: 10px; }
   .kpis.ch-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .ch-legend .sw { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
-  @media (max-width: 760px) { td.ch-hint { white-space: normal; max-width: none; } }
+  @media (max-width: 1000px) { td.ch-hint { white-space: normal; max-width: none; } }
   @media (max-width: 700px) { .kpis.ch-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
   /* 用量表内的 prompt/completion 占比条。用 .us-mix 而不是复用账号池的 .bar：
@@ -1140,6 +1195,9 @@ body[data-view="config"] #toasts { bottom: 84px; }
    只有色块，没有重边框。 */
   /* auto-fill + 等宽轨道：5 张卡时最后一张不再被 flex 拉满整行（错误卡尤其明显） */
   .pk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .pk-card.on { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); box-shadow: var(--sh-2); }
+  .pk-card[role="button"] { cursor: pointer; }
+  .pk-card[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .pk-card { min-width: 0; border: 1px solid var(--line-soft);
     border-radius: var(--r-lg); padding: 12px 14px; background: var(--surface); }
   .pk-card .who { display: flex; align-items: baseline; gap: 7px; margin-bottom: 7px; }
@@ -1161,7 +1219,7 @@ body[data-view="config"] #toasts { bottom: 84px; }
   .pk-group-toggle:hover:not(:disabled) { border: 0; color: var(--accent); }
   .pk-hidden-row[hidden] { display: none; }
   .pk-hidden-row td { color: var(--ink-3); }
-  .pk-expiry-chart { max-height: 260px; overflow-y: auto; overflow-x: hidden;
+  .pk-expiry-chart { max-height: 360px; overflow-y: auto; overflow-x: hidden;
     scrollbar-gutter: stable; scrollbar-width: thin; padding-right: 10px;
     overscroll-behavior: contain; }
   .pk-expiry-hdr { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 72px;
@@ -1174,9 +1232,12 @@ body[data-view="config"] #toasts { bottom: 84px; }
   .pk-expiry-row > span { color: var(--ink-3); font-size: var(--fs-label); }
   .pk-expiry-row > b { text-align: right; font: 600 var(--fs-label) var(--mono);
     font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-  .pk-expiry-track { display: flex; align-items: stretch; gap: 2px; height: 8px;
-    border-radius: 4px; background: var(--surface-2); overflow: hidden; }
-  .pk-expiry-seg { display: block; min-width: 3px; height: 100%; cursor: default;
+  /* lane 是满宽底槽，track 按该档总量缩放：条长可比较，段内仍表达账号构成。 */
+  .pk-expiry-lane { min-width: 0; height: 8px; border-radius: 4px;
+    background: var(--surface-2); overflow: hidden; }
+  .pk-expiry-track { display: flex; align-items: stretch; gap: 2px; height: 100%;
+    min-width: 2px; border-radius: 4px; background: transparent; overflow: hidden; }
+  .pk-expiry-seg { display: block; min-width: 1px; height: 100%; cursor: default;
     background: var(--seg-color, var(--accent)); transition: filter .15s, transform .15s; }
   .pk-expiry-seg:hover { filter: brightness(1.12); transform: scaleY(1.35); }
   .pk-expiry-legend { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 8px;
@@ -1257,6 +1318,8 @@ body[data-view="config"] #toasts { bottom: 84px; }
   /* 请求记录最多可读 1000 条，不限高会把下面的「运行日志」推到很远的地方。
      限高 + 表头吸顶：滚动区域内始终能看到列名。 */
   .req-wrap { max-height: 460px; overflow: auto; }
+  .req-more-wrap { display: none; }
+  .md-more-wrap { display: none; }
   .req-wrap thead th { position: sticky; top: 0; background: var(--surface-2); z-index: 1; }
   .clip { display: block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .clip.ip { max-width: 150px; font-family: var(--mono); font-size: var(--fs-ctl); }
@@ -1290,6 +1353,11 @@ body[data-view="config"] #toasts { bottom: 84px; }
    v3：渲染模板里原先 20+ 处 style="color:var(--ink-3)/font-size…" 收进这里。
    动态值（进度条宽度、图表色、渐变 stop）仍保留内联，属于运行时数据不是样式。 */
 .muted { color: var(--ink-3); }
+/* 仅供读屏的文本：给空表头（操作列）提供可访问名称，axe/td-has-header 需要。 */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 /* 通用 .note：表格里的副行（uid / 包来源 / 限流原因）统一成 11.5px 弱色；
    卡片头、进度条、到期行各有更具体的规则会覆盖字号。 */
 .note { color: var(--ink-3); font-size: var(--fs-label); line-height: 1.45; }
@@ -1438,11 +1506,11 @@ button.ghost.danger:hover:not(:disabled) {
     <section class="view" id="view-accounts">
       <div class="stats">
         <div class="stat"><div class="k">账号总数</div><div class="v" id="sTotal">-</div></div>
-        <div class="stat good"><div class="k">可用</div><div class="v" id="sHealthy">-</div></div>
+        <div class="stat good"><div class="k">可用</div><div class="v" id="sHealthy">-</div><div class="s" id="sHealthySub">可用率 —</div></div>
         <div class="stat warn"><div class="k">冷却中</div><div class="v" id="sCooling">-</div></div>
         <div class="stat bad"><div class="k">已禁用</div><div class="v" id="sDisabled">-</div></div>
         <div class="stat warn"><div class="k">已暂停选号</div><div class="v" id="sPaused">-</div></div>
-        <div class="stat"><div class="k">积分剩余 / 总额</div><div class="v" id="sCredits">-</div></div>
+        <div class="stat"><div class="k">积分剩余 / 总额</div><div class="v" id="sCredits">-</div><div class="s" id="sCreditsSub">—</div></div>
         <div class="stat"><div class="k">粘性会话</div><div class="v" id="sSticky">-</div></div>
       </div>
 
@@ -1454,8 +1522,8 @@ button.ghost.danger:hover:not(:disabled) {
           <h3>积分到期提醒<span class="hint" title="按最近到期批次估算：日均需耗 = 批次剩余 ÷ 距到期天数；上游按失效时刻先后自动优先扣减（FEFO）。">按最近到期批次估算 · FEFO 先到期先扣</span></h3>
           <span class="grow"></span>
           <span class="note" id="expNote"></span>
-          <button class="xs" id="btnExpFold" aria-expanded="true">收起</button>
-          <button class="xs" id="btnExp">检查</button>
+          <button class="xs" id="btnExpFold" aria-expanded="true" aria-controls="expPad">收起明细</button>
+          <button class="xs" id="btnExp">刷新明细</button>
         </header>
         <div class="pad" id="expPad"><div id="expList"></div></div>
       </div>
@@ -1490,9 +1558,9 @@ button.ghost.danger:hover:not(:disabled) {
         <div class="tbl-wrap">
         <table class="acc pool">
           <thead><tr>
-            <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th class="num">积分</th>
-            <th class="num">成功 / 失败</th><th class="num">在途</th><th>用量</th><th class="num">最近成功</th><th class="c-acts"></th>
+            <th class="mark" scope="col" aria-hidden="true"></th>
+            <th scope="col">账号</th><th scope="col">状态</th><th scope="col" class="num">积分</th>
+            <th scope="col" class="num">成功 / 失败</th><th scope="col" class="num">在途</th><th scope="col">用量</th><th scope="col" class="num">最近成功</th><th scope="col" class="c-acts"><span class="sr-only">操作</span></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -1528,7 +1596,7 @@ button.ghost.danger:hover:not(:disabled) {
             <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
           <button class="xs" id="btnScanAll">扫描待办</button>
-          <button class="xs primary" id="btnRunQueue">执行全部待办</button>
+          <button class="xs primary" id="btnRunQueue" disabled title="扫描出待办后才可执行">执行全部待办</button>
         </header>
         <div class="qprog" id="qProg" hidden>
           <div class="qbar"><i id="qBarFill"></i></div>
@@ -1596,6 +1664,7 @@ button.ghost.danger:hover:not(:disabled) {
           <tbody id="mdBody"></tbody>
         </table>
         </div>
+        <div class="md-more-wrap"><button class="xs" id="btnMdMore" hidden>显示更多</button></div>
       </div>
     </section>
 
@@ -1628,18 +1697,10 @@ button.ghost.danger:hover:not(:disabled) {
 
       <div class="box">
         <header>
-          <h3>积分到期分布</h3>
-          <span class="grow"></span>
-          <span class="note">按批次到期日聚合，颜色区分账号</span>
-        </header>
-        <div class="pad"><div id="pkExpiry"></div></div>
-      </div>
-
-      <div class="box">
-        <header>
           <h3>账号对比</h3>
           <span class="grow"></span>
           <span class="note" id="pkNote">—</span>
+          <select id="pkAcctSel" class="xs" aria-label="查看账号逐包明细"></select>
           <select id="pkSort" class="xs" title="逐包明细的排序规则">
             <option value="end_asc" selected>按到期时间</option>
             <option value="size_desc">按面额大小</option>
@@ -1649,6 +1710,15 @@ button.ghost.danger:hover:not(:disabled) {
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
       </div>
       <div id="pkDetail"></div>
+
+      <div class="box">
+        <header>
+          <h3>积分到期分布</h3>
+          <span class="grow"></span>
+          <span class="note">按批次到期日聚合，条长=该档积分合计</span>
+        </header>
+        <div class="pad"><div id="pkExpiry"></div></div>
+      </div>
     </section>
 
     <!-- 用量 -->
@@ -2093,7 +2163,7 @@ button.ghost.danger:hover:not(:disabled) {
           </div>
         </div>
 
-        <div class="savebar">
+        <div class="savebar" id="cfgSavebar" hidden>
           <span class="grow"></span>
           <span class="restart-note" id="cfgNote"></span>
           <button type="button" id="btnCfgReload">放弃修改</button>
@@ -2104,7 +2174,12 @@ button.ghost.danger:hover:not(:disabled) {
 
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
-      <div class="box">
+      <div class="vtabs log-tabs" id="logTabs" role="tablist" aria-label="日志分类">
+        <button type="button" data-logtab="req" class="on" aria-pressed="true">请求记录</button>
+        <button type="button" data-logtab="log" aria-pressed="false">服务日志</button>
+        <button type="button" data-logtab="credit" aria-pressed="false">积分历史</button>
+      </div>
+      <div class="box log-sec" data-logsec="req">
         <header>
           <h3>请求记录 <span class="hint" title="来源 IP 取 X-Forwarded-For 首段；无代理头时回落 TCP 对端。">来源 IP / User-Agent</span></h3>
           <span class="grow"></span>
@@ -2137,11 +2212,12 @@ button.ghost.danger:hover:not(:disabled) {
             <tbody id="reqBody"></tbody>
           </table>
         </div>
+        <div class="req-more-wrap"><button class="xs" id="btnReqMore" hidden>加载更多</button></div>
       </div>
 
-      <div class="box">
+      <div class="box log-sec" data-logsec="log">
         <header>
-          <h3>运行日志</h3>
+          <h3>服务日志</h3>
           <span class="grow"></span>
           <span class="chips" id="logChips">
             <button class="xs chip on" data-ch="all" aria-pressed="true">全部</button>
@@ -2155,7 +2231,7 @@ button.ghost.danger:hover:not(:disabled) {
         <pre id="logBox"></pre>
       </div>
 
-      <div class="box">
+      <div class="box log-sec" data-logsec="credit">
         <header>
           <h3>积分历史 <span class="hint">每次真实查到余额与上次比对，变动即留痕</span></h3>
           <span class="grow"></span>
@@ -2182,7 +2258,7 @@ button.ghost.danger:hover:not(:disabled) {
   </div>
 </div>
 
-<!-- 抽屉遮罩：仅 ≤760px 由 app.js 切 .on；桌面端 display:none，不参与布局 -->
+<!-- 抽屉遮罩：仅 ≤1000px 由 app.js 切 .on；桌面端 display:none，不参与布局 -->
 <div class="nav-veil" id="navVeil"></div>
 
 <!-- 积分任务 -->

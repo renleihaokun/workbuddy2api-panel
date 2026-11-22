@@ -1,4 +1,4 @@
-/* mobile.js — 手机端（≤760px）联动逻辑：抽屉开合 + 宽表卡片化的字段名标签。
+/* mobile.js — 手机端（≤1000px）联动逻辑：抽屉开合 + 宽表卡片化的字段名标签。
  *
  * 本文件是本仓库自有文件，上游不维护（同步上游时不参与冲突）。
  * 必须在 app.js 之后加载：依赖 app.js 的全局（$、go、esc、各 render*）与已渲染的 DOM。
@@ -6,7 +6,7 @@
  * 分工：样式在 mobile.css；CSS 表达不了的联动（抽屉开关、th 文本 → td[data-l]）放这里。
  */
 
-/* ── 移动端适配（≤760px）──────────────────────────────────────────────
+/* ── 移动端适配（≤1000px）──────────────────────────────────────────────
    分工：所有手机端**样式**都在 mobile.css；这里只做 CSS 表达不了的联动：
 
    1) 侧栏抽屉开合（汉堡 / 遮罩 / 导航项 / ESC / 转回宽屏复位）。
@@ -19,9 +19,9 @@
       行全是 JS 动态 innerHTML 出来的（含弹层里的任务表、积分构成里每账号一张表），
       故用 MutationObserver 监听 body 子树，任何一次重渲染后自动补标签。
 
-   两件事在 >760px 时都空转：matchMedia 不匹配；data-l 只是多一个桌面端不参与
+   两件事在 >1000px 时都空转：matchMedia 不匹配；data-l 只是多一个桌面端不参与
    渲染的属性。桌面端表现与改动前完全一致。 */
-const MOBILE_MQ = matchMedia('(max-width: 760px)');
+const MOBILE_MQ = matchMedia('(max-width: 1000px)');
 
 const navDrawer = document.querySelector('.nav');
 const navBtn = $('navBtn'), navVeil = $('navVeil');
@@ -73,7 +73,7 @@ if (navVeil) navVeil.addEventListener('click', drawerClose);         // 点遮�
 // 点导航项关：事件委托，不去改上方既有的 go() 绑定
 if (navDrawer) navDrawer.addEventListener('click', ev => { if (ev.target.closest('a')) drawerClose(); });
 addEventListener('keydown', ev => { if (ev.key === 'Escape') drawerClose(); }); // ESC 关
-// 转回 >760px 自动复位：matchMedia 的 change 在跨过断点时触发，resize 兜底
+// 转回 >1000px 自动复位：matchMedia 的 change 在跨过断点时触发，resize 兜底
 function drawerResetIfWide() { if (!MOBILE_MQ.matches) drawerClose(); else drawerSet(navDrawer && navDrawer.classList.contains('open')); }
 if (MOBILE_MQ.addEventListener) MOBILE_MQ.addEventListener('change', drawerResetIfWide);
 else if (MOBILE_MQ.addListener) MOBILE_MQ.addListener(drawerResetIfWide); // 旧 Safari
@@ -94,14 +94,14 @@ function thLabel(th) {
 /* SHORT_LABEL 手机卡片用的短字段名：一行要并排放好几个指标，表头原名太长会挤成
    两行（「成功 / 失败」「支持的思考档位」「上下文长度」）。未列出的沿用表头纯文本。 */
 const SHORT_LABEL = {
-  '成功 / 失败': '成功',
+  '成功 / 失败': '成功/失败',
   '支持的思考档位': '档位',
   '上下文长度': '上下文',
   '最大输出': '输出',
   '积分倍率': '倍率',
   '均延迟': '延迟',
   '均速率': '速率',
-  '最近成功': '最近',
+  '最近成功': '最近成功',
 };
 function labelTable(table) {
   // 卡片模式把 table/tr/td 改成 block/grid 后，Chrome/Firefox 会丢掉原生表格角色。
@@ -164,7 +164,7 @@ new MutationObserver(queueLabels).observe(document.body, { childList: true, subt
    上游那张图是固定 viewBox 1200×200 的 SVG，靠 width:100% 整体缩放：360px 宽的手机上
    缩放比只有 ~0.28，内部 10px 刻度实际只剩 ~2.8px（看着就是一排小点），柱宽也只剩 5px。
    窄屏改用 440×230 的 viewBox（缩放 ~0.77）并抽稀刻度，字号/柱宽按 CSS 像素算，
-   不需要横向拖动。>760px 仍走上游实现，桌面端不受影响。
+   不需要横向拖动。>1000px 仍走上游实现，桌面端不受影响。
    实现放在本文件而不是改 app.js：上游常改前端，独立文件才不会每次同步都冲突。 */
 const deskUsageChart = renderUsageChart;
 
@@ -193,36 +193,40 @@ function drawMobileUsageChart(series) {
     $('usChartNote').textContent = '—';
     return;
   }
-  const W = 440, H = 230, PL = 56, PR = 12, PT = 18, PB = 30;
+  const W = chartWidth(host, 440, 320, 1000), H = 230, PL = 56, PR = 12, PT = 18, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB, yBase = PT + ih;
-  const t0 = pts[0].t, span = Math.max(1, pts[pts.length - 1].t - t0);
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t, span = Math.max(1, t1 - t0);
   const max = Math.max(1, ...pts.map(p => p.tt));
+  const step = niceStep(max, 3);
+  const axisMax = step * 3;
   const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
   const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
-  $('usChartNote').textContent = pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' +
-    fmtTokTimeLabel(peak) + ' · 均值 ' + fmtTok(avg);
+  const chartNote = pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' +
+    fmtAxisTimeLabel(peak.t, t0, t1, peak.scope) + ' · 均值 ' + fmtTok(avg);
+  $('usChartNote').textContent = chartNote;
 
   let minGap = Infinity;
   for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
   if (!isFinite(minGap) || minGap <= 0) minGap = span;
   const bw = Math.max(3, Math.min(22, iw * (minGap / span) * 0.7));
   const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
-  const yOf = v => PT + ih - ih * (v / max);
+  const yOf = v => PT + ih - ih * (v / axisMax);
 
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="xMidYMid meet">';
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Token 时序图：' +
+    pts.length + ' 个数据点" preserveAspectRatio="xMidYMid meet">';
   // 只画 4 条网格：窄屏塞 5 条时刻度文字比柱子还挤
   for (let i = 0; i <= 3; i++) {
     const y = PT + ih - (ih * i / 3);
     out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>' +
-      '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 4).toFixed(1) + '" text-anchor="end">' + fmtTok(max * i / 3) + '</text>';
+      '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 4).toFixed(1) + '" text-anchor="end">' + fmtTokTick(axisMax * i / 3) + '</text>';
   }
-  if (avg > 0 && avg < max) {
+  if (avg > 0 && avg < axisMax) {
     const y = yOf(avg);
     out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
   }
   for (const p of pts) {
     const x = xOf(p.t) - bw / 2;
-    const hTot = ih * (p.tt / max);
+    const hTot = ih * (p.tt / axisMax);
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     // 每根柱子包一个 <g>：SVG 里 <title> 描述的是父元素，平铺在根下会全图共用一个
@@ -236,7 +240,8 @@ function drawMobileUsageChart(series) {
   }
   out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) + '" y2="' + yBase + '"/>';
   // x 刻度抽到 4 个（上游 6 个），且取"离目标最近的真实柱子"，标签永远落在有数据的点上
-  const TICKS = Math.min(4, pts.length);
+  // 390 宽、带日期的标签约 80px；3 个就会互相压住，≤420 只放首尾两个。
+  const TICKS = Math.min(W < 420 ? 2 : 4, pts.length);
   const used = new Set();
   for (let k = 0; k < TICKS; k++) {
     const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
@@ -250,7 +255,8 @@ function drawMobileUsageChart(series) {
     const p = pts[bi], cx = xOf(p.t);
     const anchor = cx < PL + 16 ? 'start' : (cx > W - PR - 16 ? 'end' : 'middle');
     out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) + '" y="' + (yBase + 15).toFixed(1) +
-      '" text-anchor="' + anchor + '">' + esc(fmtTokTimeLabel(p)) + '</text>';
+      '" text-anchor="' + anchor + '">' +
+      esc(fmtAxisTimeLabel(p.t, t0, t1, p.scope)) + '</text>';
   }
   let prevDay = null; // 跨天分隔线：长窗口里能看出日界
   for (const p of pts) {

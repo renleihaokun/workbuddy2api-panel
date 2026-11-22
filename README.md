@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.23.0-panel`（通道健康看板 v3：事件分类改由 `internal/channelstat/kind.go` 注册表统一驱动，趋势图拆成「拦截事件 / 出站改写」双度量并支持每千请求，补数据覆盖期与服务端分桶时区提示；请求路径收口为 `channelAdapt` 状态机，修复内容拦截降级归档、客户端断连罚号、非流式 error 帧漏计、学习计数并发重复等边界）。
+> 当前版本 `1.24.0-panel`（面板视觉 v4：手机/平板断点统一到 1000，首屏折叠积分到期提醒，积分构成改单账号明细，图表按容器宽度绘制并修跨天刻度，日志/请求/模型分页加载；详见 `docs/ui-v4/README.md`）。
 
 ## 核心能力
 

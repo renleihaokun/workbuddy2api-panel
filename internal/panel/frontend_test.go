@@ -89,7 +89,7 @@ const inert = new Proxy(function () {}, {
 });
 const sandbox = new Proxy({
   location: { hash: process.env.SMOKE_HASH || '#taskscenter' },
-  history: { replaceState() {} },
+  history: { replaceState() {}, pushState() {} },
   localStorage: { getItem: () => null, setItem() {} },
   navigator: { clipboard: { writeText: () => Promise.resolve() } },
   document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
@@ -1381,7 +1381,7 @@ process.stdout.write(JSON.stringify({fresh: fresh, folded: folded, unfolded: unf
 	if err != nil {
 		t.Fatalf("expiry fold node test failed: %v\n%s", err, out)
 	}
-	const want = `{"fresh":{"hidden":false,"text":"收起","aria":"true","raw":null},"folded":{"hidden":true,"text":"展开","aria":"false","raw":"1"},"unfolded":{"hidden":false,"text":"收起","aria":"true","raw":"0"},"restored":{"hidden":true,"text":"展开","aria":"false","raw":"1"}}`
+	const want = `{"fresh":{"hidden":false,"text":"收起明细","aria":"true","raw":null},"folded":{"hidden":true,"text":"展开","aria":"false","raw":"1"},"unfolded":{"hidden":false,"text":"收起明细","aria":"true","raw":"0"},"restored":{"hidden":true,"text":"展开","aria":"false","raw":"1"}}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry fold=%s\nwant %s", strings.TrimSpace(string(out)), want)
 	}
@@ -1491,6 +1491,14 @@ const ctx = {
   fmtTokTimeLabel: p => { const d = new Date(p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00');
                           return p.scope === 'day' ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
                                                    : String(d.getHours()).padStart(2, '0') + ':00'; },
+  chartWidth: () => 440,
+  niceStep: (max, ticks) => Math.max(1, Math.ceil(Number(max || 1) / Math.max(1, ticks))),
+  fmtTokTick: v => String(Math.round(Number(v) || 0)),
+  fmtAxisTimeLabel: (ms, t0, t1, scope) => {
+    const d = new Date(ms);
+    return scope === 'day' ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+                           : String(d.getHours()).padStart(2, '0') + ':00';
+  },
   parsePointTime: p => { const d = new Date(p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00');
                          return isNaN(d.getTime()) ? null : d.getTime(); },
   $: id => (sinks[id] || mk(id)),
@@ -2375,6 +2383,135 @@ func TestCSSNoLiteralFontSizes(t *testing.T) {
 		if sizeRe.MatchString(line) || fontRe.MatchString(line) {
 			t.Fatalf("组件 CSS 仍有裸 px 字号（应改用 --fs-* 令牌）：第 %d 行 %s", i+1, strings.TrimSpace(line))
 		}
+	}
+}
+
+// TestMobileCSSFontFloor 手机/平板数据区不允许再出现 <10.5px 的字号：
+// 8.5/9.5/10px 在 390 宽的实际屏幕上很难读，且会随上游同步悄悄回退。
+func TestMobileCSSFontFloor(t *testing.T) {
+	b, err := os.ReadFile("mobile.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`font-size:\s*(?:[0-9]|10(?:\.0+)?)px`)
+	for i, line := range strings.Split(string(b), "\n") {
+		if re.MatchString(line) {
+			t.Fatalf("mobile.css 仍有 <10.5px 字号：第 %d 行 %s", i+1, strings.TrimSpace(line))
+		}
+	}
+}
+
+// TestAppJSExpiryAutoFold 账号多时默认折叠，账号少时默认展开；用户显式选择优先。
+func TestAppJSExpiryAutoFold(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry auto fold test skipped")
+	}
+	script := `const fs=require('fs'),vm=require('vm');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const start=src.indexOf('function expFolded(');
+const end=src.indexOf('function expSummaryText');
+if(start<0||end<0) throw new Error('expFolded not found');
+function boot(stored, count) {
+  const ctx={overviewData:{accounts:Array(count)},String,Map,Array,Object};
+  ctx.localStorage={getItem:k=>k in stored?stored[k]:null,setItem:(k,v)=>{stored[k]=v;}};
+  ctx.$=()=>({querySelectorAll:()=>[]});
+  vm.createContext(ctx); vm.runInContext(src.slice(start,end)+'\nthis.expFolded=expFolded;',ctx);
+  return ctx.expFolded();
+}
+process.stdout.write(JSON.stringify({
+  many:boot({},9), few:boot({},8),
+  manyOpen:boot({'wb2api.expfold.v1':'0'},19),
+  fewFold:boot({'wb2api.expfold.v1':'1'},1)
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-autofold-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry auto fold node test failed: %v\n%s", err, out)
+	}
+	want := `{"many":true,"few":false,"manyOpen":false,"fewFold":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("expiry auto fold=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSAccountDisplayName 账号名消歧：重名追加 uid4，长邮箱/长名字保留区分位。
+func TestAppJSAccountDisplayName(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; display name test skipped")
+	}
+	script := `const fs=require('fs'),vm=require('vm');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const start=src.indexOf('function acctNameCounts');
+const end=src.indexOf('function renderAccounts');
+if(start<0||end<0) throw new Error('display helpers not found');
+const ctx={String,Map,matchMedia:()=>({matches:false}),Array,Object}; vm.createContext(ctx);
+vm.runInContext(src.slice(start,end)+'\nthis.acctNameCounts=acctNameCounts;this.acctDisplayName=acctDisplayName;',ctx);
+const list=[{uid:'uid-1111',nickname:'dup'},{uid:'uid-2222',nickname:'dup'},{uid:'uid-3333',nickname:'renleihaokun161@gmail.com'},{uid:'uid-4444',nickname:'renleihaokun2'}];
+const c=ctx.acctNameCounts(list);
+process.stdout.write(JSON.stringify({dup:ctx.acctDisplayName(list[0],c),email:ctx.acctDisplayName(list[2],c),plain:ctx.acctDisplayName(list[3],c)}));`
+	f, err := os.CreateTemp(t.TempDir(), "acctname-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("account display name node test failed: %v\n%s", err, out)
+	}
+	want := `{"dup":"dup · uid-","email":"renleihao…61@…","plain":"renleihaok…2"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("account names=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSAxisTimeLabelMultiDay 跨天窗口必须带 MM-DD：只写 HH:00 会把
+// 「11-20 23:00 → 11-21 19:00」读成同一天内的倒序。
+func TestAppJSAxisTimeLabelMultiDay(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; axis label test skipped")
+	}
+	script := `const fs=require('fs'),vm=require('vm');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const start=src.indexOf('function fmtAxisTimeLabel');
+const end=src.indexOf('function renderUsageChart');
+if(start<0||end<0) throw new Error('axis helper not found');
+const ctx={Date,String,Number,Math,Object}; vm.createContext(ctx);
+vm.runInContext(src.slice(start,end)+'\nthis.fmtAxisTimeLabel=fmtAxisTimeLabel;',ctx);
+const a=new Date(2026,10,20,23,0).getTime(), b=new Date(2026,10,21,19,0).getTime();
+const same0=new Date(2026,10,21,8,0).getTime(), same1=new Date(2026,10,21,19,0).getTime();
+process.stdout.write(JSON.stringify({
+  multi:ctx.fmtAxisTimeLabel(a,a,b,'hour'),
+  same:ctx.fmtAxisTimeLabel(same0,same0,same1,'hour'),
+  day:ctx.fmtAxisTimeLabel(a,a,b,'day')
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "axistime-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("axis label node test failed: %v\n%s", err, out)
+	}
+	want := `{"multi":"11-20 23:00","same":"08:00","day":"11-20"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("axis labels=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }
 
