@@ -1,8 +1,14 @@
 name: go-binaries
 
 # 可运行二进制构建/发布：
-#   - PR / push main → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
-#   - push v* tag    → 同上 + 打包上传到 GitHub Release（zip/tar.gz + checksums）
+#   - PR / push main → 只跑测试（go test -race），不编译五平台包
+#   - push v* tag / dispatch 到 tag 引用 → 测试 + 五平台编译 + 打包上传 Release
+#
+# 为什么 push main 不再编译：五平台矩阵（含 mac/arm64 交叉编译 + 打包 + 上传 artifact）
+# 每次 push 都要跑，是 fork 上 Actions 额度的主要消耗。2026-11-23 fork 因「Actions 用量
+# 规模」被 GitHub 限流（表现为 push 静默不触发、dispatch 报 422，而 /actions/permissions
+# 仍显示 enabled），恢复后把重活收进 tag 引用：日常推送只留回归测试。
+#
 # 固化的发布纪律（曾两次人祸，见仓库 HANDOFF）：-s -w 剥离、二进制版本串 == 源码
 # appVersion、tag 版本 == 源码版本（-ci 后缀的测试 tag 豁免，用于演练发布线）。
 on:
@@ -41,6 +47,10 @@ jobs:
 
   build:
     needs: test
+    # 只在「发版引用」上编译五平台包：tag push，或手工 workflow_dispatch 到 tag 引用
+    # （auto-release 就是这么拉起本工作流的，那时 github.ref 也是 refs/tags/v*）。
+    # push main / PR 只跑上面的 test —— 见文件头「为什么 push main 不再编译」。
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
