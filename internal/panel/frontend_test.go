@@ -2443,6 +2443,8 @@ process.stdout.write(JSON.stringify({
 }
 
 // TestAppJSAccountDisplayName 账号名消歧：重名追加 uid4，长邮箱/长名字保留区分位。
+// v5：账号列从「钉死 170px」换成弹性列，所以窄档保留 local part（renleihaokun161@…），
+// 宽档（≥1200px）直接给全名——以前连 1920 都截成 renleihao…61@…，列里明明放得下。
 func TestAppJSAccountDisplayName(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -2453,11 +2455,15 @@ const src=fs.readFileSync(process.argv[2],'utf8');
 const start=src.indexOf('function acctNameCounts');
 const end=src.indexOf('function renderAccounts');
 if(start<0||end<0) throw new Error('display helpers not found');
-const ctx={String,Map,matchMedia:()=>({matches:false}),Array,Object}; vm.createContext(ctx);
+const state={wide:false};
+const ctx={String,Map,matchMedia:()=>({matches:state.wide}),Array,Object}; vm.createContext(ctx);
 vm.runInContext(src.slice(start,end)+'\nthis.acctNameCounts=acctNameCounts;this.acctDisplayName=acctDisplayName;',ctx);
 const list=[{uid:'uid-1111',nickname:'dup'},{uid:'uid-2222',nickname:'dup'},{uid:'uid-3333',nickname:'renleihaokun161@gmail.com'},{uid:'uid-4444',nickname:'renleihaokun2'}];
 const c=ctx.acctNameCounts(list);
-process.stdout.write(JSON.stringify({dup:ctx.acctDisplayName(list[0],c),email:ctx.acctDisplayName(list[2],c),plain:ctx.acctDisplayName(list[3],c)}));`
+const narrow={dup:ctx.acctDisplayName(list[0],c),email:ctx.acctDisplayName(list[2],c),plain:ctx.acctDisplayName(list[3],c)};
+state.wide=true;
+const wide={email:ctx.acctDisplayName(list[2],c),plain:ctx.acctDisplayName(list[3],c)};
+process.stdout.write(JSON.stringify({narrow,wide}));`
 	f, err := os.CreateTemp(t.TempDir(), "acctname-*.cjs")
 	if err != nil {
 		t.Fatal(err)
@@ -2470,7 +2476,8 @@ process.stdout.write(JSON.stringify({dup:ctx.acctDisplayName(list[0],c),email:ct
 	if err != nil {
 		t.Fatalf("account display name node test failed: %v\n%s", err, out)
 	}
-	want := `{"dup":"dup · uid-","email":"renleihao…61@…","plain":"renleihaok…2"}`
+	want := `{"narrow":{"dup":"dup · uid-","email":"renleihaokun161@…","plain":"renleihaok…2"},` +
+		`"wide":{"email":"renleihaokun161@gmail.com","plain":"renleihaokun2"}}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("account names=%s want %s", strings.TrimSpace(string(out)), want)
 	}
@@ -2564,5 +2571,193 @@ func TestCSSUsageLineGrid(t *testing.T) {
 	html := string(b)
 	if !regexp.MustCompile(`(?s)\.usage-line\s*\{[^}]*display:\s*grid`).MatchString(html) {
 		t.Fatal(".usage-line 不再使用 grid：四枚 chip 会竖排，账号表行高翻倍")
+	}
+}
+
+/* ══ v5 桌面端列宽预算与溢出治理 ═══════════════════════════════════════
+   这些测试守的是「数字不能跑出方块」这条底线。v1.24.3 面板在 1024–1920 全宽度
+   都有同一类问题：auto 布局把盈余平摊给每一列，「用量」列钉死 140px 却要装下
+   139px 的四枚 chip，于是「305.7 tok/s」被画到隔壁「操作」列上。 */
+
+// panelReadIndex 读 index.html（多个 v5 测试共用）。
+func panelReadIndex(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// panelCSSRule 取某条 CSS 规则的花括号内容（选择器必须精确匹配，不许带后缀）。
+func panelCSSRule(t *testing.T, html, sel string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?s)` + regexp.QuoteMeta(sel) + `\s*\{([^}]*)\}`)
+	m := re.FindStringSubmatch(html)
+	if m == nil {
+		t.Fatalf("找不到 CSS 规则 %s", sel)
+	}
+	return m[1]
+}
+
+// TestCSSAccountTableColumnBudget 账号表必须固定布局 + 给每列显式宽度预算。
+// 退回 auto 布局，列宽就会重新被内容平摊：积分/成功失败/在途/最近成功 各空出
+// 70–140px，而账号列被钉在 170px、用量列被钉在 140px——两端同时出问题。
+func TestCSSAccountTableColumnBudget(t *testing.T) {
+	html := panelReadIndex(t)
+	rule := panelCSSRule(t, html, ".acc.pool")
+	if !strings.Contains(rule, "table-layout: fixed") {
+		t.Fatal("账号表不再是 table-layout:fixed：列宽会重新按内容平摊，数字列又会空出大片空白")
+	}
+	// 列宽下限：状态 100 / 积分 110 / 用量 168 / 操作 168。
+	// 用量列 168 是实测值：内容区 = 168 − 24(cell padding) = 144，最坏一行需要 139。
+	for _, want := range []struct {
+		nth int
+		min int
+	}{{3, 100}, {4, 110}, {7, 168}, {9, 168}} {
+		re := regexp.MustCompile(fmt.Sprintf(`\.acc\.pool th:nth-child\(%d\)\s*\{\s*width:\s*(\d+)px`, want.nth))
+		m := re.FindStringSubmatch(html)
+		if m == nil {
+			t.Fatalf("缺少 .acc.pool th:nth-child(%d) 的宽度预算", want.nth)
+		}
+		w, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w < want.min {
+			t.Fatalf("第 %d 列宽 %dpx 低于下限 %dpx：该列内容会挤出单元格", want.nth, w, want.min)
+		}
+	}
+	// 账号列必须是「吃余量」的那一列，不能被写死。
+	if !regexp.MustCompile(`\.acc\.pool th:nth-child\(2\)\s*\{\s*width:\s*auto`).MatchString(html) {
+		t.Fatal("账号列（第 2 列）必须 width:auto 吃余量，否则宽屏下名字仍被裁")
+	}
+	if !regexp.MustCompile(`\.acc\.pool \.who\s*\{[^}]*max-width:\s*none`).MatchString(html) {
+		t.Fatal(".acc.pool .who 必须解除 170px 的 max-width 约束")
+	}
+}
+
+// TestCSSUsageChipClipsInsideBox 用量 chip 必须自带溢出兜底。
+// 列宽够时 chip 恰好包住文字；真出现超长值时收缩 + 省略号，绝不能画到方块外面。
+func TestCSSUsageChipClipsInsideBox(t *testing.T) {
+	html := panelReadIndex(t)
+	item := panelCSSRule(t, html, ".usage-item")
+	if !strings.Contains(item, "min-width: 0") {
+		t.Fatal(".usage-item 缺少 min-width:0：grid 轨道不会收缩，文字会溢出")
+	}
+	if !strings.Contains(item, "overflow: hidden") {
+		t.Fatal(".usage-item 缺少 overflow:hidden：超长数值会画到 chip 外面")
+	}
+	if !regexp.MustCompile(`(?s)\.usage-item b,\s*\.usage-item em\s*\{[^}]*text-overflow:\s*ellipsis`).MatchString(html) {
+		t.Fatal("chip 内文字缺少 nowrap + ellipsis 兜底")
+	}
+	cell := panelCSSRule(t, html, ".usage-cell")
+	if !regexp.MustCompile(`width:\s*(1[7-9]\d|2\d\d)px`).MatchString(cell) {
+		t.Fatalf(".usage-cell 宽度必须 ≥176px（当前：%s）", strings.TrimSpace(cell))
+	}
+}
+
+// TestCSSConfigNumberInputNarrow 配置页的数字框必须收口。
+// v1.24 里「单账号明细默认展示条数」是 1112px 宽、装一个 1 位数。
+func TestCSSConfigNumberInputNarrow(t *testing.T) {
+	html := panelReadIndex(t)
+	re := regexp.MustCompile(`#cfgForm input\[type=number\]\s*\{\s*max-width:\s*(\d+)px`)
+	m := re.FindStringSubmatch(html)
+	if m == nil {
+		t.Fatal("缺少 '#cfgForm input[type=number] { max-width: … }'：数字框会重新撑满整行")
+	}
+	w, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w > 240 {
+		t.Fatalf("数字框上限 %dpx 太宽（>240px）", w)
+	}
+	hours := panelCSSRule(t, html, ".fld-hours input")
+	if !regexp.MustCompile(`max-width:\s*2[0-9]\dpx`).MatchString(hours) {
+		t.Fatalf(".fld-hours input 缺少 240px 级别的 max-width：时点列表会重新撑满整格")
+	}
+}
+
+// TestCSSLongTableSticky 长表必须自带滚动条 + 吸顶表头。
+// .box{overflow:hidden} 会让 position:sticky 相对卡片失效，页面级滚动的表吸不住
+// 表头——只有自带滚动条的 .tbl-wrap.tall 能吸。账号池 / 用量明细 / 积分扣除历史
+// 都靠这条规则。
+func TestCSSLongTableSticky(t *testing.T) {
+	html := panelReadIndex(t)
+	tall := panelCSSRule(t, html, ".tbl-wrap.tall")
+	if !strings.Contains(tall, "overflow: auto") {
+		t.Fatal(".tbl-wrap.tall 缺少 overflow:auto：没有滚动容器，sticky 表头不会生效")
+	}
+	if !regexp.MustCompile(`(?s)\.tbl-wrap\.tall thead th\s*\{[^}]*position:\s*sticky`).MatchString(html) {
+		t.Fatal(".tbl-wrap.tall thead th 必须是 position:sticky（表头吸顶）")
+	}
+	// 至少三张长表要挂上 tall：账号池、用量明细、积分扣除历史。
+	if n := strings.Count(html, `class="tbl-wrap tall`); n < 3 {
+		t.Fatalf("只有 %d 张表挂了 .tbl-wrap.tall，至少应为 3 张（账号池 / 用量明细 / 积分扣除历史）", n)
+	}
+	if !regexp.MustCompile(`(?s)\.tbl-wrap\.acct-tall\s*\{[^}]*--tbl-max-h`).MatchString(html) {
+		t.Fatal("账号池缺少 .acct-tall 的高度预算（--tbl-max-h）")
+	}
+}
+
+// TestCSSKpiGridNoOrphan KPI 卡不许再出现「5+1」孤儿排布。
+// auto-fit + minmax(168px) 在 1280 下算成 5 列，六张卡的第二行只剩一张。
+func TestCSSKpiGridNoOrphan(t *testing.T) {
+	html := panelReadIndex(t)
+	kpis := panelCSSRule(t, html, ".kpis")
+	if strings.Contains(kpis, "auto-fit") {
+		t.Fatal(".kpis 退回 auto-fit：列数随宽度漂移，会出现 5+1 孤儿卡")
+	}
+	if !regexp.MustCompile(`grid-template-columns:\s*repeat\(6,`).MatchString(kpis) {
+		t.Fatalf("六张 KPI 卡应显式排成 6 列（当前：%s）", strings.TrimSpace(kpis))
+	}
+}
+
+// TestAppJSAccountMenuOwnsTasks 「任务」入口必须在 ⋯ 菜单里，且企业版不出现。
+// v5 把行内按钮从 5 个收到 4 个，操作列才有空间让给账号名。
+func TestAppJSAccountMenuOwnsTasks(t *testing.T) {
+	b, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(b)
+	if strings.Contains(js, `data-a="tasks"`) {
+		t.Fatal("行内仍然渲染 data-a=\"tasks\" 按钮：操作列会被重新撑宽（应并入 ⋯ 菜单）")
+	}
+	if !regexp.MustCompile(`(?s)function openAccountMenu[\s\S]*?if \(!s\.enterprise\) items\.push\(\{ label: '成长任务'`).MatchString(js) {
+		t.Fatal("openAccountMenu 缺少「成长任务」菜单项（且必须带企业版守卫）")
+	}
+}
+
+// TestAppJSShortUid 弹窗标题里的 uid 必须带省略号，不能裸切片。
+func TestAppJSShortUid(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; shortUid test skipped")
+	}
+	script := `const fs=require('fs'),vm=require('vm');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const start=src.indexOf('function shortUid');
+const end=src.indexOf('function dur(', start);
+if(start<0||end<0) throw new Error('shortUid not found');
+const ctx={String}; vm.createContext(ctx);
+vm.runInContext(src.slice(start,end)+'\nthis.shortUid=shortUid;',ctx);
+process.stdout.write(JSON.stringify({long:ctx.shortUid('0ff3a47b-d495-48b7-9c1e-2f3a4b5c6d7e'),short:ctx.shortUid('abc123')}));`
+	f, err := os.CreateTemp(t.TempDir(), "shortuid-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("shortUid node test failed: %v\n%s", err, out)
+	}
+	want := `{"long":"0ff3a47b…6d7e","short":"abc123"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("shortUid=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }

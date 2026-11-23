@@ -203,6 +203,13 @@ function ago(iso) {
   if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
   return Math.floor(s / 86400) + ' 天前';
 }
+// shortUid 弹窗标题里的 uid：前 8 + … + 后 4。以前是裸 slice(0,16)，看着像
+// 「0ff3a47b-d495-48」——既没省略号也不知道是不是被截了，四个号前缀相同时分不清。
+function shortUid(uid) {
+  const s = String(uid || '');
+  if (!s) return '—';
+  return s.length > 14 ? s.slice(0, 8) + '…' + s.slice(-4) : s;
+}
 function dur(sec) {
   sec = Math.max(0, Math.round(sec));
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
@@ -462,8 +469,17 @@ function openVeil(id) {
   document.documentElement.classList.add('lock');
   DLG_STACK.push({ veil, prev });
   setTimeout(() => {
+    // 初焦点策略（v5）：以前一律落在「第一个可聚焦元素」，积分任务弹窗就把焦点
+    // 压在了「全部接受」上——一个批量动作默认吃 Enter，而且它的蓝色焦点环跟真正的
+    // 主按钮「一键完成可自动任务」打架，看起来像两个主按钮。
+    // 现在的顺序：显式 data-autofocus → 第一个文本输入（有输入框的弹窗就是来打字的）
+    // → 页脚里最后一个非主色按钮（通常是「关闭」，最不具破坏性）→ 兜底第一个。
     const f = dlgFocusables(veil);
-    const target = f[0] || dlg;
+    const field = f.find(el => el.matches &&
+      el.matches('input:not([type=checkbox]):not([type=radio]):not([type=hidden]), textarea, select'));
+    const auto = dlg.querySelector('[data-autofocus]');
+    const dismiss = dlg.querySelector('footer button:not(.primary):not(.danger):last-of-type');
+    const target = auto || field || dismiss || f[0] || dlg;
     if (target && target.focus) target.focus({ preventScroll: true });
   }, 30);
 }
@@ -618,16 +634,22 @@ function acctNameCounts(list) {
 function acctDisplayName(a, counts) {
   const raw = String((a && (a.nickname || a.name)) || '').trim() ||
     String((a && a.uid) || '').slice(0, 8);
+  // v5：账号列从「钉死 170px」换成弹性列（1024 下 206px / 1440 下 300px / 宽屏 600+），
+  // 所以不再需要无条件把邮箱中间截断——以前连 1920 都显示成 renleihao…n2@…，
+  // 而列里明明有 600px 放得下全名。现在按列宽档位给阈值，剩下的交给 CSS 省略号
+  // （.nm-text），完整名字始终在 title 里。
+  const wide = typeof matchMedia === 'function' && matchMedia('(min-width: 1200px)').matches;
+  const emailLimit = wide ? 34 : 20;
+  const nameLimit = wide ? 30 : 12;
   let short = raw;
-  if (raw.indexOf('@') > 0 && raw.length > 18) {
+  if (raw.indexOf('@') > 0 && raw.length > emailLimit) {
     const local = raw.split('@')[0];
-    short = local.length > 12
-      ? local.slice(0, 9) + '…' + local.slice(-2) + '@…'
+    short = local.length > 18
+      ? local.slice(0, 15) + '…' + local.slice(-2) + '@…'
       : local + '@…';
-  } else if (raw.length > 12 &&
-             !(typeof matchMedia === 'function' && matchMedia('(min-width: 1600px)').matches)) {
-    // 非邮箱长名（renleihaokun2…）只在窄屏保留尾部：宽屏列足够，显示全名。
-    short = raw.slice(0, 10) + '…' + raw.slice(raw.length > 14 ? -2 : -1);
+  } else if (raw.length > nameLimit) {
+    // 非邮箱长名：保留头尾，中间省略（尾部通常是区分号的那个数字）
+    short = raw.slice(0, nameLimit - 2) + '…' + raw.slice(raw.length > nameLimit + 2 ? -2 : -1);
   }
   const count = counts ? counts.get(raw.toLowerCase()) || 0 : 0;
   if (count > 1 && a && a.uid && short.indexOf(' · ') < 0) {
@@ -718,15 +740,15 @@ function renderAccounts(list) {
         // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
         // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
         // upstream 的 get-enterprise-user-usage 口径填充。
+        // v5：行内只留「签到 / 余额 / 暂停·恢复」三个高频动作，「任务」并入 ⋯ 菜单
+        // （操作列 219 → 176px，把宽度让给账号名；企业版菜单里同样不出现任务项）。
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '" title="解冻，恢复参与选号">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '" title="恢复选号">恢复</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '暂停选号：退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停</button>')) +
-        '<button class="xs ghost more-btn" data-a="more" data-u="' + esc(s.uid) + '" aria-haspopup="menu" aria-expanded="false" title="更多操作：禁用 / 移除">⋯</button>' +
+        '<button class="xs ghost more-btn" data-a="more" data-u="' + esc(s.uid) + '" aria-haspopup="menu" aria-expanded="false" title="更多操作：' + (s.enterprise ? '禁用 / 移除' : '任务 / 禁用 / 移除') + '">⋯</button>' +
       '</td></tr>';
   }).join('');
 }
@@ -897,6 +919,9 @@ function openAccountMenu(btn, uid) {
   const s = ((overviewData && overviewData.accounts) || []).find(x => x.uid === uid) || {};
   if (window.WBControls && typeof WBControls.menu === 'function') {
     const items = [];
+    // v5：「任务」从行内按钮收进这里。企业版没有个人成长体系（成长任务 403），
+    // 菜单里也不能出现该项，否则点开永远是错误提示。
+    if (!s.enterprise) items.push({ label: '成长任务', onPick: () => runAccountAction('tasks', uid, btn) });
     if (!s.disabled) items.push({ label: '禁用账号', danger: true, onPick: () => runAccountAction('disable', uid, btn) });
     items.push({ label: '移除账号', danger: true, onPick: () => runAccountAction('remove', uid, btn) });
     WBControls.menu(btn, items);
@@ -1466,7 +1491,12 @@ function renderRequestTable() {
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
-      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + (e && e.model
+        // 模型 ID 里有 `-` 和 `.`，auto 布局下会在连字符处折行（cn/deepseek- 换行
+        // v4.1-flash），一行记录被撑成两行、扫表时对不齐。统一走 .clip：单行省略 +
+        // 全量 title，与 IP / UA / 请求 ID 三列同一套规则。
+        ? '<span class="clip" title="' + esc(e.model) + '">' + esc(e.model) + '</span>'
+        : '<span class="muted">—</span>') + '</td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
       '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -2182,7 +2212,8 @@ const AUTO_TASKS = {
 
 function openTasks(uid) {
   taskUID = uid;
-  $('taskWho').textContent = uid.slice(0, 16);
+  $('taskWho').textContent = shortUid(uid);
+  $('taskWho').title = uid;
   openVeil('taskVeil');
   $('btnTaskReload').hidden = false;
   loadTasks();
@@ -2250,10 +2281,12 @@ async function loadTasks() {
       const cur = t.current ?? 0, tgt = t.target ?? 0;
       const prog = tgt ? cur + ' / ' + tgt : (tgt === 0 && cur > 0 ? String(cur) : '—');
       const parts = [];
-      if (t.credit) parts.push('+' + t.credit + ' 分');
-      if (t.energy) parts.push('+' + t.energy + ' 能');
+      // 「+300 分 +8 能 Buddy」这种缩写既看不出单位也看不出对象：补全成
+      // 「+300 积分 · +8 能量 · Buddy」，分隔符用中点而不是空格。
+      if (t.credit) parts.push('+' + t.credit + ' 积分');
+      if (t.energy) parts.push('+' + t.energy + ' 能量');
       if (t.reward_buddy) parts.push('Buddy');
-      const reward = parts.length ? parts.join(' ') : '—';
+      const reward = parts.length ? parts.join(' · ') : '—';
       const badge = t.claimed ? '<span class="tag ok">已领取</span>'
         : t.claimable ? '<span class="tag warn">可领取</span>'
         : t.locked ? '<span class="tag mute">未解锁</span>'
@@ -2774,13 +2807,18 @@ function usStat(v, k, cls) {
 }
 
 /* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
-   放"占比 / 均速率"这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。 */
+   放"占比 / 均速率"这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。
+   sub 传数组时每个元素单独包一层 nowrap 的 .s-pair：断行只发生在片段之间，
+   不会再出现「completion」和「0.3%」被拆到两行的断法。 */
 function usKpi(v, k, cls, sub, bar) {
+  const subHtml = Array.isArray(sub)
+    ? sub.filter(Boolean).map(s => '<span class="s-pair">' + esc(s) + '</span>').join('')
+    : (sub ? esc(sub) : '');
   return '<div class="kpi ' + (cls || '') + '">' +
     '<div class="k">' + esc(k) + '</div>' +
     '<div class="v">' + esc(v) + '</div>' +
     (bar || '') +
-    (sub ? '<div class="s">' + esc(sub) + '</div>' : '') +
+    (subHtml ? '<div class="s">' + subHtml + '</div>' : '') +
     '</div>';
 }
 
@@ -3100,7 +3138,7 @@ function renderUsage(d) {
     usKpi(fmtTok(reqs), '请求数', 'c-accent',
       errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
     usKpi(fmtTok(total), '总 token', 'c-accent',
-      'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
+      ['prompt ' + usPct(pt, total), 'completion ' + usPct(ct, total)],
       '<div class="kbar"><i class="p" style="width:' + pctW(pt) + '"></i>' +
       '<i class="c" style="width:' + pctW(ct) + '"></i></div>') +
     usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
@@ -3268,7 +3306,16 @@ function renderUsageChart(series) {
   const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
   const chartNote = pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' +
     fmtAxisTimeLabel(peak.t, t0, t1, peak.scope) + ' · 均值 ' + fmtTok(avg);
-  $('usChartNote').textContent = chartNote;
+  // completion 通常只占 prompt 的千分之几：与 prompt 同轴时柱高接近 0，图例却并列
+  // 展示两个系列，读者会以为图没画出来。占比 <1% 时在 note 里点明「不是没数据，
+  // 是量级差」，避免误判成图表故障。
+  const ctSum = pts.reduce((s, p) => s + p.ct, 0);
+  const ttSum = pts.reduce((s, p) => s + p.tt, 0);
+  const ctPct = ttSum > 0 ? ctSum / ttSum * 100 : 0;
+  const mixNote = ctPct > 0 && ctPct < 1
+    ? ' · completion 占 ' + ctPct.toFixed(1) + '%（同轴几乎不可见）'
+    : '';
+  $('usChartNote').textContent = chartNote + mixNote;
 
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
   // 变细，但不会细到看不见。
@@ -4036,7 +4083,7 @@ function expiryRowsHtml(list) {
       '<span class="exp-nm" title="' + esc(name) + '">' + esc(name) + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
+      fmtTok(daily) + '</b> 积分/天' +
       (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
       (rest ? '<div class="note">' + rest + '</div>' : '') +
       '</span></div>';
@@ -4143,7 +4190,7 @@ function renderExpirySnapshot(d) {
       '<span class="exp-nm" title="' + nm + '">' + nm + '</span>' +
       '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
       '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
+      fmtTok(daily) + '</b> 积分/天' +
       '<div class="note">仅最早一批，点「刷新明细」看全部到期批次</div>' +
       '</span></div>';
   }).join('');
@@ -4388,12 +4435,15 @@ if (chMeasure !== 'intercept' && chMeasure !== 'rewrite') chMeasure = 'intercept
 if (chMode !== 'abs' && chMode !== 'per1k') chMode = 'abs';
 if ([0, 30, 60, 300].indexOf(chAutoSec) < 0) chAutoSec = 60;
 
-/* CH_GROUP_COLOR 进图组配色（颜色是展示层，留在前端；后端只下发 key/label）。 */
+/* CH_GROUP_COLOR 进图组配色（颜色是展示层，留在前端；后端只下发 key/label）。
+   v5：原先「流中断·超时」用 --chart-2（青绿），跟全站 --ok「正常/成功」撞语义——
+   同一页里绿色一会儿代表流中断一会儿代表成功。现在故障类统一走红/琥珀/暖橙，
+   绿色只留给"正常"；限流沿用 --chart-4（紫），它是中性色，不跟任何好坏语义冲突。 */
 const CH_GROUP_COLOR = {
-  refusal: 'var(--bad)',
-  throttle: 'var(--chart-4)',
-  stream: 'var(--chart-2)',
-  other: 'var(--ink-3)',
+  refusal: 'var(--bad)',        // 通道拒绝：红
+  throttle: 'var(--chart-4)',   // 限流 / 容量：紫（中性）
+  stream: 'var(--chart-10)',    // 流中断·超时：暖橙（原来是绿色）
+  other: 'var(--ink-3)',        // 其他：中性灰
 };
 function chGroupColor(key) { return CH_GROUP_COLOR[key] || 'var(--ink-3)'; }
 

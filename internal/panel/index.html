@@ -395,6 +395,15 @@ button:active:not(:disabled) {
 }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button:disabled { opacity: .45; cursor: not-allowed; transform: none; box-shadow: none; }
+/* 禁用态的主按钮别走 opacity：45% 的蓝底会变成一块半透明灰蓝，看着像按钮被裁掉
+   或渲染坏了（任务中心「执行全部待办」就是这个观感）。改成中性实色 + title 说明。 */
+button.primary:disabled {
+  opacity: 1; background: var(--surface-2); border-color: var(--line);
+  color: var(--ink-3); box-shadow: none;
+}
+/* 弹窗里次要按钮吃 focus-visible 环时，会跟真正的主按钮抢「我是主操作」的权重
+   （积分任务弹窗的「全部接受」就是这样）。环色降一档，焦点仍然清晰可辨。 */
+button.ghost:focus-visible { outline-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
 button.primary {
   background: linear-gradient(180deg, var(--btn-pri-1), var(--btn-pri-2));
   border-color: var(--btn-pri-brd); color: var(--accent-ink); font-weight: 550;
@@ -512,6 +521,11 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
   font-size: var(--fs-label); color: var(--ink-3); margin-top: 4px;
   line-height: 1.35; white-space: normal;
 }
+/* 副标题里的「成对信息」（prompt 99.7% / completion 0.3%）：每个片段自己 nowrap，
+   断行只发生在片段之间。「总 token」卡在 1280 下曾把 completion 0.3% 拆成两行，
+   0.3% 孤零零挂在第二行行首，读起来像两个不同的指标。 */
+.kpi .s { display: flex; flex-wrap: wrap; gap: 0 10px; }
+.kpi .s-pair { white-space: nowrap; }
 .stat.good, .kpi.c-ok { --metric-c: var(--ok); }
 .stat.warn, .kpi.c-warn { --metric-c: var(--warn); }
 .stat.bad, .kpi.c-bad { --metric-c: var(--bad); }
@@ -584,9 +598,16 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
   padding: 5px var(--pad-x) 0;
   font-size: var(--fs-label); color: var(--ink-3); letter-spacing: .01em;
 }
-/* 长表（模型目录 50+ 行）：限高 + 表头吸顶，滚动时不丢列名 */
-.tbl-wrap.tall { max-height: calc(100vh - 250px); overflow: auto; }
+/* 长表：限高 + 表头吸顶，滚动时不丢列名。
+   v5：`.box{overflow:hidden}` 会让 position:sticky 相对卡片而不是视口生效，所以
+   页面级滚动的长表吸不住表头——只有自带滚动条的容器能吸。凡「行数远超一屏」的
+   表（模型目录、用量明细、积分扣除历史、请求记录、账号池）统一挂 .tall，
+   高度交给 --tbl-max-h，各页按自己的头部高度覆盖。 */
+.tbl-wrap.tall { max-height: var(--tbl-max-h, calc(100vh - 250px)); overflow: auto; }
 .tbl-wrap.tall thead th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); }
+/* 账号池的高度预算：上方还有统计卡（~2 行）+ 到期提醒 + 卡片头，合计约 300px；
+   留出的部分才是行区。窗口很矮时不低于 260px，否则一屏只剩两行可看。 */
+.tbl-wrap.acct-tall { --tbl-max-h: max(260px, calc(100vh - 300px)); }
 .acc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-table); min-width: 640px; }
 .acc th {
   text-align: left; font-weight: 500; font-size: var(--fs-label); color: var(--ink-3);
@@ -624,8 +645,19 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .acc.md { min-width: 700px; }
 .acc.md th, .acc.md td { padding: 9px var(--pad-cell-x); }
 .who { min-width: 118px; width: 170px; max-width: 170px; }
-#taskTable .who { max-width: 360px; }
-#taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
+/* 模型表列宽预算（v5）：模型名是这一页的主键，必须吃最多宽度。
+   旧布局是 auto 布局，「积分倍率」拿到 205px 装 x0.33，把 59 个模型名裁掉最多
+   122px（cn/minimax-m3.1-f…），行高还被换行顶到 117px。改为固定布局后余量全给
+   模型列（1440 下 170 → 514px），实测行高 117 → 64px。任务弹窗的 #taskTable
+   也是 .acc.md，口径不同，单独给预算，别串味（见 #taskTable 段落）。 */
+.acc.md.md-table { table-layout: fixed; }
+.acc.md.md-table .who { width: auto; max-width: none; }
+.acc.md.md-table th:nth-child(2) { width: auto; }     /* 模型（吃余量） */
+.acc.md.md-table th:nth-child(3) { width: 96px; }     /* 积分倍率 */
+.acc.md.md-table th:nth-child(4) { width: 104px; }    /* 默认档 */
+.acc.md.md-table th:nth-child(5) { width: 240px; }    /* 支持的思考档位 */
+.acc.md.md-table th:nth-child(6) { width: 96px; }     /* 上下文长度 */
+.acc.md.md-table th:nth-child(7) { width: 88px; }     /* 最大输出 */
 .who .nm { font-weight: 550; }
 /* 账号名与 realm 徽标同排：省略号只吃名字（.nm-text），徽标 flex:none 永不被挤压。
    长邮箱名曾把「国际版」标识顶出可视区（2026-11-06 修复）。 */
@@ -660,8 +692,13 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .acc td.cred { text-align: right; }
 .acc td.cred .n { text-align: right; }
 .acc td.cred .bar { margin-left: auto; }
-/* 用量列：四枚 chip 排 2×2，行高从 115px 收到 62–65px（列宽够两个 chip 并排） */
-.usage-cell { min-width: 140px; width: 140px; }
+/* 用量列：四枚 chip 排 2×2，行高从 115px 收到 62–65px（列宽够两个 chip 并排）。
+   v5：列宽 140 → 176px。140px 时内容区只有 116px，而最坏一行需要 139px
+   （「20108次」+「776.93M tok」+ 6px 间隙），chip 里的「305.7 tok/s」实测 74px
+   装进 58.5px 的盒子里——文字直接被画到隔壁「操作」列上（1280 下每行溢出
+   2.8–13.1px）。176px 给出 152px 内容区，余量 13px；万一将来出现更长的数值，
+   由下面的 min-width:0 + 省略号兜底，最坏是 chip 内省略号，不会越界。 */
+.usage-cell { min-width: 176px; width: 176px; }
 .usage-line {
   display: grid; grid-template-columns: repeat(2, minmax(0, max-content));
   align-items: center; gap: 4px 6px; max-width: 100%;
@@ -670,9 +707,13 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .usage-item {
   display: inline-flex; align-items: baseline; padding: 2px 5px; border: 1px solid transparent;
   border-radius: var(--r-sm); background: var(--surface-2);
+  /* 溢出兜底：轨道按 max-content 算，正常情况下 chip 恰好包住文字；
+     真出现超长值时收缩并省略，而不是把字画到方块外面。 */
+  min-width: 0; max-width: 100%; overflow: hidden;
 }
 .usage-item b { font-weight: 650; }
 .usage-item em { margin-left: 2px; font: 500 var(--fs-kicker)/1 var(--sans); font-style: normal; }
+.usage-item b, .usage-item em { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 用量 chip 默认中性：延迟/速率本身不是告警，只有越过阈值才上色。
    以前「有值就上色」导致每行四个彩色胶囊，真正需要看的失败数反而被淹没。 */
 .usage-count { color: var(--ink-2); background: var(--surface-2); border-color: var(--line-soft); }
@@ -703,10 +744,10 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .tag.bad { background: var(--bad-soft); color: var(--bad); border-color: color-mix(in srgb, var(--bad) 24%, transparent); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border-color: var(--line); }
 .md-avail { flex: none; padding: 0 6px; font-size: var(--fs-kicker); line-height: 16px; }
-/* 限流芯片：宽度必须封顶。td 在 auto 布局下会按 max-content 撑列，一条 36 字符的
-   模型名能把「状态」列顶到 354px、把整张表推出卡片（1440 下实测溢出 207px）。
-   这里给 200px 上限并让模型名/说明各自省略，完整内容仍在 title 里。 */
-.rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 0; max-width: 200px; }
+/* 限流芯片：宽度必须封顶。以前的封顶是 200px（那时状态列钉死 200px）；v5 状态列
+   收到 132px，芯片改成吃满单元格宽度——列宽本身已经是硬上限，再写死 200px 只会
+   让芯片伸到隔壁列上。模型名/说明各自省略，完整内容仍在 title 里。 */
+.rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 0; max-width: 100%; }
 .rate-limit {
   display: flex; align-items: baseline; gap: 6px; padding: 4px 7px; min-width: 0;
   border: 1px solid color-mix(in srgb, var(--warn) 24%, var(--line));
@@ -715,12 +756,34 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 .rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-2); color: var(--ink-3); }
 .rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; min-width: 0; }
 .rate-limit span { color: var(--ink-2); min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.acts { display: flex; gap: 4px; justify-content: flex-end; white-space: nowrap; }
-.acts button { padding: 0 5px; height: var(--h-xs); font-size: var(--fs-ctl); white-space: nowrap; flex: none; }
-/* 状态列封顶：限流芯片再长也不能把整张表推出卡片（见 .rate-limits 注释） */
-.acc.pool th:nth-child(3), .acc.pool td:nth-child(3) { width: 200px; max-width: 200px; }
-/* 笔记本档：列宽预算按「内容区 = 视口 − 232 侧栏 − 48 边距 − 10 滚动条」算。
-   1366 下需要再省 ~95px，先把信息密度最低的「最近成功」整列收起（手机卡片模式不受影响）。 */
+/* 操作列「签到 余额 任务 暂停 ⋯」原来是 gap:4px + padding:0 5px、窄档再单独降到
+   gap:2px + padding:0 3px。v5 统一成一档，固定布局下每行宽必须可预测；
+   实测收掉「任务」后 4 枚按钮 = 127.5px，176px 列的内容区 146px 还有 18px 余量。 */
+.acts { display: flex; gap: 3px; justify-content: flex-end; white-space: nowrap; }
+.acts button { padding: 0 4px; height: var(--h-xs); font-size: var(--fs-ctl); white-space: nowrap; flex: none; }
+/* ── 账号表列宽预算（v5）──────────────────────────────────────────────
+   以前是 auto 布局 + 几处 width 钉死：盈余被平摊给每一列，于是
+   「积分 229 / 成功失败 207 / 在途 106 / 最近成功 199」这些 60–90px 就够的列
+   各空出 70–140px，而「账号」被钉在 170px（名字截成 renleihao…n2@…）、「用量」
+   钉在 140px（chip 直接画到「操作」列上）。现在换固定布局，列宽由 th 显式给，
+   余量全部交给「账号」列。
+   预算 = 视口 − 232 侧栏 − 48 边距 − 10 滚动条 − 2 边框（固定列合计 848px）：
+     1920 → 账号 612 ／ 1440 → 290 ／ 1280 → 226（藏最近成功）
+     1024 → 204（再藏在途 + 用量）
+   四档都 ≥ 200px，≥1001 全程不出现横向滚动（上列为浏览器实测值，与预算差 ~10px
+   来自滚动条宽度）。 */
+.acc.pool { table-layout: fixed; }
+.acc.pool .who { width: auto; max-width: none; }
+.acc.pool th:nth-child(1) { width: 0; }        /* 健康色条：绝对定位导轨，不占列宽 */
+.acc.pool th:nth-child(2) { width: auto; }     /* 账号：吃掉全部余量 */
+.acc.pool th:nth-child(3) { width: 132px; }    /* 状态：已暂停选号 62px + 限流芯片 */
+.acc.pool th:nth-child(4) { width: 124px; }    /* 积分：3,231/5,958 + 88px 量条 */
+.acc.pool th:nth-child(5) { width: 96px; }     /* 成功 / 失败 */
+.acc.pool th:nth-child(6) { width: 48px; }     /* 在途 */
+.acc.pool th:nth-child(7) { width: 176px; }    /* 用量：四枚 chip 2×2 */
+.acc.pool th:nth-child(8) { width: 96px; }     /* 最近成功 */
+.acc.pool th:nth-child(9) { width: 176px; }    /* 操作：签到 余额 暂停 ⋯ */
+/* 笔记本档：先把信息密度最低的「最近成功」整列收起（手机卡片模式不受影响）。 */
 @media (min-width: 1001px) and (max-width: 1400px) {
   .acc.pool th:nth-child(8), .acc.pool td:nth-child(8) { display: none; }
 }
@@ -729,17 +792,10 @@ label.fld > .hint { display: block; font-size: var(--fs-label); color: var(--ink
 @media (min-width: 1001px) and (max-width: 1240px) {
   .acc.pool th:nth-child(6), .acc.pool td:nth-child(6) { display: none; }
 }
-/* 1001–1150：再收起「用量」列。账号表的固定列宽合计约 823px，而 1024 的
-   可见区只有 732px；收起 140px 后 683px 正好放下，操作列不再被推到屏外。
-   更窄的视口走手机卡片模式（≤1000），不会看到这条规则。 */
+/* 1001–1150：再收起「用量」列（1024 的可见区只有 734px）。更窄的视口走手机
+   卡片模式（≤1000），不会看到这条规则。 */
 @media (min-width: 1001px) and (max-width: 1150px) {
   .acc.pool th:nth-child(7), .acc.pool td:nth-child(7) { display: none; }
-  /* 收起「用量」后表格仍差 ~50px：账号/状态列收窄，动作按钮减 padding；
-     1024 下「成功 / 失败」和操作列可同时完整显示，不再出现半截列。 */
-  .acc.pool th:nth-child(2), .acc.pool td:nth-child(2) { width: 150px; }
-  .acc.pool th:nth-child(3), .acc.pool td:nth-child(3) { width: 150px; max-width: 150px; }
-  .acc.pool .acts { gap: 2px; }
-  .acc.pool .acts button { padding: 0 3px; }
 }
 /* 请求记录 10 列在 1001–1400 收起来源 IP / UA / 请求 ID：这三列是取证字段，
    不该把表格撑出横向滚动；1440 起恢复全列。 */
@@ -857,6 +913,17 @@ legend { font-size: var(--fs-meta); color: var(--ink-3); font-weight: 600; paddi
   border-left: 2px solid var(--line); color: var(--ink-3);
   font-size: var(--fs-label); line-height: 1.7;
 }
+/* 短输入收口（v5）：全局 input 是 width:100%（表单整行用），于是「单账号明细
+   默认展示条数」拿到 1112px 装一个 1 位数、8 个「时点/间隔」各 544px——框比内容
+   大 20 倍，读起来像没做完。三类按语义收口：
+     1) 所有 type=number（条数/超时/阈值）：180px，语义上就是短数字，不必逐个加类；
+     2) 逗号分隔的时点列表：240px；
+     3) 其余长文本（监听地址、UA、路径、UID 顺序）保持整行不动。 */
+#cfgForm input[type=number] { max-width: 180px; }
+.fld-num input { max-width: 180px; }
+.fld-hours input { max-width: 240px; }
+/* 只有一行短输入的卡片：让 .grid2 里的字段不撑满整格（配合上面的 max-width） */
+.fld-num, .fld-hours { min-width: 0; }
 .savebar {
   display: flex; align-items: center; gap: 12px; padding: 12px var(--pad-x);
   border-top: 1px solid var(--line);
@@ -1010,16 +1077,21 @@ body[data-view="config"] #toasts { bottom: 84px; }
 /* ── 用量视图 ─────────────────────────────────────────────────────
    这一页一屏要放下「两组 KPI + 图表 + 三张表」，所以视觉语言比账号池更轻：
    卡片用顶部色轨区分语义，数字用等宽/等宽数字对齐，分隔靠留白而不是更多边框。
-   v2：KPI 改成 auto-fit —— 5 张卡不再被塞进 6 列网格留下一个空格子。 */
+   v5：KPI 从 auto-fit 改成显式断点。auto-fit + minmax(168px) 在 1280 下算成 5 列，
+   六张卡变成 5+1——「平均延迟」孤零零挂在第二行、右边一大块死白。显式 6/3/2 列
+   永远不会出现孤儿卡，也不用再靠 minmax 猜列数。 */
   /* KPI 卡：顶部 2px 色轨是唯一的重色，数值大、标签小，扫一眼就能读出量级。 */
   .kpis {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+    display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 10px; padding: 16px var(--pad-x) 4px;
   }
-  .kpis.k4 { grid-template-columns: repeat(auto-fit, minmax(196px, 1fr)); }
-  /* k6：六张卡在常见桌面宽度下排成 3×2（minmax 240 时 950px 内容区正好 3 列），
-     避免 auto-fit 排成 5+1 留下一个孤零零的卡片。 */
-  .kpis.k6 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  /* k6：六张卡固定 3×2（通道健康的 ch-kpis 会再覆盖成 3 列），不靠 minmax 猜。 */
+  .kpis.k6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  /* 断点：6 列在 1440+ 一排放得下（每张 ~180px），1280 档降到 3 列两排。
+     降档位置按「卡片最小可读宽度 200px」反推，避免出现 5+1 这种孤儿排布。 */
+  @media (max-width: 1439px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 1100px) { .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   /* 首屏骨架：KPI 网格在数据到达前是空的，给一条微光占位条，
      比"整块空白"更像"正在加载"。数据一到就自然消失（:empty 不再匹配）。 */
   .kpis:empty::after {
@@ -1069,7 +1141,22 @@ body[data-view="config"] #toasts { bottom: 84px; }
     transition: width var(--dur-3) var(--ease); }
   .sav-covtxt { font-size: var(--fs-label); color: var(--ink-3); margin-top: 6px; }
   .sav-list { min-width: 0; }
-  .sav-tbl { min-width: 520px; font-size: var(--fs-table); table-layout: fixed; }
+  /* 任务弹窗的 `.who` 是任务标题（最长「关注【腾讯 WorkBuddy】官方公众号」），
+   旧规则 max-width:360px 在 auto 布局下仍会被「奖励/状态」挤到 245px，
+   标题折成三行、task_code 还会从单词中间断开。固定布局 + 显式预算解决。 */
+#taskTable { table-layout: fixed; min-width: 620px; }
+#taskTable .who { width: auto; max-width: none; }
+#taskTable th:nth-child(2) { width: auto; }   /* 任务标题：吃余量 */
+#taskTable th:nth-child(3) { width: 96px; }   /* 进度 */
+#taskTable th:nth-child(4) { width: 200px; }  /* 奖励 */
+#taskTable th:nth-child(5) { width: 96px; }   /* 状态 */
+#taskTable th:nth-child(6) { width: 96px; }   /* 操作 */
+/* 任务标题与 task_code 允许在两段之间换行，但不许把一个标识符拆成两行
+   （wb_wechat_oa_subscri|be_task 这种断法读起来像另一个 id）。 */
+#taskTable .who .nm { white-space: normal; word-break: normal; overflow-wrap: anywhere; }
+#taskTable .who .id { white-space: normal; word-break: normal; overflow-wrap: anywhere; }
+
+.sav-tbl { min-width: 520px; font-size: var(--fs-table); table-layout: fixed; }
 /* 列宽固定：模型名 + 价格说明是两块 nowrap 文本，auto 布局下会把首列撑到 332px，
    请求/Token/折算/占比全被压扁。 */
 .sav-tbl th:nth-child(1) { width: 38%; }
@@ -1555,7 +1642,10 @@ button.ghost.danger:hover:not(:disabled) {
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
         </header>
-        <div class="tbl-wrap">
+        <!-- 账号池：19 行 ≈ 1140px，整页滚两屏就丢表头。挂 .tall 让它自带滚动条
+             （sticky 表头只在自带滚动容器里生效，见 .tbl-wrap.tall 注释），
+             高度在 .acct-tall 里按「统计卡 + 到期提醒 + 卡片头」预留 300px。 -->
+        <div class="tbl-wrap tall acct-tall">
         <table class="acc pool">
           <thead><tr>
             <th class="mark" scope="col" aria-hidden="true"></th>
@@ -1659,7 +1749,7 @@ button.ghost.danger:hover:not(:disabled) {
           <span class="fbar-end"><span class="note" id="mdCount"></span><button class="xs ghost" id="mdReset" title="清空全部筛选条件">重置</button></span>
         </div>
         <div class="tbl-wrap tall">
-        <table class="acc md zebra">
+        <table class="acc md md-table zebra">
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th class="num">积分倍率</th><th>默认档</th><th>支持的思考档位</th><th class="num">上下文长度</th><th class="num">最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
@@ -1803,7 +1893,7 @@ button.ghost.danger:hover:not(:disabled) {
             </select>
           </label>
         </header>
-        <div class="tbl-wrap">
+        <div class="tbl-wrap tall">
           <table class="acc zebra">
             <thead id="usDimHead"></thead>
             <tbody id="usDimBody"></tbody>
@@ -1822,7 +1912,7 @@ button.ghost.danger:hover:not(:disabled) {
           <span class="note" id="usCreditNote">—</span>
         </header>
         <div class="kpis k4" id="usCreditStats"></div>
-        <div class="tbl-wrap">
+        <div class="tbl-wrap tall">
           <table class="acc zebra">
             <thead id="usCreditHead"></thead>
             <tbody id="usCreditBody"></tbody>
@@ -1935,9 +2025,13 @@ button.ghost.danger:hover:not(:disabled) {
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>
-            <label class="fld"><span class="lb">单账号明细默认展示条数</span>
-              <input name="package_detail_limit" type="number" min="1" placeholder="5">
-              <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+            <!-- v5：这一项原来是整行 label.fld，1–2 位数的输入框被拉到 1112px。
+                 放进 .grid2 并用 .fld-num 收口，现在只有 180px。 -->
+            <div class="grid2">
+              <label class="fld fld-num"><span class="lb">单账号明细默认展示条数</span>
+                <input name="package_detail_limit" type="number" min="1" placeholder="5">
+                <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+            </div>
           </div>
         </div>
 
@@ -1948,13 +2042,13 @@ button.ghost.danger:hover:not(:disabled) {
               <div>
                 <label class="switch"><span class="lb">自动签到</span>
                   <input type="checkbox" name="checkin_enabled"></label>
-                <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
+                <label class="fld fld-hours"><span class="lb">签到时点（小时，逗号分隔）</span>
                   <input name="checkin_hours" placeholder="9, 21"></label>
               </div>
               <div>
                 <label class="switch"><span class="lb">Token 保活</span>
                   <input type="checkbox" name="keepalive_enabled"></label>
-                <label class="fld"><span class="lb">保活时点（小时，逗号分隔）</span>
+                <label class="fld fld-hours"><span class="lb">保活时点（小时，逗号分隔）</span>
                   <input name="keepalive_hours" placeholder="22"></label>
               </div>
             </div>
@@ -1963,14 +2057,14 @@ button.ghost.danger:hover:not(:disabled) {
               <div>
                 <label class="switch"><span class="lb">猫猫旅行</span>
                   <input type="checkbox" name="travel_enabled"></label>
-                <label class="fld"><span class="lb">旅行时点（小时，逗号分隔）</span>
+                <label class="fld fld-hours"><span class="lb">旅行时点（小时，逗号分隔）</span>
                   <input name="travel_hours" placeholder="9, 21">
                   <span class="hint">一趟派出 + 一趟领奖闭环</span></label>
               </div>
               <div>
                 <label class="switch"><span class="lb">活跃上报</span>
                   <input type="checkbox" name="activity_enabled"></label>
-                <label class="fld"><span class="lb">上报时点（小时，逗号分隔）</span>
+                <label class="fld fld-hours"><span class="lb">上报时点（小时，逗号分隔）</span>
                   <input name="activity_hours" placeholder="10">
                   <span class="hint">点亮连登 + 解锁领养前置</span></label>
               </div>
@@ -1979,14 +2073,14 @@ button.ghost.danger:hover:not(:disabled) {
             <div class="grid2">
               <label class="switch"><span class="lb">后台刷新余额</span>
                 <input type="checkbox" name="balance_refresh_enabled"></label>
-              <label class="fld"><span class="lb">刷新间隔（分钟）</span>
+              <label class="fld fld-num"><span class="lb">刷新间隔（分钟）</span>
                 <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
               <label class="switch"><span class="lb">成长任务自动执行</span>
                 <input type="checkbox" name="growth_enabled" checked></label>
-              <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
+              <label class="fld fld-hours"><span class="lb">执行时点（小时，逗号分隔）</span>
                 <input name="growth_hours" placeholder="1">
                 <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
