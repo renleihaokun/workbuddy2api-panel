@@ -173,25 +173,41 @@ func TestDueForAccountDisabledAlwaysDue(t *testing.T) {
 	}
 }
 
-// TestJitterMinutesDefault 未配置时回落默认 45；显式 0 才是关闭。
-func TestJitterMinutesDefault(t *testing.T) {
+// TestJitterMinutesDefaultFromConfig 零值 Config = **不抖动**（关键契约）。
+//
+// 默认 45 分钟由配置装配层（cmd/server normalize）落地，不在 scheduler 包里
+// 硬编码。原因：scheduler 的零值 Config 被大量排程推演用例直接构造，若这里
+// 凭空给出 45 分钟窗口，既有的整点排程断言全部失真（首版就踩了这条）。
+// 生产路径必过 normalize，所以线上默认仍是 45。
+func TestJitterMinutesDefaultFromConfig(t *testing.T) {
 	s := &Scheduler{}
-	if got := s.jitterMinutes(); got != DefaultJitterMinutes {
-		t.Errorf("未配置时 jitterMinutes = %d, want %d", got, DefaultJitterMinutes)
+	if got := s.jitterMinutes(); got != 0 {
+		t.Errorf("零值 Config 的 jitterMinutes = %d, want 0（装配层负责给默认值）", got)
 	}
+
 	zero := 0
 	s.SetJitterMinutes(&zero)
 	if got := s.jitterMinutes(); got != 0 {
 		t.Errorf("显式 0 时 jitterMinutes = %d, want 0（关闭）", got)
 	}
+
 	twenty := 20
 	s.SetJitterMinutes(&twenty)
 	if got := s.jitterMinutes(); got != 20 {
 		t.Errorf("显式 20 时 jitterMinutes = %d, want 20", got)
 	}
+
 	s.SetJitterMinutes(nil)
-	if got := s.jitterMinutes(); got != DefaultJitterMinutes {
-		t.Errorf("恢复默认后 jitterMinutes = %d, want %d", got, DefaultJitterMinutes)
+	if got := s.jitterMinutes(); got != 0 {
+		t.Errorf("清空后 jitterMinutes = %d, want 0", got)
+	}
+
+	// 装配层给的默认值（45）必须能被本包正确识别并启用续跑。
+	def := DefaultJitterMinutes
+	s2 := &Scheduler{cfg: Config{CheckinHours: []int{9}, JitterMinutes: &def}}
+	at := time.Date(2026, 11, 25, 9, 0, 10, 0, time.Local)
+	if next, _ := s2.jitterContinuation(at); next.IsZero() {
+		t.Error("装配层给出默认 45 分钟时，窗口内应续跑")
 	}
 }
 
@@ -218,5 +234,110 @@ func TestManualTriggerBypassesJitter(t *testing.T) {
 	}
 	if jittered == 6 {
 		t.Error("抖动窗口内 6 个账号在基点全部到点，抖动似乎没有生效")
+	}
+}
+
+// TestJitterContinuationRearmsWithinWindow 回归（线上暴露的真实缺陷）：
+//
+// 排程原本只在整点唤醒一次，抖动把部分账号摊到 h:07/h:23…，那一轮它们因
+// 「未到点」被跳过，调度器随即排到下一天 —— 这些账号当天就永远不执行了。
+// 修复后窗口内必须每分钟续跑一轮。
+func TestJitterContinuationRearmsWithinWindow(t *testing.T) {
+	fortyFive := DefaultJitterMinutes
+	s := &Scheduler{cfg: Config{CheckinHours: []int{9}, JitterMinutes: &fortyFive}}
+
+	// 9:00（窗口内第 0 分钟）→ 应续跑，下一跳在 9:01。
+	at0 := time.Date(2026, 11, 25, 9, 0, 10, 0, time.Local)
+	next, kinds := s.jitterContinuation(at0)
+	if next.IsZero() {
+		t.Fatal("9:00 在窗口内应续跑，实际没有排下一跳")
+	}
+	if want := time.Date(2026, 11, 25, 9, 1, 0, 0, time.Local); !next.Equal(want) {
+		t.Errorf("下一次唤醒 = %v, want %v", next, want)
+	}
+	if len(kinds) != 1 || kinds[0] != taskCheckin {
+		t.Errorf("kinds = %v, want [taskCheckin]", kinds)
+	}
+
+	// 9:30（仍在 45 分钟窗口内）→ 继续续跑。
+	at30 := time.Date(2026, 11, 25, 9, 30, 5, 0, time.Local)
+	if next, _ := s.jitterContinuation(at30); next.IsZero() {
+		t.Error("9:30 仍在窗口内，应继续续跑")
+	}
+
+	// 9:45（窗口已满 45 分钟）→ 不再续跑，交回 nextFire 排下一整点。
+	at45 := time.Date(2026, 11, 25, 9, 45, 0, 0, time.Local)
+	if next, _ := s.jitterContinuation(at45); !next.IsZero() {
+		t.Errorf("9:45 窗口已结束，不该再续跑，得到 %v", next)
+	}
+
+	// 10:00 不是配置时点 → 不续跑。
+	at10 := time.Date(2026, 11, 25, 10, 5, 0, 0, time.Local)
+	if next, _ := s.jitterContinuation(at10); !next.IsZero() {
+		t.Errorf("10:05 不是签到时点，不该续跑，得到 %v", next)
+	}
+}
+
+// TestJitterContinuationDisabledWhenJitterOff 关闭抖动时绝不续跑（零行为回归）。
+func TestJitterContinuationDisabledWhenJitterOff(t *testing.T) {
+	zero := 0
+	s := &Scheduler{cfg: Config{CheckinHours: []int{9}, JitterMinutes: &zero}}
+	at := time.Date(2026, 11, 25, 9, 0, 10, 0, time.Local)
+	if next, _ := s.jitterContinuation(at); !next.IsZero() {
+		t.Errorf("jitter=0 时不该续跑，得到 %v", next)
+	}
+}
+
+// TestJitterContinuationSkipsDisabledTasks 关闭的任务不进续跑候选。
+func TestJitterContinuationSkipsDisabledTasks(t *testing.T) {
+	fortyFive := 45
+	s := &Scheduler{cfg: Config{
+		CheckinHours:    []int{9},
+		ActivityHours:   []int{9},
+		CheckinDisabled: true,
+		JitterMinutes:   &fortyFive,
+	}}
+	at := time.Date(2026, 11, 25, 9, 0, 10, 0, time.Local)
+	_, kinds := s.jitterContinuation(at)
+	for _, k := range kinds {
+		if k == taskCheckin {
+			t.Error("签到已禁用，不该出现在续跑候选里")
+		}
+	}
+	if len(kinds) != 1 || kinds[0] != taskActivity {
+		t.Errorf("kinds = %v, want 只剩 [taskActivity]", kinds)
+	}
+}
+
+// TestJitterWindowEventuallyReleasesEveryAccount 端到端语义：
+// 在一个抖动窗口内逐分钟 tick，24 个账号必须**全部**最终被放到。
+//
+// 这条锁死「不会漏号」——正是线上缺陷的本质（跑一轮就跳到下一天）。
+func TestJitterWindowEventuallyReleasesEveryAccount(t *testing.T) {
+	const window = DefaultJitterMinutes
+	uids := make([]string, 24)
+	for i := range uids {
+		uids[i] = fmt.Sprintf("workbuddy-%04d", i)
+	}
+
+	released := make(map[string]bool, len(uids))
+	hourBase := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+	// 窗口内每分钟一个 tick（模拟调度器续跑）。
+	for m := 0; m < window; m++ {
+		now := hourBase.Add(time.Duration(m) * time.Minute)
+		for _, uid := range uids {
+			if dueForAccount(now, hourBase, uid, "checkin", window) {
+				released[uid] = true
+			}
+		}
+	}
+	if len(released) != len(uids) {
+		missing := make([]string, 0)
+		for _, uid := range uids {
+			if !released[uid] {
+				missing = append(missing, uid)
+			}
+		}
+		t.Fatalf("窗口结束后仍有 %d 个账号没被放出: %v", len(missing), missing)
 	}
 }

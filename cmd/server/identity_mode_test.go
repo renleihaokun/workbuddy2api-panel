@@ -42,18 +42,21 @@ func TestIdentityModeRejectsUnknown(t *testing.T) {
 	}
 }
 
-// TestJitterMinutesTriState nil（键缺席）与显式 0 必须可区分。
+// TestJitterMinutesTriState 键缺席与显式 0 必须可区分。
+//
+// 注意：键缺席最终也会变成 45（normalize 落地默认），因为生产路径一定经过
+// normalize。区分点在于「显式 0 保持 0」（关闭），而缺席得到默认值。
 func TestJitterMinutesTriState(t *testing.T) {
-	// 键缺席 → nil（运行时用默认 45）。
+	// 键缺席 → 默认 45（不是 nil，也不是关闭）。
 	c, err := ParseConfig([]byte(`{"listen":":0"}`))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if c.Schedule.JitterMinutes != nil {
-		t.Errorf("缺省 jitter_minutes = %v, want nil", *c.Schedule.JitterMinutes)
+	if c.Schedule.JitterMinutes == nil || *c.Schedule.JitterMinutes != defaultJitterMinutes {
+		t.Errorf("缺省 jitter_minutes = %v, want %d", c.Schedule.JitterMinutes, defaultJitterMinutes)
 	}
 
-	// 显式 0 → 关闭（不是回落默认）。
+	// 显式 0 → 关闭（不是被改成默认值）。
 	c2, err := ParseConfig([]byte(`{"listen":":0","schedule":{"jitter_minutes":0}}`))
 	if err != nil {
 		t.Fatalf("parse: %v", err)

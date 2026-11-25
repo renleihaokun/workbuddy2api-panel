@@ -130,6 +130,7 @@ type Config struct {
 		//
 		// 三态：键缺席（nil）= 默认 45 分钟（新部署自带抖动）；显式 0 = 关闭；
 		// 正值 = 该窗口。窗口不取 60，留余量避免尾部账号撞进下一小时。
+		// nil 的默认值在 normalize 里落地（见那里的说明：scheduler 零值 = 不抖动）。
 		JitterMinutes *int `json:"jitter_minutes"`
 	} `json:"schedule"`
 
@@ -321,6 +322,11 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 }
 
+// defaultJitterMinutes 账号时刻抖动的默认窗口（分钟）。
+// 与 internal/scheduler.DefaultJitterMinutes 同值——这里独立声明是为了不把
+// 配置包反向耦合到调度实现上（两处都改才算改，单测会钉住）。
+const defaultJitterMinutes = 45
+
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
@@ -357,6 +363,9 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	// 账号时刻抖动默认 45 分钟：24 个号共用一个出口 IP，不抖动就会同刻同动作。
+	jitterDef := defaultJitterMinutes
+	c.Schedule.JitterMinutes = &jitterDef
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -721,9 +730,18 @@ func (c *Config) normalize() error {
 	if _, err := upstream.ParseIdentityMode(c.Upstream.IdentityMode); err != nil {
 		return err
 	}
-	// 抖动窗口：nil 表示「键缺席」→ 保留 nil，由 scheduler 回落默认 45；
-	// 显式负值按 0 处理（= 关闭），不静默改成正数。
-	if c.Schedule.JitterMinutes != nil && *c.Schedule.JitterMinutes < 0 {
+	// 抖动窗口：nil（键缺席）→ 默认 45 分钟；显式 0 = 关闭；负值按 0 处理。
+	//
+	// 默认值在这里落地而不是放在 scheduler 包：scheduler 的零值 Config 必须表示
+	// 「不抖动」，否则测试/手工构造的调度器会凭空获得 45 分钟窗口，把既有的
+	// 整点排程推演全部带偏。生产路径一定经过 normalize，所以线上默认仍是 45。
+	//
+	// 45 与 scheduler.DefaultJitterMinutes 同值（两处都改了才算改；单测
+	// cmd/server 的 TestJitterMinutesTriState 会钉住这里的口径）。
+	if c.Schedule.JitterMinutes == nil {
+		def := defaultJitterMinutes
+		c.Schedule.JitterMinutes = &def
+	} else if *c.Schedule.JitterMinutes < 0 {
 		zero := 0
 		c.Schedule.JitterMinutes = &zero
 	}

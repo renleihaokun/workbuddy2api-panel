@@ -210,18 +210,22 @@ func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 
 // jitterMinutes 当前生效的按账号抖动窗口（分钟）。<=0 表示关闭。
 //
-// 三态：未配置（nil）→ DefaultJitterMinutes；显式 0 → 关闭；正值 → 该值。
+// 三态：nil（未配置）→ 使用 Config.JitterMinutes 的**装配层默认值**。注意这里
+// 不硬编码默认数字：默认值由 main 在装配时写入（config.schedule.jitter_minutes
+// 的缺省），这样零值 Config（测试、手工构造）就是「不抖动」，与引入抖动前的
+// 行为逐秒一致——否则测试用的 &Scheduler{cfg: Config{...}} 会凭空获得抖动，
+// 既有排程推演用例全部失真。
 func (s *Scheduler) jitterMinutes() int {
 	s.schedMu.Lock()
 	defer s.schedMu.Unlock()
 	if s.cfg.JitterMinutes == nil {
-		return DefaultJitterMinutes
+		return 0
 	}
 	return *s.cfg.JitterMinutes
 }
 
 // SetJitterMinutes 热更新按账号抖动窗口（schedule.jitter_minutes）。
-// nil = 恢复默认；显式传 0 才是关闭抖动。
+// nil = 关闭（零值语义）；显式 0 同样关闭。默认值由装配层显式传入。
 func (s *Scheduler) SetJitterMinutes(v *int) {
 	s.schedMu.Lock()
 	s.cfg.JitterMinutes = v
@@ -300,6 +304,28 @@ const (
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
 // 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
 func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+	// 抖动续跑：若「现在」正处在某个任务的小时窗口内（[h:00, h:jitter)），
+	// 下一跳设为「1 分钟后」继续补 tick。
+	//
+	// 为什么必须有它：抖动把各账号的时刻摊到该小时内的不同分钟，而排程本身
+	// 只在该小时整点唤醒一次——不续跑的话，被摊到 h:07 的账号在整点那一轮
+	// 因「未到点」被跳过，之后调度器直接排到下一天，它当天就永远不执行了。
+	// 有了续跑，调度器在窗口内每分钟醒一次，逐批把到点的账号放出去；
+	// 窗口结束后 nextFire 自然给出下一个整点，续跑随之停止（不会无限循环）。
+	//
+	// 注意续跑是**叠加**在排程时点之上的：baseNextWake 保持「下一个排程时点」
+	// 的原有语义（测试与手工排演都依赖它），续跑只在本轮窗口真正生效时提前
+	// 唤醒。两者取更早者。
+	next, kinds := s.baseNextWake(now)
+	if at, jk := s.jitterContinuation(now); !at.IsZero() && (next.IsZero() || at.Before(next)) {
+		return at, jk
+	}
+	return next, kinds
+}
+
+// baseNextWake 返回下一个**排程时点**（小时整点）与届时该跑的任务种类。
+// 保持引入抖动前的原有语义：不受抖动窗口影响。
+func (s *Scheduler) baseNextWake(now time.Time) (time.Time, []taskKind) {
 	s.schedMu.Lock()
 	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
 	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
@@ -350,6 +376,65 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		}
 	}
 	return earliest, kinds
+}
+
+// jitterContinuation 报告「抖动窗口内是否需要再补一轮」，返回下一次唤醒时刻
+// 与本轮要派发的任务种类；不在窗口内返回零时间。
+//
+// 只对受抖动影响的三类「按账号扇出」任务生效（签到 / 活跃上报 / 保活）——
+// 旅行、夜猫子、成长队列是整批动作，不吃账号级抖动。
+func (s *Scheduler) jitterContinuation(now time.Time) (time.Time, []taskKind) {
+	window := s.jitterMinutes()
+	if window <= 0 || window >= 60 {
+		return time.Time{}, nil // 未开抖动（或窗口畸形）→ 不续跑，保持原行为
+	}
+
+	s.schedMu.Lock()
+	type taskHours struct {
+		hours []int
+		off   bool
+		kind  taskKind
+	}
+	tasks := []taskHours{
+		{s.cfg.CheckinHours, s.cfg.CheckinDisabled, taskCheckin},
+		{s.cfg.ActivityHours, s.cfg.ActivityDisabled, taskActivity},
+		{s.cfg.KeepaliveHours, s.cfg.KeepaliveDisabled, taskKeepalive},
+	}
+	s.schedMu.Unlock()
+
+	hourStart := now.Truncate(time.Hour)
+	minuteIntoHour := now.Sub(hourStart)
+
+	var kinds []taskKind
+	for _, t := range tasks {
+		if t.off {
+			continue
+		}
+		// 当前小时必须是该任务的配置时点之一，且尚未走出抖动窗口。
+		configured := false
+		for _, h := range t.hours {
+			if h == now.Hour() {
+				configured = true
+				break
+			}
+		}
+		if !configured {
+			continue
+		}
+		if minuteIntoHour >= time.Duration(window)*time.Minute {
+			continue // 窗口已走完：本小时这一轮到此为止
+		}
+		kinds = append(kinds, t.kind)
+	}
+	if len(kinds) == 0 {
+		return time.Time{}, nil
+	}
+	// 下一分钟再醒一次（不早于 now+1s，避免同一分钟内空转）。
+	at := hourStart.Add(minuteIntoHour.Truncate(time.Minute) + time.Minute)
+	if !at.After(now) {
+		at = now.Add(time.Minute)
+	}
+	return at, kinds
 }
 
 // wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
