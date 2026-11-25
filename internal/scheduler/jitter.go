@@ -14,6 +14,7 @@ package scheduler
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"sync"
 	"time"
 )
 
@@ -58,14 +59,88 @@ func jitteredFireAt(base time.Time, task, uid string, window int) time.Time {
 // dueForAccount 报告 now 是否已到该账号本次任务的抖动时刻。
 //
 // base 是本轮任务的小时起点（如 09:00），账号实际时点 = base + 抖动量
-// （0 ~ window-1 分钟，且不超出本小时）。返回 true 表示可以执行。
-//
-// 注意语义是「已到期」而不是「恰好此刻」：调度 tick 可能晚于抖动时刻很多
-// （例如进程刚启动、或上一轮任务跑久了），那时仍应执行——幂等由各任务自身
-// 保证（签到返回「今天已签到」、上报每日一次、保活重复刷新无害）。
+// （0 ~ window-1 分钟，且不超出本小时）。返回 true 表示已到期。
 func dueForAccount(now, base time.Time, uid, task string, window int) bool {
 	if now.Before(base) {
 		return false // 还没到小时起点
 	}
 	return !now.Before(jitteredFireAt(base, task, uid, window))
+}
+
+// firedMarker 生成「本账号本任务本小时已执行过」的台账键。
+//
+// 为什么必须有台账：抖动续跑会在窗口内每分钟唤醒一轮，而 dueForAccount 是
+// **「已到期」**语义——09:07 到点的账号在 09:08、09:09… 每一轮都会再次返回
+// true。没有台账的话，45 分钟窗口 × 24 个账号会给上游打上千次重复签到
+// （签到虽幂等，但这种请求量本身就是异常特征，比漏签更糟）。
+//
+// 键里带小时起点，所以：
+//   - 同一小时窗口内，一个账号只执行一次；
+//   - 下一个排程时点（如 21:00）是新键，照常执行；
+//   - 跨天不冲突（日期已在时间戳里）。
+func firedMarker(base time.Time, task, uid string) string {
+	return base.Format("20060102T15") + "|" + task + "|" + uid
+}
+
+// slotLedger 按账号记录「本轮已执行」的台账（进程内，勿持久化）。
+//
+// 不持久化的理由：重启后重跑一轮是安全的——签到返回「今天已签到」、上报
+// 服务端按每日一次计、保活重复刷新无害；而持久化反而会在时钟回拨/改配置后
+// 留下「以为跑过其实没跑」的脏状态。重启频率远低于窗口内 tick 频率。
+type slotLedger struct {
+	mu   sync.Mutex
+	seen map[string]time.Time // marker → 首次记录时刻（用于清理）
+}
+
+// claim 尝试占用一个标记；返回 true 表示本次由调用方执行，false 表示已执行过。
+func (l *slotLedger) claim(marker string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.seen == nil {
+		l.seen = make(map[string]time.Time, 64)
+	}
+	if _, done := l.seen[marker]; done {
+		return false
+	}
+	l.seen[marker] = now
+	// 顺手清理：标记按小时递增，保留最近 48 小时足够覆盖任何窗口/回拨场景。
+	// 不清理会让长跑进程的 map 无界增长（每小时 24 号 × 3 任务 ≈ 72 条）。
+	if len(l.seen) > 4096 {
+		cutoff := now.Add(-48 * time.Hour)
+		for k, at := range l.seen {
+			if at.Before(cutoff) {
+				delete(l.seen, k)
+			}
+		}
+	}
+	return true
+}
+
+// reset 清空台账（测试用）。
+func (l *slotLedger) reset() {
+	l.mu.Lock()
+	l.seen = nil
+	l.mu.Unlock()
+}
+
+// shouldFire 综合判定「本账号本次任务此刻是否该执行」：
+// 已到抖动时刻 **且** 本轮尚未执行过。
+//
+// 这是三个任务体（签到 / 活跃上报 / 保活）的唯一判定入口——把「到点」与
+// 「只跑一次」两件事绑在一起，避免调用点各写一遍漏掉台账。
+//
+// scheduled=false（面板手动触发）时不做任何抖动与台账判定：用户点了按钮就
+// 该立刻对全部账号执行，与定时排程互不干扰。
+func (s *Scheduler) shouldFire(now, hourBase time.Time, uid, task string, scheduled bool) bool {
+	if !scheduled {
+		return true
+	}
+	window := s.jitterMinutes()
+	if window <= 0 {
+		return true // 抖动关闭：回到整点全跑（与引入前逐秒一致）
+	}
+	if !dueForAccount(now, hourBase, uid, task, window) {
+		return false // 未到本账号的分钟点
+	}
+	return s.ledger.claim(firedMarker(hourBase, task, uid), now)
 }

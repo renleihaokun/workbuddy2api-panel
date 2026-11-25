@@ -99,6 +99,10 @@ type Scheduler struct {
 	mu         sync.Mutex
 	adoptTried map[string]string
 
+	// ledger 抖动轮次的「已执行」台账：保证抖动续跑期间一个账号只执行一次
+	// （见 jitter.go 的 firedMarker / shouldFire）。
+	ledger slotLedger
+
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与
 	// 各周期循环各自消费，分别用独立 channel（同 channel 被多个 select 消费会丢信号）。
@@ -638,16 +642,12 @@ func (s *Scheduler) runCheckin(scheduled bool) {
 	// 手动触发（scheduled=false）不抖动：用户点了按钮就该立刻全跑。
 	now := time.Now()
 	hourBase := now.Truncate(time.Hour)
-	jitter := 0
-	if scheduled {
-		jitter = s.jitterMinutes()
-	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
-		// 按账号抖动：未到本账号的分钟点则跳过，下一轮 tick 再来。
-		if !dueForAccount(now, hourBase, st.UID, "checkin", jitter) {
+		// 抖动判定：已到本账号分钟点 **且** 本轮尚未执行过（台账保证只跑一次）。
+		if !s.shouldFire(now, hourBase, st.UID, "checkin", scheduled) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -744,16 +744,12 @@ func (s *Scheduler) runActivityBody(ctx context.Context, scheduled bool) {
 	includeDisabled := s.includeDisabledInTasks()
 	now := time.Now()
 	hourBase := now.Truncate(time.Hour)
-	jitter := 0
-	if scheduled {
-		jitter = s.jitterMinutes()
-	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
-		// 按账号抖动：与签到同口径，避免全部账号在同一分钟上报。
-		if !dueForAccount(now, hourBase, st.UID, "activity", jitter) {
+		// 抖动判定：与签到同口径，避免全部账号在同一分钟上报；台账保证只跑一次。
+		if !s.shouldFire(now, hourBase, st.UID, "activity", scheduled) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -845,17 +841,13 @@ func (s *Scheduler) runKeepalive(scheduled bool) {
 	includeDisabled := s.includeDisabledInTasks()
 	now := time.Now()
 	hourBase := now.Truncate(time.Hour)
-	jitter := 0
-	if scheduled {
-		jitter = s.jitterMinutes()
-	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
 			continue
 		}
-		// 按账号抖动：24 个号同时刷新 token 会在上游形成一次明显的行为簇。
-		// 保活幂等（重复刷新无害），tick 晚到补执行也安全。
-		if !dueForAccount(now, hourBase, st.UID, "keepalive", jitter) {
+		// 抖动判定：24 个号同时刷新 token 会在上游形成一次明显的行为簇；
+		// 台账保证窗口内每个号只刷新一次。
+		if !s.shouldFire(now, hourBase, st.UID, "keepalive", scheduled) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)

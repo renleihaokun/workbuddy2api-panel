@@ -7,6 +7,8 @@ package scheduler
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -339,5 +341,227 @@ func TestJitterWindowEventuallyReleasesEveryAccount(t *testing.T) {
 			}
 		}
 		t.Fatalf("窗口结束后仍有 %d 个账号没被放出: %v", len(missing), missing)
+	}
+}
+
+// TestShouldFireClaimsOnce 复核补的关键约束：**窗口内每个账号只执行一次**。
+//
+// dueForAccount 是「已到期」语义——到点之后每一轮都返回 true。续跑会每分钟
+// 醒一次，若不记账，45 分钟窗口 × 24 个账号会给上游打上千次重复签到（签到
+// 虽幂等，但这种请求量本身比漏签更像异常）。shouldFire 必须把「到点」与
+// 「只跑一次」绑在一起。
+func TestShouldFireClaimsOnce(t *testing.T) {
+	const window = DefaultJitterMinutes
+	def := window
+	s := &Scheduler{cfg: Config{JitterMinutes: &def}}
+	hourBase := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+
+	const uid = "workbuddy-0007"
+	slot := jitteredFireAt(hourBase, "checkin", uid, window)
+
+	// 到点之前：不执行。
+	if s.shouldFire(slot.Add(-time.Minute), hourBase, uid, "checkin", true) {
+		t.Fatal("未到抖动时刻不该执行")
+	}
+	// 恰好到点：执行一次。
+	if !s.shouldFire(slot, hourBase, uid, "checkin", true) {
+		t.Fatal("到点应立即执行")
+	}
+	// 窗口内后续每一轮 tick：都必须返回 false（已执行过）。
+	for m := 0; m < window; m++ {
+		now := hourBase.Add(time.Duration(m) * time.Minute)
+		if !now.Before(slot) && s.shouldFire(now, hourBase, uid, "checkin", true) {
+			t.Fatalf("%v 时该账号已在 %v 执行过，不该重复执行", now, slot)
+		}
+	}
+	// 下一个排程时点（21:00）是新键：照常执行。
+	nextHour := hourBase.Add(12 * time.Hour)
+	nextSlot := jitteredFireAt(nextHour, "checkin", uid, window)
+	if !s.shouldFire(nextSlot, nextHour, uid, "checkin", true) {
+		t.Error("下一个排程时点应重新允许执行（台账按小时分键）")
+	}
+}
+
+// TestShouldFireWholeWindowRequestCount 复核量化约束：
+// 一个窗口内对 24 个账号的判定，必须恰好放出 24 次，不多不少。
+//
+// 这条同时挡住两个方向的错误：漏号（<24）与重复（>24）。
+func TestShouldFireWholeWindowRequestCount(t *testing.T) {
+	const window = DefaultJitterMinutes
+	def := window
+	s := &Scheduler{cfg: Config{JitterMinutes: &def}}
+	hourBase := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+
+	uids := make([]string, 24)
+	for i := range uids {
+		uids[i] = fmt.Sprintf("workbuddy-%04d", i)
+	}
+
+	fired := make(map[string]int)
+	for m := 0; m < window; m++ {
+		now := hourBase.Add(time.Duration(m) * time.Minute)
+		for _, uid := range uids {
+			if s.shouldFire(now, hourBase, uid, "checkin", true) {
+				fired[uid]++
+			}
+		}
+	}
+
+	total := 0
+	for _, uid := range uids {
+		switch fired[uid] {
+		case 1:
+			// 正好
+		case 0:
+			t.Errorf("%s 整个窗口内没被执行（漏号）", uid)
+		default:
+			t.Errorf("%s 被执行了 %d 次（重复）", uid, fired[uid])
+		}
+		total += fired[uid]
+	}
+	if total != len(uids) {
+		t.Errorf("窗口内总执行次数 = %d, want %d（每号恰好一次）", total, len(uids))
+	}
+}
+
+// TestShouldFireManualAlwaysTrue 手动触发不受抖动与台账影响。
+func TestShouldFireManualAlwaysTrue(t *testing.T) {
+	def := DefaultJitterMinutes
+	s := &Scheduler{cfg: Config{JitterMinutes: &def}}
+	hourBase := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+	for i := 0; i < 3; i++ {
+		if !s.shouldFire(hourBase, hourBase, "u1", "checkin", false) {
+			t.Fatalf("第 %d 次手动触发被拦截（手动口径应恒 true）", i+1)
+		}
+	}
+}
+
+// TestShouldFireJitterOffAlwaysTrue 抖动关闭时恒 true（零行为回归）。
+func TestShouldFireJitterOffAlwaysTrue(t *testing.T) {
+	zero := 0
+	s := &Scheduler{cfg: Config{JitterMinutes: &zero}}
+	hourBase := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+	for i := 0; i < 3; i++ {
+		if !s.shouldFire(hourBase, hourBase, "u1", "checkin", true) {
+			t.Fatal("抖动关闭时定时排程应恒执行")
+		}
+	}
+}
+
+// TestFiredMarkerScopes 台账键必须按 小时 / 任务 / 账号 三者隔离。
+func TestFiredMarkerScopes(t *testing.T) {
+	h9 := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+	h21 := time.Date(2026, 11, 25, 21, 0, 0, 0, time.Local)
+
+	base := firedMarker(h9, "checkin", "u1")
+	if base == firedMarker(h21, "checkin", "u1") {
+		t.Error("不同小时必须分键")
+	}
+	if base == firedMarker(h9, "activity", "u1") {
+		t.Error("不同任务必须分键")
+	}
+	if base == firedMarker(h9, "checkin", "u2") {
+		t.Error("不同账号必须分键")
+	}
+	if base != firedMarker(h9, "checkin", "u1") {
+		t.Error("同小时同任务同账号必须同键（幂等）")
+	}
+}
+
+// TestSlotLedgerClaimAndCleanup 台账 claim 语义与容量清理。
+func TestSlotLedgerClaimAndCleanup(t *testing.T) {
+	var l slotLedger
+	now := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+	if !l.claim("k1", now) {
+		t.Fatal("首次 claim 应成功")
+	}
+	if l.claim("k1", now) {
+		t.Fatal("重复 claim 应失败")
+	}
+	if !l.claim("k2", now) {
+		t.Fatal("不同键首次 claim 应成功")
+	}
+
+	// 容量清理：塞入大量旧标记后 map 不应无限增长。
+	for i := 0; i < 5000; i++ {
+		l.claim(fmt.Sprintf("old-%d", i), now.Add(-72*time.Hour))
+	}
+	l.claim("fresh", now)
+	l.mu.Lock()
+	size := len(l.seen)
+	l.mu.Unlock()
+	if size > 5000 {
+		t.Errorf("台账未清理，size=%d", size)
+	}
+}
+
+// TestSlotLedgerConcurrent 并发 claim 同一键只能有一个成功。
+func TestSlotLedgerConcurrent(t *testing.T) {
+	var l slotLedger
+	now := time.Now()
+	const n = 50
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if l.claim("same-key", now) {
+				ok.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := ok.Load(); got != 1 {
+		t.Errorf("并发 claim 同一键成功了 %d 次，want 恰好 1 次", got)
+	}
+}
+
+// TestShouldFireConcurrentNoDoubleFire 并发压力：多个 goroutine 同时对一个
+// 窗口内的 24 个账号做判定，每个账号仍必须恰好执行一次。
+//
+// 续跑 tick 与面板手动触发可能并发进入（复查发现锁是**非嵌套**持有：
+// jitterMinutes 取 schedMu 后即释放，再取 ledger 自己的锁），这里用压力
+// 用例钉住「不会双发、不会死锁」。
+func TestShouldFireConcurrentNoDoubleFire(t *testing.T) {
+	const window = DefaultJitterMinutes
+	def := window
+	s := &Scheduler{cfg: Config{JitterMinutes: &def}}
+	hourBase := time.Date(2026, 11, 25, 9, 0, 0, 0, time.Local)
+
+	uids := make([]string, 24)
+	for i := range uids {
+		uids[i] = fmt.Sprintf("cb-%04d", i)
+	}
+
+	var mu sync.Mutex
+	fired := make(map[string]int)
+	var wg sync.WaitGroup
+
+	// 8 个并发 worker，每个跑完整个窗口的每分钟 tick。
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for m := 0; m < window; m++ {
+				now := hourBase.Add(time.Duration(m) * time.Minute)
+				for _, uid := range uids {
+					if s.shouldFire(now, hourBase, uid, "checkin", true) {
+						mu.Lock()
+						fired[uid]++
+						mu.Unlock()
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, uid := range uids {
+		if fired[uid] != 1 {
+			t.Errorf("%s 并发场景下被执行 %d 次，want 恰好 1 次", uid, fired[uid])
+		}
 	}
 }
