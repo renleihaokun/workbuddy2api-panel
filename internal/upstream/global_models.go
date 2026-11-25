@@ -207,11 +207,11 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		}()
 		return ch
 	}
-	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
-	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
-	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
-	v3IDECh := probeV3(codeBuddyIDEUA)
-	v3CLICh := probeV3(codeBuddyCLIUA)
+	// 三路并集：官方桌面端 UA（真机形态，主路）+ 两条历史探测 UA（拿官方 UA
+	// 拿不到的那部分模型）。历史 UA **只在这里出现**，不进任何用户链路。
+	v3DesktopCh := probeV3(c.chatUA(a))
+	v3IDECh := probeV3(legacyIDEProbeUA)
+	v3CLICh := probeV3(legacyCLIProbeUA)
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。

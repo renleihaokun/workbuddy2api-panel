@@ -22,6 +22,7 @@ import (
 	"net/url"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // growth 域任务路径（与 scripts/task_common.py 对齐）。
@@ -97,6 +98,10 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
+	// 小程序口径：必须撤掉桌面端 5.11.3 的 X-Client-* 三头，否则会发出
+	// `5.11.3 / miniprogram / WorkBuddy`——桌面端不会说 miniprogram，小程序也不会
+	// 自报 5.11.3，是个谁都不像的第四种组合（见 identity.go 的 drop 注释）。
+	c.dropClientIdentityHeaders(req)
 	req.Header.Set("X-Client-Platform", mpPlatform)
 	return c.doJSON(req)
 }
@@ -118,6 +123,7 @@ func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy in
 		return 0, 0, err
 	}
 	c.BillingHeaders(req, a)
+	c.dropClientIdentityHeaders(req)
 	req.Header.Set("X-Client-Platform", mpPlatform)
 	data, err := c.doJSON(req)
 	if err != nil {
@@ -230,17 +236,19 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	if err != nil {
 		return 0, 0, err
 	}
-	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
-	// 带 x-client-platform: web 标记来源端。
+	// Web 端请求头形状（对照浏览器实际请求）：这是 **web 层**（浏览器语义），
+	// Origin/Referer 与 x-client-platform: web 都要发，与 RPC 层相反。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://www.workbuddy.cn")
-	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
+	origin := originRefererFor(a)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/profile/growth-center")
 	req.Header.Set("x-client-platform", "web")
-	if ua := c.userAgent(a); ua != "" {
+	if ua := c.userAgentForWeb(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
@@ -250,6 +258,8 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	}
 	if d := a.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
+	} else {
+		req.Header.Set("X-Domain", c.billingHost(a))
 	}
 
 	data, err := c.doJSON(req)

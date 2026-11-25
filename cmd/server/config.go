@@ -16,6 +16,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -119,6 +120,17 @@ type Config struct {
 		// 只做 accept/claim 两条幂等请求，不跑任何行为链路；分钟级开销可忽略。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+
+		// JitterMinutes 按账号的分钟级时刻抖动窗口（分钟）。
+		//
+		// 背景：排程时点（checkin_hours 等）只精确到小时，而网关出口只有一个 IP——
+		// 不抖动时全部账号会在同一个整点做完全相同的动作（签到/上报/保活/夜猫子），
+		// 上游不需要任何指纹就能把它们归到一起。抖动让每个账号落在该小时内的不同
+		// 分钟：按 uid 稳定散列（跨重启不漂）、按自然日轮换。
+		//
+		// 三态：键缺席（nil）= 默认 45 分钟（新部署自带抖动）；显式 0 = 关闭；
+		// 正值 = 该窗口。窗口不取 60，留余量避免尾部账号撞进下一小时。
+		JitterMinutes *int `json:"jitter_minutes"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -150,14 +162,15 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
-		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三族 UA）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
-		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
+		// 默认值已对齐官方 WorkBuddy 桌面形态，用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
-		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的品牌段与 X-IDE-Version）。
+		// 空 = 按账号 realm 取内置默认：CN 5.11.3 / global 5.9.4（两个发行档不同）。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 按 realm 取默认
+		// （CN 2.176.0 / global 2.165.0，随各分发包内置）。
 		CliVersion string `json:"cli_version"`
 		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
 		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
@@ -169,6 +182,18 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// IdentityMode 出站身份实现模式（热生效）：
+		//
+		//   "capture"（缺省/空）→ 对齐真机抓包：不发 X-Machine-ID/X-Session-ID、
+		//     UA 分 chat/RPC/billing 三族、带齐 x-stainless-*/X-Agent-*/baggage 等
+		//     真机头族、会话 ID 用带连字符 UUIDv7。
+		//   "legacy" → **逐字节还原改造前**的出站形态（自造设备头、Origin/Referer/
+		//     Accept-Language 全覆盖、旧三段式 UA）。逃生门：上游若有意外反应，
+		//     面板改一行即时回退，不必回滚二进制。
+		//
+		// 为什么留这条退路：capture 模式的所有口径来自同类项目的逆向结论，我们没有
+		// 自己的抓包能本地自证，生产上必须能立刻回到已知可跑的形态。
+		IdentityMode string `json:"identity_mode"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -690,6 +715,17 @@ func (c *Config) normalize() error {
 		return fmt.Errorf("models.id_style: %w", err)
 	} else {
 		c.Models.IDStyle = string(style)
+	}
+	// 出站身份模式：空串回落 capture；非法值 fail fast（同上纪律——静默回落
+	// 会让「配了 legacy 却没生效」变成一次危险的误判）。
+	if _, err := upstream.ParseIdentityMode(c.Upstream.IdentityMode); err != nil {
+		return err
+	}
+	// 抖动窗口：nil 表示「键缺席」→ 保留 nil，由 scheduler 回落默认 45；
+	// 显式负值按 0 处理（= 关闭），不静默改成正数。
+	if c.Schedule.JitterMinutes != nil && *c.Schedule.JitterMinutes < 0 {
+		zero := 0
+		c.Schedule.JitterMinutes = &zero
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

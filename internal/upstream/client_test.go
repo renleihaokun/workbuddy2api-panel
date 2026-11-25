@@ -383,7 +383,9 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
+	// X-Product 是 SKU 段，恒 SaaS —— 真机两版实测都不是产品名。
+	// 产品名承载在 X-IDE-Name/Type 上（见 injectAttribution）。
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -710,8 +712,11 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			// 该端点现在并发两路取并集：官方桌面 UA + 历史 IDE 探测 UA。
+			// 两路都必须是已知形态之一，不能出现空 UA 或 Go 默认串。
+			gotUA := r.Header.Get("User-Agent")
+			if gotUA != "WorkBuddy/5.11.3 CLI/2.176.0" && gotUA != legacyIDEProbeUA {
+				t.Errorf("v3/config UA=%q want 官方两段式或 legacy 探测串", gotUA)
 			}
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))

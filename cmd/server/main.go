@@ -36,7 +36,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.25.0-panel"
+const appVersion = "1.26.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -168,6 +168,14 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 出站身份模式（capture 对齐真机 / legacy 逐字节还原改造前）。
+	// normalize 已校验过枚举，这里解析不会失败。
+	if mode, err := upstream.ParseIdentityMode(cfg.Upstream.IdentityMode); err == nil {
+		up.SetIdentityMode(mode)
+		if mode == upstream.ModeLegacy {
+			log.Printf("出站身份：legacy 模式（还原改造前形态，非默认）")
+		}
+	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -211,6 +219,8 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// 按账号的分钟级抖动窗口：单出口 IP 下让各账号错开整点（nil = 默认 45）。
+		JitterMinutes: cfg.Schedule.JitterMinutes,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -627,6 +637,16 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		RealmNamePrefix:      newCfg.Models.RealmNamePrefix,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	// 出站身份模式热生效：面板改完立刻切，不需要重启（逃生门必须即时可用）。
+	if mode, err := upstream.ParseIdentityMode(newCfg.Upstream.IdentityMode); err == nil {
+		up.SetIdentityMode(mode)
+	}
+	// 其余上游身份字段（UA 覆盖 / 版本段）在面板保存后同样热生效：
+	// 版本号错了要能立刻改，而不是等重启。
+	up.UserAgent = newCfg.Upstream.UserAgent
+	up.ClientVersion = newCfg.Upstream.ClientVersion
+	up.CliVersion = newCfg.Upstream.CliVersion
+	up.ClientName = newCfg.Upstream.ClientName
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -651,6 +671,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetJitterMinutes(newCfg.Schedule.JitterMinutes)
 
 	return restartRequiredFields(newCfg), nil
 }

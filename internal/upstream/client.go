@@ -891,6 +891,10 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// identityMode 出站身份模式（ModeCapture / ModeLegacy，见 identity.go）。
+	// atomic：面板保存配置热改，chat 热路径并发读。零值 = ModeCapture。
+	identityMode atomic.Int32
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -1590,24 +1594,17 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	return false
 }
 
-// codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
-// CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
-// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
-// （flash：393216 + low/high/max）。
-// 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
-const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
-
-// codeBuddyCLIUA CLI 三段式 UA。**实测（2026-09-22）该端点对不同 UA 下发的模型集合不同**：
-//   - IDE UA  → 14 条（10 个 chat：含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
-//   - CLI UA  → 22 条（22 个 chat：**含 deepseek-v4.1-flash / deepseek-v4.1-flash-sg /
-//     gpt-6-astra / kimi-k2.8-preview**，但无 o4-mini / enhance-1.0 / auto-chat）
+// legacyIDEProbeUA /v3/config 的**历史探测 UA**，仅保留给「目录取并集」用。
 //
-// 注意两点，都与旧注释相反，勿再按旧注释推断：
-//  1. 旧注释称「CLI UA 拿到精简目录、IDE UA 才返回完整能力」——实测模型数量恰好相反，
-//     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
-//     而非模型更多。两路各有独有模型，缺一不可。
-//  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
+// 这个串是从旧版 IDE 客户端抄来的，WorkBuddy 分发包里根本不存在——真实身份
+// 链路**绝不能**发它（那是最显眼的非官方指纹）。但它有一个不可替代的作用：
+// 实测该端点对不同 UA 下发**不同模型集合**，这条串能拿到官方桌面 UA 拿不到的
+// 模型（含 deepseek 系列）。故只在目录探测的多路并集里出现，不进任何用户链路。
+const legacyIDEProbeUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
+
+// legacyCLIProbeUA /v3/config 的第二条历史探测 UA（同 legacyIDEProbeUA 的定位）。
+// 仅用于 global 侧多路并集，不进用户链路。
+const legacyCLIProbeUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
@@ -1775,17 +1772,43 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
+// fetchV3Models 探测 /v3/config 取模型目录（CN 侧）。
+//
 // v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
-// 失败返回错误（调用方降级为仅企业端点）。
+//
+// 并发两路取并集：官方桌面端 UA（v3ConfigUA，真机唯一形态）+ 历史 IDE UA
+// （legacyIDEProbeUA）。该端点对不同 UA 下发不同模型集合，单发官方 UA 会丢模型；
+// 而历史 UA 只用于目录探测，不出现在任何用户链路上——指纹与覆盖率两头都要。
+// 单路失败降级为另一路结果，两路全失败才返回错误。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
-	if err != nil {
-		return nil, err
+	type v3Result struct {
+		byID map[string]ModelInfo
+		err  error
 	}
-	out := make([]ModelInfo, 0, len(byID))
-	for _, mi := range byID {
+	probe := func(ua string) chan v3Result {
+		ch := make(chan v3Result, 1)
+		go func() {
+			byID, err := c.fetchV3ConfigModelMap(a, ua)
+			ch <- v3Result{byID: byID, err: err}
+		}()
+		return ch
+	}
+	r1 := <-probe(c.v3ConfigUA(a))
+	r2 := <-probe(legacyIDEProbeUA)
+	if r1.err != nil && r2.err != nil {
+		return nil, r1.err
+	}
+	merged := make(map[string]ModelInfo, len(r1.byID)+len(r2.byID))
+	for _, r := range []v3Result{r1, r2} {
+		for id, mi := range r.byID {
+			if _, exists := merged[id]; !exists { // 官方 UA 结果优先（先写入者胜）
+				merged[id] = mi
+			}
+		}
+	}
+	out := make([]ModelInfo, 0, len(merged))
+	for _, mi := range merged {
 		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
@@ -2052,8 +2075,8 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
-// ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
-// 不同模型集合**（见 codeBuddyCLIUA 注释），global 探测据此并发两路取并集。
+// ua 为该次请求的 User-Agent；空串等价 v3ConfigUA(a)。该端点对 UA 敏感且**不同 UA 下发
+// 不同模型集合**，调用方据此并发多路取并集。
 func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
@@ -2069,7 +2092,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
 	if ua == "" {
-		ua = codeBuddyIDEUA
+		ua = c.v3ConfigUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)

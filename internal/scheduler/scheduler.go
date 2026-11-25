@@ -58,6 +58,22 @@ type Config struct {
 	// 选号**——pool.pick 侧的 disabled 过滤与本开关无关。
 	IncludeDisabledInTasks bool
 
+	// JitterMinutes 按账号的分钟级时刻抖动窗口（schedule.jitter_minutes）。
+	//
+	// 为什么需要：网关出口 IP 只有一个，而排程只精确到小时——不抖动的话 24 个
+	// 账号会在同一个整点做完全相同的动作（签到/上报/保活/夜猫子），这是比 HTTP
+	// 头更直接的关联特征。抖动让每个账号落在该小时内的不同分钟，按 uid 稳定
+	// 散列、按自然日轮换。
+	//
+	// 三态语义（用指针区分「没配」与「配了 0」）：
+	//   - nil（键缺席）→ 默认 DefaultJitterMinutes（45），新部署自带抖动；
+	//   - 0（显式配置）→ 关闭抖动，回到整点同时打（与引入前逐秒一致）；
+	//   - >0 → 该窗口分钟数。
+	//
+	// 窗口刻意不取 60，留余量避免尾部账号撞进下一小时（例如 checkin_hours
+	// 同时含 9 和 21 时两轮不互相侵入）。
+	JitterMinutes *int
+
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
@@ -189,6 +205,26 @@ func (s *Scheduler) includeDisabledInTasks() bool {
 func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 	s.schedMu.Lock()
 	s.cfg.IncludeDisabledInTasks = v
+	s.schedMu.Unlock()
+}
+
+// jitterMinutes 当前生效的按账号抖动窗口（分钟）。<=0 表示关闭。
+//
+// 三态：未配置（nil）→ DefaultJitterMinutes；显式 0 → 关闭；正值 → 该值。
+func (s *Scheduler) jitterMinutes() int {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	if s.cfg.JitterMinutes == nil {
+		return DefaultJitterMinutes
+	}
+	return *s.cfg.JitterMinutes
+}
+
+// SetJitterMinutes 热更新按账号抖动窗口（schedule.jitter_minutes）。
+// nil = 恢复默认；显式传 0 才是关闭抖动。
+func (s *Scheduler) SetJitterMinutes(v *int) {
+	s.schedMu.Lock()
+	s.cfg.JitterMinutes = v
 	s.schedMu.Unlock()
 }
 
@@ -436,13 +472,13 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.runCheckinScheduled()
 			case taskTravel:
 				s.RunTravelNow()
 			case taskActivity:
 				s.runActivity(ctx)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.runKeepaliveScheduled()
 			case taskBlackcat:
 				s.RunBlackcatNow()
 			case taskGrowth:
@@ -475,30 +511,58 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
+// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻（**手动触发口径**）。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 //
+// 手动触发**不受账号抖动门控**：用户点了按钮就该立刻全跑，而不是等某个
+// 账号的分钟点。抖动只作用于定时排程（见 runCheckinScheduled）。
+//
 // 返回 false 表示上一轮仍在执行、本次触发被单飞跳过（面板据此如实回显）。
 func (s *Scheduler) RunCheckinNow() bool {
+	return s.runCheckinLocked(false)
+}
+
+// runCheckinScheduled 定时排程口径：按账号抖动错开执行（见 jitter.go）。
+func (s *Scheduler) runCheckinScheduled() bool {
+	return s.runCheckinLocked(true)
+}
+
+// runCheckinLocked 单飞守卫 + 按 scheduled 决定是否应用抖动。
+func (s *Scheduler) runCheckinLocked(scheduled bool) bool {
 	if !s.checkinRun.TryLock() {
 		log.Printf("checkin: 上一轮仍在执行，跳过本次触发")
 		return false
 	}
 	defer s.checkinRun.Unlock()
-	s.runCheckin()
+	s.runCheckin(scheduled)
 	return true
 }
 
-// runCheckin 签到任务体（不含单飞锁，供 RunCheckinNow / StartCheckin 共用）。
-func (s *Scheduler) runCheckin() {
+// runCheckin 签到任务体（不含单飞锁）。
+// scheduled=true 表示由定时排程触发（应用按账号抖动）；false 表示面板手动
+// 触发（立即对全部账号执行，不受抖动门控）。
+func (s *Scheduler) runCheckin(scheduled bool) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	// 抖动基准：本轮小时起点（如 09:00）。每个账号按 uid 散列到该小时内的
+	// 不同分钟，避免 24 个号在同一时刻从同一个出口 IP 同时签到。
+	// 手动触发（scheduled=false）不抖动：用户点了按钮就该立刻全跑。
+	now := time.Now()
+	hourBase := now.Truncate(time.Hour)
+	jitter := 0
+	if scheduled {
+		jitter = s.jitterMinutes()
+	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
+			continue
+		}
+		// 按账号抖动：未到本账号的分钟点则跳过，下一轮 tick 再来。
+		if !dueForAccount(now, hourBase, st.UID, "checkin", jitter) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -564,28 +628,47 @@ func (s *Scheduler) runCheckin() {
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
+// RunActivityNow 面板手动触发口径：立即对全部账号上报，**不受账号抖动门控**
+// （用户点了按钮就该立刻全跑，而不是等某个账号的分钟点）。
+// 排程主循环走 runActivity（scheduled=true，应用抖动；ctx 取消时立即放弃剩余账号）。
 func (s *Scheduler) RunActivityNow() bool {
-	return s.runActivity(context.Background())
+	return s.runActivityWith(context.Background(), false)
 }
 
-// runActivity 活跃上报遍历，随 ctx 取消立即退出。
+// runActivity 活跃上报遍历（定时排程口径，应用账号抖动），随 ctx 取消立即退出。
 // 返回 false 表示上一轮仍在执行、本次触发被单飞跳过。
 func (s *Scheduler) runActivity(ctx context.Context) bool {
+	return s.runActivityWith(ctx, true)
+}
+
+// runActivityWith 单飞守卫 + 按 scheduled 决定是否应用账号抖动。
+func (s *Scheduler) runActivityWith(ctx context.Context, scheduled bool) bool {
 	if !s.activityRun.TryLock() {
 		log.Printf("activity: 上一轮仍在执行，跳过本次触发")
 		return false
 	}
 	defer s.activityRun.Unlock()
-	s.runActivityBody(ctx)
+	s.runActivityBody(ctx, scheduled)
 	return true
 }
 
 // runActivityBody 活跃上报任务体（不含单飞锁，供 runActivity / StartActivity 共用）。
-func (s *Scheduler) runActivityBody(ctx context.Context) {
+// scheduled=true 表示定时排程触发（应用账号抖动）；false = 面板手动触发（全跑）。
+func (s *Scheduler) runActivityBody(ctx context.Context, scheduled bool) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
+	now := time.Now()
+	hourBase := now.Truncate(time.Hour)
+	jitter := 0
+	if scheduled {
+		jitter = s.jitterMinutes()
+	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
+			continue
+		}
+		// 按账号抖动：与签到同口径，避免全部账号在同一分钟上报。
+		if !dueForAccount(now, hourBase, st.UID, "activity", jitter) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -652,20 +735,42 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 //
 // 返回 false 表示上一轮仍在执行、本次触发被单飞跳过。
 func (s *Scheduler) RunKeepaliveNow() bool {
+	return s.runKeepaliveLocked(false)
+}
+
+// runKeepaliveScheduled 定时排程口径：按账号抖动错开（见 jitter.go）。
+func (s *Scheduler) runKeepaliveScheduled() bool {
+	return s.runKeepaliveLocked(true)
+}
+
+// runKeepaliveLocked 单飞守卫 + 按 scheduled 决定是否应用账号抖动。
+func (s *Scheduler) runKeepaliveLocked(scheduled bool) bool {
 	if !s.keepaliveRun.TryLock() {
 		log.Printf("keepalive: 上一轮仍在执行，跳过本次触发")
 		return false
 	}
 	defer s.keepaliveRun.Unlock()
-	s.runKeepalive()
+	s.runKeepalive(scheduled)
 	return true
 }
 
 // runKeepalive 保活任务体（不含单飞锁）。
-func (s *Scheduler) runKeepalive() {
+// scheduled=true 表示定时排程触发（应用账号抖动）；false = 面板手动触发（全跑）。
+func (s *Scheduler) runKeepalive(scheduled bool) {
 	includeDisabled := s.includeDisabledInTasks()
+	now := time.Now()
+	hourBase := now.Truncate(time.Hour)
+	jitter := 0
+	if scheduled {
+		jitter = s.jitterMinutes()
+	}
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
+			continue
+		}
+		// 按账号抖动：24 个号同时刷新 token 会在上游形成一次明显的行为簇。
+		// 保活幂等（重复刷新无害），tick 晚到补执行也安全。
+		if !dueForAccount(now, hourBase, st.UID, "keepalive", jitter) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -705,7 +810,7 @@ func (s *Scheduler) startAsync(mu *sync.Mutex, name string, fn func()) bool {
 
 // StartCheckin 面板「全部签到」：已在跑返回 false。
 func (s *Scheduler) StartCheckin() bool {
-	return s.startAsync(&s.checkinRun, "checkin", s.runCheckin)
+	return s.startAsync(&s.checkinRun, "checkin", func() { s.runCheckin(false) })
 }
 
 // StartTravel 面板「旅行巡检」：已在跑返回 false。
@@ -715,12 +820,12 @@ func (s *Scheduler) StartTravel() bool {
 
 // StartActivity 面板「活跃上报」：已在跑返回 false。
 func (s *Scheduler) StartActivity() bool {
-	return s.startAsync(&s.activityRun, "activity", func() { s.runActivityBody(context.Background()) })
+	return s.startAsync(&s.activityRun, "activity", func() { s.runActivityBody(context.Background(), false) })
 }
 
 // StartKeepalive 面板「全部保活」：已在跑返回 false。
 func (s *Scheduler) StartKeepalive() bool {
-	return s.startAsync(&s.keepaliveRun, "keepalive", s.runKeepalive)
+	return s.startAsync(&s.keepaliveRun, "keepalive", func() { s.runKeepalive(false) })
 }
 
 // poolExpiryBuckets 把 upstream 的按日到期批次转换为 pool 结构。两个包字段同构，

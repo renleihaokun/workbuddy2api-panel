@@ -15,6 +15,7 @@ import (
 	"net/http"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 // FetchAccountProfile 拉取账号资料并返回最新昵称。uid 与凭证不一致时报错
@@ -27,11 +28,13 @@ func (c *Client) FetchAccountProfile(a *auth.Auth) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", "https://www.workbuddy.cn")
-	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/account-settings")
-	if ua := c.userAgent(a); ua != "" {
-		req.Header.Set("User-Agent", ua)
-	}
+	// 这是 web 层请求（控制台页面），走浏览器 UA 与按 realm 切的 Origin/Referer。
+	// 旧实现把 Origin 写死成 CN 域，global 账号会带着 cn 域打 global 端点。
+	origin := originRefererFor(a)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/profile/account-settings")
+	req.Header.Set("User-Agent", c.userAgentForWeb(a))
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	data, err := c.doJSON(req)
 	if err != nil {
 		return "", err

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"time"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -54,6 +55,62 @@ func NewMessageID() string {
 	}
 	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
+}
+
+// NewTimeOrderedID 生成会话级 ID：带连字符的 UUIDv7（RFC 9562），36 字符。
+//
+// 为什么必须是 v7 而不是 32 hex：真机 5.9.3 的 X-Conversation-ID 恒为
+// `01a1815d-dacf-75f1-…` 这种时间有序 UUID 形态（前 48 位是毫秒时间戳）。
+// 旧实现发 32 位无连字符串，与客户端的会话 id 形态对不上——那是可判别的
+// 网关痕迹（同源分叉与本项目各自的抓包结论一致）。
+//
+// 用途：X-Conversation-ID（客户端未声明会话时）、acp-connection-id。
+// 注意**不要**拿它当消息级 ID：消息级仍是 32 hex（见 NewMessageID），
+// 真机这两族形态本来就不同。
+func NewTimeOrderedID() string {
+	b := make([]byte, 16)
+	// 前 6 字节：毫秒时间戳（大端）。
+	ms := uint64(time.Now().UnixMilli())
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	// 后 10 字节：随机。熵源故障时用 math/rand 兜底（形态仍合法）。
+	if _, err := cryptorand.Read(b[6:]); err != nil {
+		v1, v2 := rand.Uint64(), rand.Uint64()
+		for i := 0; i < 8; i++ {
+			b[6+i] = byte(v1 >> (8 * i))
+		}
+		b[14] = byte(v2)
+		b[15] = byte(v2 >> 8)
+	}
+	b[6] = (b[6] & 0x0f) | 0x70 // 版本位 = 7
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 变体位
+	return formatUUID(b)
+}
+
+// formatUUID 把 16 字节格式化成 8-4-4-4-12 的带连字符形态。
+func formatUUID(b []byte) string {
+	h := hex.EncodeToString(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// NewSpanID 生成 B3 SpanId：16 位 hex（8 字节随机）。
+//
+// 为什么不复用 messageID[:16]：真机 span（如 9795d0f16a68bd32）与 trace/request
+// 完全无关，是独立随机的。拿 messageID 前缀充数会把 12 hex 的时间前缀一起带
+// 出来，两个头之间出现可推导的关联——形态上就是网关自造。
+func NewSpanID() string {
+	b := make([]byte, 8)
+	if _, err := cryptorand.Read(b); err != nil {
+		v := rand.Uint64()
+		for i := 0; i < 8; i++ {
+			b[i] = byte(v >> (8 * i))
+		}
+	}
+	return hex.EncodeToString(b)
 }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法

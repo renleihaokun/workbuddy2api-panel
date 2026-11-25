@@ -2096,6 +2096,13 @@ button.ghost.danger:hover:not(:disabled) {
             <label class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></label>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">账号时刻抖动窗口（分钟）</span>
+                <input name="jitter_minutes" type="number" min="0" placeholder="45">
+                <span class="hint">默认 45；填 0 = 关闭</span></label>
+            </div>
+            <div class="hint">排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到 / 上报 / 保活 / 夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换）。<br>只影响<b>定时排程</b>：面板上手动点「立即签到 / 上报 / 保活」仍会立刻对全部账号执行。改动即时生效。</div>
           </div>
         </div>
 
@@ -2202,8 +2209,22 @@ button.ghost.danger:hover:not(:disabled) {
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>
-                <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
-                <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+                <input name="user_agent" placeholder="留空 = 按 realm 自动（CN WorkBuddy/5.11.3…，global workbuddy-ai/5.9.4…）">
+                <span class="hint">完全覆盖三族 UA；留空则 chat/RPC/billing 各自按真机形态。改动即时生效</span></label>
+              <label class="fld"><span class="lb">出站身份模式</span>
+                <select name="identity_mode">
+                  <option value="">capture — 对齐真机（默认）</option>
+                  <option value="legacy">legacy — 还原改造前形态（回退用）</option>
+                </select>
+                <span class="hint">capture 删掉自造的设备头、UA 分三族、补真机头族；legacy 逐字节回到旧行为。改动即时生效</span></label>
+            </div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">客户端版本段</span>
+                <input name="client_version" placeholder="留空 = CN 5.11.3 / global 5.9.4">
+                <span class="hint">同时决定 UA 的品牌段与 X-IDE-Version（单一来源）。改动即时生效</span></label>
+              <label class="fld"><span class="lb">内置 CLI 版本段</span>
+                <input name="cli_version" placeholder="留空 = CN 2.176.0 / global 2.165.0">
+                <span class="hint">UA 的 CLI/&lt;ver&gt; 段；跟随官方分发包内置版本。改动即时生效</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">

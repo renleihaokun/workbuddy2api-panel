@@ -5,10 +5,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
+
+// uuidShapeRe 带连字符的 UUID 形态（8-4-4-4-12）。真机的 machineId/sessionId
+// 都是这个形状，36 位无连字符 hex 与之对不上。
+var uuidShapeRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // TestReportDesktopEventFingerprint 断言桌面指纹上报：走 chatBase、UA 为桌面形状、
 // 事件数组自动注入 workbuddy-desktop 公共指纹（覆盖同名业务键）。
@@ -40,8 +46,10 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("report desktop: %v", err)
 	}
-	if gotUA != desktopUA {
-		t.Errorf("UA=%q want %q", gotUA, desktopUA)
+	// /v2/report 走 RPC 层 UA（不是 chat 三段式的首段驼峰形态）。
+	wantUA := (&Client{ChatBaseCN: srv.URL}).rpcUA(&auth.Auth{UID: "u-dt"})
+	if gotUA != wantUA {
+		t.Errorf("UA=%q want %q", gotUA, wantUA)
 	}
 	if len(got) != 1 {
 		t.Fatalf("events=%d want 1", len(got))
@@ -62,9 +70,18 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if ev["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", ev["mode"])
 	}
-	// machineId 应为 uid 稳定派生（36 hex）。
-	if len(ev["machineId"].(string)) != 36 {
-		t.Errorf("machineId 长度=%d want 36", len(ev["machineId"].(string)))
+	// machineId 是**带连字符的 UUID 形态**（真机如此），不是 36 位无连字符 hex。
+	// 形态对不上本身就是一处可判别的「网关特征」。
+	machineID, _ := ev["machineId"].(string)
+	if !uuidShapeRe.MatchString(machineID) {
+		t.Errorf("machineId=%q 不是带连字符的 UUID 形态", machineID)
+	}
+	if sessID, _ := ev["sessionId"].(string); sessID == machineID {
+		t.Error("sessionId 与 machineId 不应相同（真机是两套独立标识）")
+	}
+	// 版本段必须与本账号的 clientVersion 一致（旧实现这里是写死的 5.5.6）。
+	if got, want := ev["ideVersion"], (&Client{ChatBaseCN: srv.URL}).clientVersion(&auth.Auth{UID: "u-dt"}); got != want {
+		t.Errorf("ideVersion=%v want %v（版本必须来自单一来源）", got, want)
 	}
 }
 
@@ -137,8 +154,8 @@ func TestSetAppearanceTheme(t *testing.T) {
 		if r.URL.Path != "/v2/user-asset/appearance/set" {
 			t.Errorf("path=%s want /v2/user-asset/appearance/set", r.URL.Path)
 		}
-		if r.Header.Get("User-Agent") != desktopUA {
-			t.Errorf("UA=%q want desktop UA", r.Header.Get("User-Agent"))
+		if got := r.Header.Get("User-Agent"); got == "" || strings.Contains(got, "Go-http-client") {
+			t.Errorf("UA=%q 缺失或仍是 Go 默认串（该路径此前完全没有 UA）", got)
 		}
 		raw, _ := io.ReadAll(r.Body)
 		json.Unmarshal(raw, &got)

@@ -23,8 +23,6 @@ package upstream
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,31 +33,28 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
-// 幂等：同一账号每次生成相同值，模拟固定设备。
-func deriveID(a *auth.Auth, salt string) string {
-	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
-}
-
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-func desktopFingerprint(a *auth.Auth) map[string]any {
+//
+// 版本段统一走 c.clientVersion(a)：旧实现这里写死 5.5.6 而 headers 用 5.5.4，
+// 同一个号对上报告知两个版本，是自相矛盾的指纹。machineId/sessionId 是**带连
+// 字符的 UUID 形态**（真机如此），由 uid 稳定派生——同账号恒定、账号间互异。
+func (c *Client) desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
+	ver := c.clientVersion(a)
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
@@ -71,11 +66,11 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
-		"machineId":    deriveID(a, "machine"),
-		"sessionId":    deriveID(a, "session"),
+		"ideVersion":   ver,
+		"machineId":    deviceID(a, "machine"),
+		"sessionId":    deviceID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   ver,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
@@ -93,7 +88,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
-	fp := desktopFingerprint(a)
+	fp := c.desktopFingerprint(a)
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
@@ -116,15 +111,23 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.desktopBase(a))
+	// /v2/report 是 RPC 层请求（客户端用自建 fetch 发出），走 RPC 形态 UA。
+	req.Header.Set("User-Agent", c.rpcUA(a))
+	// X-Domain 是真机形态的**裸主机名**（不带 scheme），旧实现塞的是完整 URL。
+	req.Header.Set("X-Domain", c.desktopHost(a))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	// X-Request-ID：纯随机 32 hex（旧实现是「派生前缀 + 纳秒」，自造串）。
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
 	_, err = c.doJSON(req)
 	return err
+}
+
+// desktopHost desktop /v2/report 的 X-Domain：chat base 的裸主机名。
+func (c *Client) desktopHost(a *auth.Auth) string {
+	return hostOf(c.desktopBase(a), "copilot.tencent.com")
 }
 
 // DesktopChatSequence 构造一次「桌面端成功对话」的完整事件链
@@ -217,7 +220,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", c.rpcUA(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
@@ -324,7 +327,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
-		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
+		"machineId": deviceID(a, "webmachine"), "userId": a.UID,
 		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
@@ -464,8 +467,8 @@ func (c *Client) marketExpertListPage(a *auth.Auth, expertType string, page, pag
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", c.chatBase(a))
+	req.Header.Set("User-Agent", c.rpcUA(a))
+	req.Header.Set("X-Domain", hostOf(c.chatBase(a), "copilot.tencent.com"))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
@@ -551,24 +554,13 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if err != nil {
 		return "", "", err
 	}
-	h := req.Header
-	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
-	h.Set("X-Domain", c.chatBase(a))
-	h.Set("X-Product", "SaaS")
-	h.Set("X-User-Id", a.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
-	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Agent-Type", "main")
-	h.Set("X-IDE-Name", "WorkBuddy")
-	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
-	h.Set("x-codebuddy-request", "1")
+	// 走统一的 ChatHeaders，而不是手拼一套头：手拼的这版 UA 用桌面常量、
+	// X-IDE-Version 写死 5.5.6、X-Request-ID 是纳秒串，与网关其它 chat 路径
+	// 三处不一致——同一个号在两条路上自称不同的客户端，是最容易被交叉比对的形态。
+	// 这里声明「会话 ID 已知、轮级 ID 与消息 ID 内部生成」即可。
+	c.ChatHeaders(req, a, "", ChatMeta{ConversationID: conversationID})
 	if expertID != "" {
-		h.Set("X-Expert-Id", expertID)
+		req.Header.Set("X-Expert-Id", expertID)
 	}
 	if os.Getenv("WB2A_DEBUG_CHAT") != "" {
 		fmt.Printf("[dbg] URL=%s\n", req.URL)

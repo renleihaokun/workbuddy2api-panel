@@ -38,7 +38,9 @@
     "balance_refresh_minutes": 5,
     "task_sweep_enabled": true,
     "task_sweep_minutes": 15,
-    "include_disabled_in_tasks": false
+    "include_disabled_in_tasks": false,
+    "_comment_jitter": "按账号的分钟级时刻抖动窗口（分钟）。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。默认 45：每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换）。显式填 0 = 关闭抖动（回到整点同时打，与老版本逐秒一致）。",
+    "jitter_minutes": 45
   },
   "global": {
     "enabled": true,

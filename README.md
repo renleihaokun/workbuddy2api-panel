@@ -311,7 +311,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 上游改动 | 吸收内容 |
 |---|---|
 | 净化增强 | `tool_calls.arguments` 盲区修复（content=null 的工具调用轮此前完全漏净化）、裸 `11128` 反探测改写、桌面版身份句（逗号形态）漏网修复、反馈句整句改写 |
-| 出站头族 | UA 对齐官方三段式 `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<ver>`（默认 5.5.4/2.137.1，可配）；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`（`client_name` 配 `WorkBuddy` 即对齐官方桌面端）；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源）；`X-IDE-Version` 补齐 |
+| 出站头族 | **对齐真机抓包**：UA 分 chat / RPC / billing **三族**（默认 CN `5.11.3`+`2.176.0`、global `5.9.4`+`2.165.0`，按 realm 各取各的）；chat 带 `x-stainless-*` / `X-Agent-*` / `X-Private-Data` / `b3` / `traceparent` / `baggage` 等真机头族；`X-IDE-*` 用量归属四头 + `X-Agent-Purpose`；`X-Device-Token` 设备风控头（auth 每号 / config / 文件三源，**不自造**）。**不发** `X-Machine-ID`/`X-Session-ID`（官方客户端从不发，设备标识在 `/v2/report` 的 body 里）。`upstream.identity_mode=legacy` 可一键回退改造前形态；`go run ./cmd/hdrprobe capture\|legacy` 可实打实对比两种模式的出站头 |
 | 并发修复 | 客户端 IP 改按请求参数传递（消除共享字段竞态）；billing 单段 UA 形态 |
 | 签到幂等 | `IsAlreadyCheckin` 识别"今天已签到"（code=10001/14001），调度日志不再把重复签到当失败 |
 | 粘性按模型判活 | 会话绑定的账号被 6004/6000 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
@@ -539,16 +539,18 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；并发上限受 `pool.batch_concurrency` 约束 |
 | `schedule.task_sweep_enabled` | `true` | 任务补领清扫开关：分钟级、幂等地 accept 未接受任务、claim 已达标未领奖励（不跑任何行为链路）。默认开启 |
 | `schedule.task_sweep_minutes` | `15` | 补领清扫周期（分钟）；与成长队列（行为链路、成本高）不同，清扫只做 accept/claim 两条幂等 RPC |
+| `schedule.jitter_minutes` | `45` | 按账号的分钟级时刻抖动窗口。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换、按任务区分）。显式 `0` = 关闭。**只影响定时排程**：面板手动「立即签到/上报/保活」仍立刻对全部账号执行。**热生效** |
 | `global.enabled` | `true` | global 域路由总开关。`false` = 纯 CN 逃生门：即便 auth 写了 `realm=global` 也不路由 global base（`auth.Realm()` 的第一道闸）。改动需重启 |
 | `global.chat_base` / `global.billing_base` | 空 | 国际版上游 base 覆盖；空 = 内置默认 `https://www.workbuddy.ai`。改动需重启 |
 | `cn.chat_base` | 空 | 国内版 chat / 模型目录上游 base 覆盖；空 = 内置默认 `https://copilot.tencent.com`。`copilot.tencent.com` 对部分海外出口（Clash 全局 + TUN 等）会 TLS 复位，可改官方桌面端同构的 `https://www.workbuddy.cn`。改动需重启 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
-| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 三段式默认：CN `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`，global `WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1`；可用 `client_version` / `cli_version` 调版本段）。官网「使用端」列按出站 UA 服务端归因 |
-| `upstream.client_version` | 空（`5.5.4`） | UA 的 `WorkBuddy/<ver>` 段与 `X-IDE-Version`；空 = 内置默认。改动需重启 |
-| `upstream.cli_version` | 空（`2.137.1`） | UA 的 `CLI/<ver>` 段；空 = 内置默认。改动需重启 |
-| `upstream.client_name` | 空 | 用量归属头取值：配 `WorkBuddy` 时注入 `X-IDE-Name` / `X-IDE-Type` / `X-IDE-Version` / `X-Product` 四头；空 = 旧行为（`X-Product=SaaS`，不设 `X-IDE-*`）。改动需重启 |
+| `upstream.identity_mode` | `capture` | 出站身份实现模式。`capture`（缺省）= 对齐真机抓包：不发自造头、UA 分三族、补 `x-stainless-*` / `X-Agent-*` / `baggage` 等真机头族、会话 ID 用 UUIDv7。`legacy` = **逐字节还原改造前**形态（含 `X-Machine-ID`/`X-Session-ID`、Origin/Referer/Accept-Language 全覆盖、旧三段式 UA 5.5.4/2.137.1），作为逃生门。**热生效**。可用 `go run ./cmd/hdrprobe capture` / `legacy` 实际对比两种模式的出站头 |
+| `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 按 realm 的三族默认：CN `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`、global `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`；billing 用 `axios/1.16.1`；可用 `client_version` / `cli_version` 调版本段）。官网「使用端」列按出站 UA 服务端归因。**热生效** |
+| `upstream.client_version` | 空 | UA 的品牌段与 `X-IDE-Version`（单一来源）；空 = 按 realm：CN `5.11.3` / global `5.9.4`。**热生效** |
+| `upstream.cli_version` | 空 | UA 的 `CLI/<ver>` 段；空 = 按 realm：CN `2.176.0` / global `2.165.0`。**热生效** |
+| `upstream.client_name` | 空 | 用量归属头取值：配 `WorkBuddy` 时注入 `X-IDE-Name` / `X-IDE-Type` / `X-IDE-Version` 三头（`X-Product` 恒 `SaaS`，是真机的 SKU 段）；配 `SaaS` = 只发 `X-Product` 不设 `X-IDE-*`。**热生效** |
 | `upstream.device_token` | 空 | `X-Device-Token` 设备风控头全局兜底；每号 auth 文件的 `device_token` 优先。改动需重启 |
 | `upstream.device_token_file` | 空 | 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。改动需重启 |
 | `upstream.passthrough_ip` | `false` | 是否把客户端 IP 透传给上游；默认关闭（反代安全边界）。改动需重启 |
@@ -1394,7 +1396,7 @@ wire_api = "responses"
 | `portal/operation-platform/market/expert/list` | POST | 专家市场列表（专家类成长任务用） |
 | `activity/growth/tasks/<task_code>/claim` | POST | **领取任务奖励**（任务码在路径、无 body；**Web 域 `www.workbuddy.cn`**，非 CLI 域——这是领奖能成功的关键） |
 
-出站请求统一携带官方桌面端形态 UA（默认 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`；global 平台段为 `WorkBuddy AI`，可被 `upstream.user_agent` 覆盖）；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
+出站请求按**三族 UA** 对齐真机（chat `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`、global 品牌段为 `workbuddy-ai`；RPC 族首段即品牌 slug；billing 为 `axios/1.16.1`），可被 `upstream.user_agent` 覆盖；聊天请求带账号头（`X-User-Id` 等），**永不携带 `X-Refresh-Token`**（该头只出现在 token 刷新请求）。领奖请求额外带 `x-client-platform: web` 与 workbuddy.cn 的 Origin/Referer。
 
 ## 请求级日志
 
@@ -1666,7 +1668,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 ### 如何让官网「使用端」列显示为 WorkBuddy？
 
-官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认为官方桌面端三段式 `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`（global 平台段为 `WorkBuddy AI`），版本段可用 `client_version` / `cli_version` 调整。
+官网「使用端」列按出站请求 UA 服务端归因。配置 `upstream.user_agent: "WorkBuddy/2.x.x"`（或环境变量 `WB2A_USER_AGENT`）即可改写全部出站请求的 UA；默认为对齐真机的三族形态（CN `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`，global `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`，billing `axios/1.16.1`），版本段可用 `client_version` / `cli_version` 调整；`go run ./cmd/hdrprobe capture` 可打印实际出站头核对。
 
 ### 「已省」是怎么算的？和实际支出对不上怎么办？
 
@@ -1707,7 +1709,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 6004/6000 模型级限流 code 与重置时间解析 | `internal/upstream/client.go`（`IsModelRateLimit` / `ModelRateLimitReason` / `ParseRateReset`） |
 | `14003` 模型忙 / `6021` 渠道满载 / `502001` 上游基础设施不罚号 | `internal/upstream/client.go` `Classify`；`internal/server/handler.go`（`ErrModelBusy` / `ErrUpstreamBusy` / `ErrUpstreamInfra`） |
 | `11101` 不罚号、不轮转 | `internal/upstream/client.go` `Classify`（`ErrBadParams`）；`internal/server/handler.go` `chatCompletions` fail-fast 分支 |
-| 出站 UA 默认三段式与覆盖（空 = `WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1`） | `cmd/server/config.go`（`Upstream.UserAgent` / `ClientVersion` / `CliVersion`）；接线 `cmd/server/main.go`；默认值 `internal/upstream/headers.go`（`defaultClientVersion` / `defaultCliVersion`） |
+| 出站 UA 三族与覆盖（空 = 按 realm：CN `WorkBuddy/5.11.3 … CLI/2.176.0`、global `WorkBuddy/5.9.4 workbuddy-ai/… CLI/2.165.0`、billing `axios/1.16.1`） | `cmd/server/config.go`（`Upstream.UserAgent` / `ClientVersion` / `CliVersion` / `IdentityMode`）；接线 `cmd/server/main.go`；默认值与三族形态 `internal/upstream/identity.go`（`defaultClientVersionCN/Global`、`defaultCliVersionCN/Global`） |
 | session-dead 连续阈值 3 才禁用 | `internal/pool/entry.go` `sessionDeadThreshold` |
 | `ReviveDisabled` 人工复活 | `internal/pool/state.go` `Pool.ReviveDisabled` |
 | disabled 账号透出 `disabled_reason` | `internal/pool/entry.go` `Status.DisabledReason` |

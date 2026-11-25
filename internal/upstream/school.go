@@ -32,12 +32,10 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
-	}
+	// 走统一的 BillingHeaders：旧实现只手设了 4 个头，连 UA 都没有——出站会落到
+	// Go 默认的 `Go-http-client/1.1`，那是最硬的一处网关特征。这里一并补齐
+	// UA / X-Request-ID / X-Domain / X-Client-* 全族。
+	c.BillingHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -104,12 +102,12 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
-	}
+	// 小程序身份：先套统一的 billing 头族（含 UA / X-Request-ID / X-Domain），
+	// 再覆盖成小程序口径。旧实现完全没设 UA，出站是 Go 默认串。
+	c.BillingHeaders(req, a)
+	// 小程序不是桌面端，必须撤掉桌面端 5.11.3 的 origin 级注入（否则会发出
+	// `5.11.3 / miniprogram / WorkBuddy` 这种谁都不像的第四种组合）。
+	c.dropClientIdentityHeaders(req)
 	req.Header.Set("X-Client-Product", "workbuddy-mp")
 	req.Header.Set("X-Client-Version", "2.4.0")
 	req.Header.Set("X-Client-Platform", "mp-weixin")

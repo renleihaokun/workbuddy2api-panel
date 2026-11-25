@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -140,25 +141,66 @@ func TestNonChatModelGenerationTags(t *testing.T) {
 	}
 }
 
-// TestDesktopUAForGlobalAccount 桌面端 UA 按 realm 切平台段：global 账号必须是
-// `WorkBuddy AI`（送错平台段会触发上游 403 code=11140 风控）。探测主路用这个 UA，
-// 与 chat 路径同源——global 目录探测因此拿到客户端同款模型集。
-func TestDesktopUAForGlobalAccount(t *testing.T) {
+// TestChatUAForGlobalAccount chat 链路 UA 的品牌段按 realm 切：global 必须是
+// 小写连字符 slug `workbuddy-ai`（Electron asciiSlug 的产物），且首段恒为驼峰
+// `WorkBuddy/`（SDK buildUserAgent 的形态）。送错品牌段会触发上游 403
+// code=11140 风控。探测主路用同一个 UA，与 chat 路径同源。
+func TestChatUAForGlobalAccount(t *testing.T) {
 	c := New()
 	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
 	global.BackfillRealm()
-	ua := c.defaultWorkBuddyUAFor(global)
-	if want := "WorkBuddy AI"; !contains(ua, want) {
-		t.Errorf("global desktop UA = %q, want it to contain %q", ua, want)
+	ua := c.chatUA(global)
+	if want := "workbuddy-ai/"; !contains(ua, want) {
+		t.Errorf("global chat UA = %q, want it to contain %q", ua, want)
+	}
+	// 首段恒驼峰 WorkBuddy（不论 realm）——这是 SDK 的 productName 段。
+	if !strings.HasPrefix(ua, "WorkBuddy/") {
+		t.Errorf("global chat UA = %q, want prefix WorkBuddy/（首段恒驼峰）", ua)
 	}
 	if !contains(ua, "CLI/") {
-		t.Errorf("global desktop UA = %q, want CLI segment", ua)
+		t.Errorf("global chat UA = %q, want CLI segment", ua)
 	}
-	// CN 账号保持 WorkBuddy（零回归）。
+	// 大写带空格的 "WorkBuddy AI" 是真的不存在的形态（只出现在 RPC 之外的旧实现）。
+	if contains(ua, "WorkBuddy AI") {
+		t.Errorf("global chat UA = %q, must not contain 'WorkBuddy AI'（真机是小写 slug）", ua)
+	}
+
+	// CN 账号：两段都是驼峰 WorkBuddy。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
-	if ua := c.defaultWorkBuddyUAFor(cn); contains(ua, "WorkBuddy AI") {
-		t.Errorf("cn desktop UA = %q, must not contain 'WorkBuddy AI'", ua)
+	cnUA := c.chatUA(cn)
+	if contains(cnUA, "workbuddy-ai") {
+		t.Errorf("cn chat UA = %q, must not contain workbuddy-ai", cnUA)
+	}
+	if want := "WorkBuddy/" + defaultClientVersionCN + " WorkBuddy/" + defaultClientVersionCN; !strings.HasPrefix(cnUA, want) {
+		t.Errorf("cn chat UA = %q, want prefix %q", cnUA, want)
+	}
+}
+
+// TestRPCUADiffersFromChatUA RPC 层与 chat 层的 UA 是两个家族：RPC 首段就是品牌
+// slug（global 为 workbuddy-ai），chat 首段恒驼峰。两族并存才是官方形态。
+func TestRPCUADiffersFromChatUA(t *testing.T) {
+	c := New()
+	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
+	global.BackfillRealm()
+	if got := c.rpcUA(global); !strings.HasPrefix(got, "workbuddy-ai/") {
+		t.Errorf("global RPC UA = %q, want prefix workbuddy-ai/（首段即品牌 slug）", got)
+	}
+	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
+	cn.BackfillRealm()
+	// CN 下两族同值（品牌段本来就是驼峰）。
+	if c.rpcUA(cn) != c.chatUA(cn) {
+		t.Errorf("cn RPC UA=%q 与 chat UA=%q 应同值", c.rpcUA(cn), c.chatUA(cn))
+	}
+}
+
+// TestBillingUAIsAxios billing 域走 axios 实例，UA 是 axios 默认串，不带品牌段。
+func TestBillingUAIsAxios(t *testing.T) {
+	c := New()
+	cn := &auth.Auth{UID: "u1", Domain: "copilot.tencent.com"}
+	cn.BackfillRealm()
+	if got := c.billingUA(); got != "axios/1.16.1" {
+		t.Errorf("billing UA = %q, want axios/1.16.1", got)
 	}
 }
 

@@ -242,6 +242,12 @@ func (a *Auth) IsEnterpriseSession() bool {
 // 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
 // base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
 func jwtEnterpriseID(token string) string {
+	return jwtClaim(token, "enterprise_id")
+}
+
+// jwtClaim 解出 JWT payload 里的单个字符串声明；非 JWT / 解码失败 / 非字符串一律 ""。
+// 先按无填充 base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
+func jwtClaim(token, name string) string {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
 		return ""
@@ -252,13 +258,27 @@ func jwtEnterpriseID(token string) string {
 			return ""
 		}
 	}
-	var payload struct {
-		EnterpriseID string `json:"enterprise_id"`
-	}
+	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(payload.EnterpriseID)
+	s, _ := payload[name].(string)
+	return strings.TrimSpace(s)
+}
+
+// TokenSource 当前凭证 JWT 里的 token_source 声明（token 的来路，如
+// enterprise_switch）。用于出站 X-Auth-Method / X-Userinfo。
+//
+// 每次现解码而不是 Parse 时缓存：RefreshToken 会整体换发 token，来路可能翻转。
+// 缺声明返回 ""（调用方据此不发该头——官方个人号本来就不发）。
+func (a *Auth) TokenSource() string {
+	return jwtClaim(a.AccessTokenValue(), "token_source")
+}
+
+// IdSource 当前凭证 JWT 里的 id_source 声明（独立于企业态的身份维度）。
+// 缺声明返回 ""。
+func (a *Auth) IdSource() string {
+	return jwtClaim(a.AccessTokenValue(), "id_source")
 }
 
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
