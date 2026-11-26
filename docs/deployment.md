@@ -62,6 +62,12 @@ sha256sum wb2api.new
 strings wb2api.new | grep -F '<appVersion>'
 ```
 
+> **`EXPECT` 要的是「二进制」的 sha256，不是 Release `checksums.txt` 里的那一串**：后者是
+> `wb2api-panel-v<版本>-<平台>.tar.gz` / `.zip` 压缩包的摘要。用官方 Release 包部署时，顺序是
+> 「先按 checksums.txt 校验压缩包 → 解包 → 再对解出来的 `wb2api` 算 sha256 当 `EXPECT`」。
+> 2026-11-26 实测踩过：tarball `aee87e…` 与实际二进制 `8bd799…` 不是一回事，拿错会让 `deploy-wb2api.sh`
+> 在干跑阶段就报 sha256 不匹配（脚本行为正确，是喂错了值）。
+
 ### 2.2 干跑（不替换、不重启）
 
 ```bash
