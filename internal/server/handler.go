@@ -2056,9 +2056,35 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →
 		// 账号临时出池（NoteFailures 达阈降权），单次/偶发不罚（不误伤）。ErrNone
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
+		//
+		// 例外：401 补一手求证。线上绝大多数 401 是网关/边缘的 HTML 页（无业务信封，
+		// 归 ErrClient）——它与会话真失效的响应长得一模一样，光看响应体分不出来。
+		// 求证=死则记一次 session dead（仍要连续 3 次才禁用）；求证=活/无判词则完全
+		// 维持旧行为（不冷却、不罚号）：只增加识别能力，不改变可用性口径。
 		if kind == upstream.ErrClient {
+			if uerr != nil && uerr.Status == http.StatusUnauthorized {
+				h.verifyBare401(uid)
+			}
 			h.cfg.Pool.NoteFailures(uid)
 		}
+	}
+}
+
+// verifyBare401 对「裸 401」（无业务信封的网关拦截页）补一次求证。
+//
+// 只认 Dead：Alive（401 只是被边缘拦）与 Inconclusive（网络/5xx/网关把 refresh
+// 也拦了）都不改变旧行为——不冷却、不罚号，由轮转继续服务。求证本身按账号 60s
+// 节流（upstream.VerifySession 内部），401 风暴下不会放大成刷新风暴。
+func (h *Handler) verifyBare401(uid string) {
+	if !h.verifyOn401() || h.cfg.Upstream == nil {
+		return
+	}
+	a := h.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return
+	}
+	if h.cfg.Upstream.VerifySession(a) == upstream.SessionDead {
+		h.cfg.Pool.NoteSessionDead(uid)
 	}
 }
 

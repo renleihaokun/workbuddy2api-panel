@@ -171,6 +171,63 @@ func TestChatSkipsPreRefreshWhenRefreshTokenKnownDead(t *testing.T) {
 	}
 }
 
+// TestChatBare401VerifiesDead 裸 401（网关 HTML 页，无业务信封）也要能识别真死号：
+// 求证=Dead 才计数，连续 3 次禁用；窗口内只打一次 refresh。
+func TestChatBare401VerifiesDead(t *testing.T) {
+	gateway401 := `<html><head><title>401 Authorization Required</title></head><body>openresty</body></html>`
+	up, refreshCalls := newPathUpstream(
+		func() (int, string) { return 401, gateway401 },
+		func() (int, string) { return 401, sessionDeadBody },
+	)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, VerifySessionOn401: true})
+
+	for i := 1; i < pool.SessionDeadThreshold(); i++ {
+		doChat(h)
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次不应禁用: %+v", i, st)
+		}
+	}
+	doChat(h)
+	st, _ := p.Status("u1")
+	if !st.Disabled || !st.NeedsRelogin {
+		t.Fatalf("裸 401 + 求证=死 连续 %d 次应禁用: %+v", pool.SessionDeadThreshold(), st)
+	}
+	if got := atomic.LoadInt32(refreshCalls); got != 1 {
+		t.Errorf("refresh calls=%d want 1（节流窗口内复用结论）", got)
+	}
+}
+
+// TestChatBare401VerifyAliveNoPenalty 裸 401 + 求证=活：完全维持旧行为——
+// 不冷却、不禁用（只有连败计数照旧），换号继续服务。
+func TestChatBare401VerifyAliveNoPenalty(t *testing.T) {
+	gateway401 := `<html><head><title>401 Authorization Required</title></head><body>openresty</body></html>`
+	up, refreshCalls := newPathUpstream(
+		func() (int, string) { return 401, gateway401 },
+		func() (int, string) { return 200, refreshOKBody },
+	)
+	a := &auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999}
+	p := testPoolWith(a)
+	h := NewHandler(Config{Pool: p, Upstream: up, VerifySessionOn401: true})
+
+	for i := 0; i < pool.SessionDeadThreshold()+1; i++ {
+		doChat(h)
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled || st.Cooling {
+		t.Fatalf("求证=活时不得罚号: %+v", st)
+	}
+	if st.RefreshTokenDead {
+		t.Errorf("求证成功不该留 RT 判死标记: %+v", st)
+	}
+	if got := atomic.LoadInt32(refreshCalls); got != 1 {
+		t.Errorf("refresh calls=%d want 1", got)
+	}
+	if a.AccessTokenValue() != "at-new" {
+		t.Errorf("求证成功应写回新 token，got %q", a.AccessTokenValue())
+	}
+}
+
 // TestChatPreRefreshSessionDeadKeepsServingWhenAccessValid RT 判死但 AT 未过期：
 // 请求前预刷新失败不应换号——继续用当前 AT 把这一发请求打完。
 func TestChatPreRefreshSessionDeadKeepsServingWhenAccessValid(t *testing.T) {
