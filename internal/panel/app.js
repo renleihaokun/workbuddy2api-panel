@@ -14,6 +14,9 @@ let cfgReady = false;
 let cfgDirty = 0;
 let cfgBaseline = null; // 表单回填后的快照：dirty 判定只看用户是否改过，不把 HTML 默认值算进去
 let logPin = true, loginState = null, loginTimer = null;
+// reloginUID 非空 = 当前弹窗是「给这个账号重登」而不是「添加新账号」：
+// realm 跟账号走（不让选）、落盘就地改写、成功后自动解禁。
+let reloginUID = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -679,7 +682,14 @@ function renderAccounts(list) {
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
-    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    if (s.disabled) {
+      cls = 'off';
+      // needs_relogin：refresh token 已被上游作废，解冻/等时间都救不回，只能重登。
+      // 必须与「封禁 / 人工停用」在标签上分开，否则运维会去点解冻、或者干等它自己好。
+      tag = s.needs_relogin
+        ? '<span class="tag bad" title="refresh token 已被上游作废：revive 救不回，只能重新登录">待重登</span>'
+        : '<span class="tag bad">已禁用</span>';
+    }
     else if (s.paused) { cls = 'cool'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
       cls = 'cool';
@@ -687,6 +697,15 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    // RT 判死但 AT 还活着：号此刻仍可用（chat 不受影响），黄标提醒趁 AT 没过期赶紧重登——
+    // AT 一过期这个号就真的不能用了。与「已禁用」是两个维度，所以单独一枚标签。
+    let rtTag = '';
+    if (!s.disabled && s.refresh_token_dead) {
+      const expMs = parseAPITime(s.access_token_expires_at);
+      const left = expMs ? Math.max(0, Math.round((expMs - Date.now()) / 1000)) : 0;
+      rtTag = '<span class="tag warn" title="refresh token 已失效（无法续期）；access token 到期后只能重新登录">RT 已失效' +
+        (left > 0 ? ' · AT 剩 ' + dur(left) : '') + '</span>';
+    }
     const note = s.reason ? '<div class="sub-note">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
@@ -713,6 +732,16 @@ function renderAccounts(list) {
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
     const frozen = s.disabled || cool > 0;
+    // 操作按钮取舍：needs_relogin / RT 判死时主按钮是「重登」——解冻点了也没用
+    // （凭证已经作废），摆在那是误导；其余号维持解冻/暂停的既有语义。
+    const reloginBtn = (s.needs_relogin || s.refresh_token_dead)
+      ? '<button class="xs primary" data-a="relogin" data-u="' + esc(s.uid) + '" title="重新扫码登录该账号：凭证就地更新，保留 device_token">重登</button>'
+      : '';
+    const freezeBtn = s.needs_relogin
+      ? ''
+      : (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '" title="解冻，恢复参与选号">解冻</button>'
+                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '" title="恢复选号">恢复</button>'
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '暂停选号：退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停</button>'));
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = fmtTok(tu.total_tokens);
@@ -725,7 +754,7 @@ function renderAccounts(list) {
       // 名字单独包一层 .nm-text：省略号只作用于名字，realm 徽标固定不收缩——
       // 否则长邮箱名会把徽标一起裁掉（2026-11-06 面板截图反馈）。
       '<td class="who"><div class="nm"><span class="nm-text" title="' + esc(s.nickname || '') + '">' + remarkName(s.uid, esc(dispName)) + '</span>' + (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '') + (s.enterprise ? '<span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + rtTag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span class="sep-dim">/</span> ' + (Number(s.err_total) > 0 ? '<span class="txt-bad">' + s.err_total + '</span>' : '<span class="muted">0</span>') + '</td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -745,9 +774,7 @@ function renderAccounts(list) {
         (s.enterprise ? '' :
           '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '" title="解冻，恢复参与选号">解冻</button>'
-                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '" title="恢复选号">恢复</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '暂停选号：退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停</button>')) +
+        reloginBtn + freezeBtn +
         '<button class="xs ghost more-btn" data-a="more" data-u="' + esc(s.uid) + '" aria-haspopup="menu" aria-expanded="false" title="更多操作：' + (s.enterprise ? '禁用 / 移除' : '任务 / 禁用 / 移除') + '">⋯</button>' +
       '</td></tr>';
   }).join('');
@@ -847,7 +874,12 @@ async function loadOverview(quiet) {
     $('navState').textContent = !known ? '数据异常' : (d.healthy > 0 ? '服务正常' : (Number(d.total) > 0 ? '无可用账号' : '待添加账号'));
     const p = $('navPulse');
     p.className = 'pulse' + (!known ? ' bad' : (d.healthy > 0 ? '' : (Number(d.total) > 0 ? ' warn' : ' bad')));
-    $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
+    $('accNote').textContent = [
+      d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '',
+      // 待重登单独提示：这是唯一「程序救不了、必须人工扫码」的状态，混在禁用数里
+      // 看不出该做什么。
+      Number(d.needs_relogin) > 0 ? d.needs_relogin + ' 个待重登（需重新登录）' : '',
+    ].filter(Boolean).join(' · ');
     const up = Number(d.uptime_sec);
     const metaText = Number.isFinite(up)
       ? '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分'
@@ -905,8 +937,23 @@ async function runAccountAction(a, u, triggerBtn) {
       toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'refresh') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/refresh', { method: 'POST' });
+      toast(r.message || (r.ok ? '刷新成功' : '刷新失败'), r.ok ? 'ok' : 'err');
     } else if (a === 'remove') {
-      const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
+      let r;
+      try {
+        r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
+      } catch (e) {
+        // 后端对「凭证看起来仍有效」的号要求 force=1（删除不可逆）。这里给一次
+        // 显式确认，而不是把 409 文案原样丢给用户。
+        if (!/force=1/.test(e.message || '')) throw e;
+        if (!(await askConfirm({
+          title: '强制移除？', confirmText: '仍然移除', danger: true,
+          body: '该账号的凭证看起来仍有效（未禁用、也未判 RT 失效）。移除会永久删除 auths/ 下的凭证文件，只能重新扫码恢复。'
+        }))) return;
+        r = await api('accounts/' + encodeURIComponent(u) + '/remove?force=1', { method: 'POST' });
+      }
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
@@ -922,6 +969,11 @@ function openAccountMenu(btn, uid) {
     // v5：「任务」从行内按钮收进这里。企业版没有个人成长体系（成长任务 403），
     // 菜单里也不能出现该项，否则点开永远是错误提示。
     if (!s.enterprise) items.push({ label: '成长任务', onPick: () => runAccountAction('tasks', uid, btn) });
+    // 刷新令牌：手动问一次上游，立刻知道「还能不能自愈」（回包带 needs_relogin）。
+    items.push({ label: '刷新令牌', onPick: () => runAccountAction('refresh', uid, btn) });
+    if (s.needs_relogin || s.refresh_token_dead) {
+      items.push({ label: '重新登录', onPick: () => openRelogin(uid) });
+    }
     if (!s.disabled) items.push({ label: '禁用账号', danger: true, onPick: () => runAccountAction('disable', uid, btn) });
     items.push({ label: '移除账号', danger: true, onPick: () => runAccountAction('remove', uid, btn) });
     WBControls.menu(btn, items);
@@ -937,6 +989,7 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'add') { openAdd(); return; }
+  if (a === 'relogin') { openRelogin(u); return; }
   if (a === 'more') { openAccountMenu(b, u); return; }
   await runAccountAction(a, u, b);
 });
@@ -1864,6 +1917,9 @@ $('cfgForm').onsubmit = async ev => {
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
+  reloginUID = null;
+  const t = $('addTitle'); if (t) t.textContent = '添加账号';
+  const tabs = $('addTabs'); if (tabs) tabs.hidden = false;
   openVeil('addVeil');
   // 重置到登录标签
   switchAddTab('login');
@@ -1875,6 +1931,19 @@ function openAdd() {
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
 }
+/* openRelogin 单号重登：复用添加账号弹窗的设备授权流程，差别只在「目标已定」——
+   realm 由账号决定（选错域会把国际版号写成 cn，下一发请求就 401），并且不允许
+   切到导入标签（那条路会绕开 uid 校验）。 */
+function openRelogin(uid) {
+  openAdd();
+  reloginUID = uid;
+  const t = $('addTitle'); if (t) t.textContent = '重登账号';
+  const tabs = $('addTabs'); if (tabs) tabs.hidden = true;
+  // realm 跟账号走：不展示选择器，直接从账号的 realm 发起。
+  $('addPick').hidden = true;
+  $('addErr').hidden = true;
+  startAddLogin();
+}
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
@@ -1885,9 +1954,14 @@ document.querySelectorAll('#addTabs .tab').forEach(b => {
 });
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
+  const relogin = !!reloginUID;
+  const url = relogin
+    ? 'accounts/' + encodeURIComponent(reloginUID) + '/relogin/start'
+    : 'login/start';
+  const body = relogin ? '{}' : JSON.stringify({ realm });
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
-  api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
+  api(url, { method: 'POST', body }).then(r => {
     loginState = r.state;
     $('addUrl').textContent = r.url;
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
@@ -1911,7 +1985,11 @@ async function pollLogin() {
       stopPoll();
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      $('addDone').textContent = r.relogin
+        ? '已重登 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '')
+          + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '')
+          + '，凭证已就地更新，账号已回到池中'
+        : '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
@@ -1921,7 +1999,7 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; closeVeil('addVeil'); }
+function closeAdd() { stopPoll(); loginState = null; reloginUID = null; closeVeil('addVeil'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');

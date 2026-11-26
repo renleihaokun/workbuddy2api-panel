@@ -522,6 +522,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `logging.request_client_info` | `true` | 请求归档 / stdout 流水 / 面板运行日志记录调用来源（客户端 IP、User-Agent）；关闭后来源字段为空（老归档显示 `—`）。热生效 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `pool.verify_session_on_401` | `true` | **401 先求证再计数**。请求路径拿到 401 时先用 refresh 端点问一次（活 / 死 / 无判词），只有「上游应用层明确拒绝」才计入会话失效；`false` = 旧行为（401 直接进连续计数，不发求证请求）。这是本次吊销处置的**回滚闸**。**热生效** |
+| `pool.session_verify_interval` | `60s` | 同一账号两次 401 求证的最小间隔。窗口内复用上次结论——上游大面积 401 时，每个失败请求都去 refresh 等于给刷新端点造风暴。`<=0` 回落默认值。**热生效** |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
 | `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
@@ -720,7 +722,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 余额不足 | HTTP 402 / `429 + code 14018` / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
 | 频控 | HTTP 429 / 限流文案（不限状态码） | 普通限流：软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004` / `6000`（模型级）带「将在 … 重置」时**只冷却该模型到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)）。**`14003` 模型忙 / `6021` 渠道满载**不罚号、不轮转（见下节 FAQ） | 到期自动恢复 / 成功清零退避 |
 | 账号级故障 | `11140` + `request illegal`（账号被上游限制）/ `14017`（trial 未激活） | `11140` 硬禁用（官方申诉，重登无效）；`14017` 软冷却（补完 register 后可能自愈） | 申诉 / 软冷却到期 |
-| Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
+| Session 失效 | body 含 `Offline user session not found` / `12153`；或网关 401（APISIX/openresty HTML 页） | **401 先求证**：refresh 成功=撤销误判（30s 短冷却）；refresh 被应用层拒绝=计数；网络/5xx/429/网关把 refresh 也拦了=无判词（60s 短冷却，不计数）。**连续 3 次**确证才永久禁用；刷新成功 / 任意成功 / 手工复活清计数。RT 判死但 access token 未过期时**不禁用**（账号还能聊天），只标「RT 已失效」提示重登 | 面板「重登」重新扫码（`POST /panel/api/accounts/{uid}/relogin/start`）；或 `login.sh`；或 `ReviveDisabled` |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 上游基础设施 | HTTP 500 + `10000` + `extError 502001`（Upstream authentication failed） | **不罚账号、不喂熔断**，仍换号；末端 `502 upstream_error` | 即时 |
 | 渠道满载 | `6021` / `queue.full.title` | **不罚账号、不轮转**，直接 `503 upstream_busy`（换任何账号都撞同一堵墙） | 即时 |
@@ -1269,10 +1271,10 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 | 分组 | 端点 |
 |---|---|
 | 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET credit_trend`（`from` / `to`；走势采样点 + 实时 `current`）· `GET channel_health`（`from` / `to`；`requests` 失败率序列 + `events` 事件序列（每点带 `groups`）+ `groups` 堆叠组元数据 + `kinds` 事件表（`label/group/unit/hint/per_1k/last_at`）+ `state`（未接线为 `null`）+ `sources` 各源 `from/to/since` + `tz` + `realms` 分域 + `realm_labeled/realm_total`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
-| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `remove`；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
+| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `refresh`（手动刷一次 token，回包带 `needs_relogin` / `access_usable`）· `relogin/start`（给该 uid 发一张扫码码；扫回来必须同 uid、就地改写、成功后自动解禁）· `remove`（凭证看起来仍有效时需 `?force=1`）；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
 | 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
 | 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
-| 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit` |
+| 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit`（默认**跳过**已存在的 uid，`overwrite=1` 才覆盖且保留 `device_token` 等手写键，回包含 `imported` / `overwritten` / `skipped`） |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 
 账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
@@ -1657,8 +1659,20 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 ### 账号被 Disable 后如何恢复？
 
-- **用 `./login.sh` 重新登录**覆盖凭证，重启后自动回池；
-- 或源码侧调用 `Pool.ReviveDisabled(uid)` 清除 `disabled` 状态（`state.json` 同步刷新）。
+先看面板上那个标签是什么，三种「不可用」的处置完全不同：
+
+- **待重登**（`needs_relogin=true`）：refresh token 已被上游作废，**解冻没用、等时间也不会好**。
+  点该行的「重登」按钮扫码即可（`POST /panel/api/accounts/{uid}/relogin/start`，realm 跟账号走、
+  扫到的必须是这个号、凭证就地改写并保留 `device_token`）。成功后自动解禁并清掉标记。
+- **已禁用**（封禁 / 人工停用）：封禁（11140 异常行为）重登无效，只能去 WorkBuddy 官方渠道申诉；
+  人工停用点「解冻」即可。
+- **RT 已失效 · AT 剩 N 天**（`refresh_token_dead=true` 但账号仍可用）：号现在还能聊天，
+  趁 access token 没过期点「重登」最划算；拖到 AT 过期就真的不能用了。
+
+其他兜底：`./login.sh` 重新登录覆盖凭证、重启后自动回池；或源码侧 `Pool.ReviveDisabled(uid)`。
+
+判据速记：单次 401/12153 不禁用；网络/5xx/429 不算吊销；网关 HTML 401 先求证；`11140`
+（账号异常行为）是封禁、重登无效；RT 判死但 access token 未过期时账号仍可用，只是不能再续期。
 
 ### 系统提示词被内容策略 / 通道校验误杀怎么办？
 
