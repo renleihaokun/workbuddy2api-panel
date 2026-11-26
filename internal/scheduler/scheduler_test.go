@@ -332,6 +332,42 @@ func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 	if st.DisabledReason != "12153 session dead" {
 		t.Errorf("disabled_reason=%q want 12153 session dead", st.DisabledReason)
 	}
+	// 死因枚举：面板靠它区分「待重登」与「被封禁」。
+	if st.DisabledKind != pool.DisableKindSessionDead || !st.NeedsRelogin {
+		t.Errorf("disabled_kind=%q needs_relogin=%v want session_dead/true", st.DisabledKind, st.NeedsRelogin)
+	}
+}
+
+// TestRunKeepaliveSessionDeadButAccessUsable 保活刷新回 12153、但 AT 仍有效：
+// 不计 session dead、不禁用（同类实测过的形态：refresh 恒死、chat 全 200），
+// 只记「RT 已死」凭证层事实，交给面板提醒重登。
+func TestRunKeepaliveSessionDeadButAccessUsable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		w.Write([]byte(`{"code":12153,"msg":"Offline user session not found"}`))
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	a := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "rt",
+		ExpiresAt: time.Now().Add(72 * time.Hour).Unix()}
+	p.Add(a)
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+	for i := 0; i < pool.SessionDeadThreshold()+1; i++ {
+		s.RunKeepaliveNow()
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Fatalf("AT 仍有效时不得禁用账号: %+v", st)
+	}
+	if !st.RefreshTokenDead {
+		t.Errorf("应记下 refresh_token_dead 凭证层事实: %+v", st)
+	}
+	if st.NeedsRelogin {
+		t.Errorf("账号未出池时不该 needs_relogin: %+v", st)
+	}
 }
 
 // TestRunKeepaliveSessionDeadResetBySuccess 两次 12153 后刷新成功 → 计数清零，
@@ -340,7 +376,9 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 	var fails atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fails.Add(1) == 3 { // 第 3 次（本次调度循环的第二轮）刷新成功
-			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
+			// 刻意不带 expiresIn：ExpiresAt 保持 1（已过期）。否则「刷新成功 → AT
+			// 变有效」会命中 AT 豁免，后续 12153 不再计数，本用例就测不到「成功清计数」。
+			w.Write([]byte(`{"code":0,"data":{"accessToken":"new"}}`))
 			return
 		}
 		w.WriteHeader(401)

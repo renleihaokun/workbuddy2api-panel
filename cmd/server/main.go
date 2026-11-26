@@ -150,6 +150,10 @@ func main() {
 
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	// 401 求证的同号节流窗口（config pool.session_verify_interval，热改见 saveConfig）。
+	// 装配期先注入一次：否则首轮请求会先用 upstream 内置默认（60s）——值相同，
+	// 但显式注入让"配置即真相"这条链完整。
+	up.SetSessionVerifyInterval(cfg.SessionVerifyIntervalDur)
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
 	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
 	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
@@ -276,14 +280,16 @@ func main() {
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		SystemAsUserFallback: cfg.Features.SystemAsUserFallback,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
-		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
-		ModelIDStyle:         modelid.StyleOf(cfg.Models.IDStyle),
-		RealmNamePrefix:      cfg.Models.RealmNamePrefix,
+		APIKey:                cfg.APIKey,
+		SoftCooldown:          cfg.SoftRateDur,
+		SanitizeFingerprints:  cfg.Features.SanitizeBlacklistFingerprints,
+		SystemAsUserFallback:  cfg.Features.SystemAsUserFallback,
+		RecordClientInfo:      cfg.Logging.RequestClientInfo,
+		HiddenModels:          livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		ModelIDStyle:          modelid.StyleOf(cfg.Models.IDStyle),
+		RealmNamePrefix:       cfg.Models.RealmNamePrefix,
+		VerifySessionOn401:    cfg.Pool.VerifySessionOn401,
+		SessionVerifyInterval: cfg.SessionVerifyIntervalDur,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -408,6 +414,10 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		// 401 求证（pool.verify_session_on_401）与节流窗口：运行期以 livecfg 为准，
+		// 这里同时填静态值，供 Live 为 nil 的裸用/测试路径。
+		VerifySessionOn401:    cfg.Pool.VerifySessionOn401,
+		SessionVerifyInterval: cfg.SessionVerifyIntervalDur,
 		Panel:        pn,
 		Live:         live,
 		Usage:        rec,
@@ -627,16 +637,20 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		SystemAsUserFallback: newCfg.Features.SystemAsUserFallback,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
-		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
-		ModelIDStyle:         modelid.StyleOf(newCfg.Models.IDStyle),
-		RealmNamePrefix:      newCfg.Models.RealmNamePrefix,
+		APIKey:                newCfg.APIKey,
+		SoftCooldown:          newCfg.SoftRateDur,
+		SanitizeFingerprints:  newCfg.Features.SanitizeBlacklistFingerprints,
+		SystemAsUserFallback:  newCfg.Features.SystemAsUserFallback,
+		RecordClientInfo:      newCfg.Logging.RequestClientInfo,
+		HiddenModels:          livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		ModelIDStyle:          modelid.StyleOf(newCfg.Models.IDStyle),
+		RealmNamePrefix:       newCfg.Models.RealmNamePrefix,
+		VerifySessionOn401:    newCfg.Pool.VerifySessionOn401,
+		SessionVerifyInterval: newCfg.SessionVerifyIntervalDur,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	// 401 求证的节流窗口热生效：验证是失败路径上的额外上游调用，必须能不改进程就收紧/放宽。
+	up.SetSessionVerifyInterval(newCfg.SessionVerifyIntervalDur)
 	// 出站身份模式热生效：面板改完立刻切，不需要重启（逃生门必须即时可用）。
 	if mode, err := upstream.ParseIdentityMode(newCfg.Upstream.IdentityMode); err == nil {
 		up.SetIdentityMode(mode)

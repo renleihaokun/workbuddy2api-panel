@@ -31,6 +31,12 @@ type Snapshot struct {
 	// RealmNamePrefix 为 true 时列表/面板的 name 前置 "CN · " / "Global · "，
 	// 便于两域同 id 的模型在客户端里区分（默认 false，零回归）。
 	RealmNamePrefix bool
+	// VerifySessionOn401 401 先求证再计数（pool.verify_session_on_401，默认 true）。
+	// 关闭 = 旧行为（401 命中的 session dead 直接计数，不发求证请求）。
+	VerifySessionOn401 bool
+	// SessionVerifyInterval 同账号两次 401 求证的最小间隔
+	//（pool.session_verify_interval，默认 60s；<=0 时调用方回落默认）。
+	SessionVerifyInterval time.Duration
 }
 
 // Holder 原子持有当前快照。

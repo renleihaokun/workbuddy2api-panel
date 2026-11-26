@@ -984,21 +984,34 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
-func TestChatSessionDeadDisables(t *testing.T) {
+// TestChatSessionDeadNeedsThreshold 12153 单次不再禁用：连续 sessionDeadThreshold
+// 次才判死（issue #215：单次 12153 常是抖动/闪断/refresh 竞态，一次就杀会误伤）。
+func TestChatSessionDeadNeedsThreshold(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 求证开关留零值（关闭）= 旧判据下的计数路径：每次 401 记一次。
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
-		t.Errorf("code=%d", rec.Code)
+	body := `{"model":"glm-5.2","messages":[]}`
+	for i := 1; i < pool.SessionDeadThreshold(); i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+		if rec.Code != 503 {
+			t.Fatalf("第 %d 次: code=%d body=%s", i, rec.Code, rec.Body)
+		}
+		if st, _ := p.Status("u1"); st.Disabled {
+			t.Fatalf("第 %d 次 12153 不应禁用: %+v", i, st)
+		}
 	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 	st, _ := p.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Fatalf("连续 %d 次 12153 应禁用: %+v", pool.SessionDeadThreshold(), st)
+	}
+	if st.DisabledKind != pool.DisableKindSessionDead || !st.NeedsRelogin {
+		t.Errorf("disabled_kind=%q needs_relogin=%v want session_dead/true", st.DisabledKind, st.NeedsRelogin)
 	}
 }
 

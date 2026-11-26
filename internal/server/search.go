@@ -76,24 +76,34 @@ func (h *Handler) runSearch(ctx context.Context, query string, maxResults int, m
 		}
 		// token 临近过期先刷新：搜索与 chat 共用同一 accessToken，把过期 token
 		// 打到搜索端点会换回 401，被 applyErrorPolicy 当账号故障处置、误伤健康号。
-		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+		// RT 已被判死的号跳过（同 chat 口径），不重复撞已死的刷新端点。
+		if acct.NeedsRefresh(h.cfg.RefreshSkew) && !h.cfg.Pool.RefreshTokenDead(acct.UID) {
 			if rerr := h.cfg.Upstream.RefreshToken(acct); rerr != nil {
-				h.cfg.Pool.Release(acct.UID)
 				lastErr = rerr
 				var ue *upstream.Error
+				isDead := errors.As(rerr, &ue) && ue.Kind == upstream.ErrSessionDead
 				if errors.As(rerr, &ue) {
 					lastStatus, lastKind = ue.Status, ue.Kind
-					h.applyErrorPolicy(acct.UID, ue.Kind, ue.Msg, "", ue)
+					if isDead {
+						// 与 chat 的「请求前刷新失败」同口径：RT 判死但 AT 仍有效时
+						// 只记凭证层事实、不计数（handleRefreshSessionDead）。
+						h.handleRefreshSessionDead(acct)
+					} else {
+						h.applyErrorPolicy(acct.UID, ue.Kind, ue.Msg, "", ue)
+					}
 				} else {
 					h.cfg.Pool.NoteFailures(acct.UID)
 					lastStatus = http.StatusServiceUnavailable
 				}
-				if !rotateBackoff(i, ctx) {
-					break
+				// RT 死但 AT 仍有效 → 继续用当前 AT 发搜索（号还能干活，换号是浪费）。
+				if !isDead || !upstream.AccessUsableWithoutRefresh(acct) {
+					h.cfg.Pool.Release(acct.UID)
+					if !rotateBackoff(i, ctx) {
+						break
+					}
+					continue
 				}
-				continue
-			}
-			if serr := acct.SaveAtomic(); serr != nil {
+			} else if serr := acct.SaveAtomic(); serr != nil {
 				// 刷新成功但落盘失败：下次启动会拿旧 token，必须暴露。
 				log.Printf("ERR: [server] search refresh acct=%s: save auth failed: %v",
 					logfmt.Label(acct.UID, acct.Nickname), serr)

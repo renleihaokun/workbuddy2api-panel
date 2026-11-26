@@ -8,7 +8,9 @@
 //
 // 迁移矩阵（事件 → 动作 → 字段）：
 //
-//	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
+//	disabled           ← disableLocked（DisableWithKind / NoteSessionDead 达阈）
+//	disabledKind       ← disableLocked 的 kind 参数（session_dead / banned / manual）
+//	rtDeadAt           ← MarkRefreshTokenDead（RT 判死但 AT 仍有效，不禁用）；refresh 成功清
 //	until/coolKind     ← Cooldown(CoolSoft/Hard) / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
 //	                     （reviveCoolingLocked 不清——余额恢复不构成限流解除证据）
@@ -39,7 +41,7 @@ func (e *entry) clearCoolingLocked() {
 	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
 }
 
-// disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
+// disableLocked 禁用迁移：置 disabled/disabledKind 并清冷却域（禁用是比冷却更强的不可用终态）。
 //
 // 旧 Disable 只置 disabled+reason，不碰 until/modelCooldowns/softStreak，会出现
 // 「disabled=true 但 cooling=true / 残留 modelCooldowns」的一致性问题——一个先被
@@ -48,11 +50,15 @@ func (e *entry) clearCoolingLocked() {
 //
 // 熔断器保留：熔断是「连续 5xx 失败」信号（与授权/会话无关），禁用后再复活时
 // 熔断观测仍有效，不应被禁用覆盖。
-func (p *Pool) disableLocked(e *entry, reason string) {
+//
+// kind 是死因枚举（DisableKind*）：面板/监控据此区分「该重登」「被封禁」「人工停用」。
+// 空值 = 未分型（老调用点），行为与旧版一致。
+func (p *Pool) disableLocked(e *entry, reason, kind string) {
 	e.clearCoolingLocked()
 	e.disabled = true
 	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
+	e.disabledKind = kind
 	p.dirty.Store(true)
 }
 

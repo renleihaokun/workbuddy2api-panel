@@ -855,16 +855,31 @@ func (s *Scheduler) runKeepalive(scheduled bool) {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
+			isDead := errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+			// refresh token 失效 ≠ 账号不可用：AT 还没过期时 chat 仍正常（同类实测过
+			// refresh 恒回 12153、AT 却还有几十天、chat 全 200 的账号）。这种号既不计
+			// session dead（连续三次保活就会禁掉一个完全健康的号），也不打 WARN——
+			// 面板的错误汇总按 WARN 聚合，打 WARN 会让「保活失败」一直挂在页面上。
+			// 只记「RT 已死」这个凭证层事实，交给面板提醒趁 AT 未过期重登。
+			if isDead && upstream.AccessUsableWithoutRefresh(a) {
+				s.cfg.Pool.MarkRefreshTokenDead(st.UID)
+				log.Printf("INFO: keepalive %s: refresh token 已失效但 access token 仍有效（至 %s），本轮跳过（对话仍可用）",
+					logfmt.Label(st.UID, st.Nickname), time.Unix(a.ExpiresAtValue(), 0).Format("2006-01-02"))
+				continue
+			}
+			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			if isDead && !st.Disabled {
+				// 凭证层事实先记下（面板黄标），再按三振计死（AT 已过期，账号确实不可用）。
+				s.cfg.Pool.MarkRefreshTokenDead(st.UID)
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}
 			continue
 		}
-		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		s.cfg.Pool.ClearSessionDead(st.UID)     // 刷新成功清误判计数，失败不该累计
+		s.cfg.Pool.ClearRefreshTokenDead(st.UID) // 刷新成功 = RT 又活了（重登后或上游自行恢复）
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}

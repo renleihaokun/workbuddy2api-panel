@@ -102,6 +102,20 @@ type Status struct {
 	Enterprise      bool       `json:"enterprise,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// DisabledKind 禁用死因（session_dead / banned / manual；空 = 未分型的老调用点）。
+	// 与 DisabledReason 并存：reason 是给人看的原文，kind 是给程序判定的枚举。
+	DisabledKind string `json:"disabled_kind,omitempty"`
+	// NeedsRelogin 是否「只能靠重新登录恢复」（= disabled 且死因是 session_dead）。
+	// 这是唯一必须人工介入的账号状态：revive 救不回、等时间也不会好。派生量，
+	// 不落盘（由 disabled + disabledKind 推出，避免两处状态漂移）。
+	NeedsRelogin bool `json:"needs_relogin"`
+	// RefreshTokenDead refresh token 已被上游判死（AT 可能仍有效，账号还能干活）。
+	// 与 NeedsRelogin 的区别：这是「凭证层」事实，那是「账号已出池」事实。
+	RefreshTokenDead   bool      `json:"refresh_token_dead"`
+	RefreshTokenDeadAt time.Time `json:"refresh_token_dead_at,omitempty"`
+	// AccessTokenExpiresAt 当前 access token 的到期时刻（0 = 未知）。面板据此提示
+	// 「RT 已失效，AT 还剩 N 天」——RT 死但 AT 有效期间重登最划算。
+	AccessTokenExpiresAt time.Time `json:"access_token_expires_at,omitempty"`
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
@@ -220,6 +234,16 @@ type entry struct {
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
 	paused         bool
+	// disabledKind 禁用死因（DisableKind* 常量）。面板/监控靠它区分「该重登」
+	// 与「被封禁 / 人工停用」——只看 reason 文案是不可靠的（各调用点措辞会漂）。
+	// 旧 state.json 无此字段 → applyAccountsLocked 按 reason 文案做一次性兜底迁移。
+	// 持久化（stateAccount.DisabledKind）。
+	disabledKind string
+	// rtDeadAt refresh token 被上游判定失效的时刻。此时 AT 可能仍有效（chat 照常），
+	// 所以它**不等于**禁用：只用于面板黄标提示「趁 AT 没过期赶紧重登」。
+	// 只由 MarkRefreshTokenDead 写入、只由 refresh 成功清除；人工 revive 不清——
+	// RT 死了是上游的既成事实，点解冻不会把它复活。持久化。
+	rtDeadAt time.Time
 	reason         string
 	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
@@ -438,6 +462,12 @@ type stateAccount struct {
 	Disabled     bool      `json:"disabled"`
 	Paused       bool      `json:"paused,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
+	// DisabledKind 禁用死因（DisableKind*）。omitempty：老文件/未分型调用点不写键，
+	// 加载时按 reason 文案兜底迁移（见 applyAccountsLocked）。
+	DisabledKind string `json:"disabled_kind,omitempty"`
+	// RefreshTokenDeadAt RT 被上游判死时刻（AT 可能仍有效）。omitempty + 指针：
+	// 未判死时不写键；用指针才能让零值 time 真正被省略（Go omitempty 对结构体无效）。
+	RefreshTokenDeadAt *time.Time `json:"refresh_token_dead_at,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
 	CoolKind     CoolKind  `json:"cool_kind"`
 	SuccessCount int64     `json:"success_count,omitempty"`
@@ -550,6 +580,25 @@ const sessionDeadThreshold = 3
 
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"
+
+// 禁用死因枚举（stateAccount.DisabledKind / Status.DisabledKind）。
+//
+// 为什么要分型：同一个「不可用」有三种完全不同的处置——
+//   - session_dead：只能重登（面板给「重登」按钮，不进封禁提示）；
+//   - banned：上游按账号限制（11140），重登无效，只能申诉；
+//   - manual：运维手停，随时可解冻。
+//
+// 老代码只写 reason 文案，面板只能靠字符串猜；这里把判据固化下来。
+const (
+	// DisableKindNone 未分型：老调用点/旧 state 文件（reason 无 12153 文案）。
+	DisableKindNone = ""
+	// DisableKindSessionDead 会话失效（12153 / 401 invalid_token），需人工重登。
+	DisableKindSessionDead = "session_dead"
+	// DisableKindBanned 上游按账号限制（11140 异常行为），重登无效。
+	DisableKindBanned = "banned"
+	// DisableKindManual 运维手动禁用（面板），随时可解冻。
+	DisableKindManual = "manual"
+)
 
 // SessionDeadThreshold 暴露连续 12153 的禁用阈值（供 scheduler 日志/运维文档引用）。
 func SessionDeadThreshold() int { return sessionDeadThreshold }

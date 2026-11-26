@@ -13,10 +13,19 @@ import (
 )
 
 func (p *Pool) Disable(uid, reason string) {
+	p.DisableWithKind(uid, reason, DisableKindNone)
+}
+
+// DisableWithKind 同 Disable，但记录死因枚举（DisableKind*）。
+//
+// 死因决定面板/监控怎么处置该账号：session_dead → 给「重登」；
+// banned → 提示申诉（重登无效）；manual → 给「解冻」。用枚举而不是解析 reason
+// 文案：reason 是给人看的、各调用点措辞会漂，拿它当判据迟早出错。
+func (p *Pool) DisableWithKind(uid, reason, kind string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		p.disableLocked(e, reason)
+		p.disableLocked(e, reason, kind)
 	}
 }
 
@@ -41,8 +50,66 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 		return false
 	}
 	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason)
+	p.disableLocked(e, sessionDeadReason, DisableKindSessionDead)
 	return true
+}
+
+// MarkRefreshTokenDead 记录「refresh token 已被上游判死」，但**不禁用、不冷却**。
+//
+// 用途：AT 还没过期时账号照常能聊天（同类实测过 refresh 恒回 12153、chat 全 200
+// 的账号）。这时把它计成 session dead，连续三次保活就会禁掉一个完全健康的号。
+// 正确处置是记下「RT 死了」这个凭证层事实，交给面板提醒趁 AT 没过期赶紧重登；
+// AT 真过期后，401 自然会走 401 求证 → 三振 → 禁用。
+//
+// 与 sessionDeadFails 的关系：RT 判死是「凭证层」事实，与「账号是否还可用」是两个
+// 维度，各自独立记账——这里**不动**连续计数（AT 过期后的 401 还要正常三振）。
+func (p *Pool) MarkRefreshTokenDead(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.rtDeadAt = time.Now()
+	p.dirty.Store(true)
+	return true
+}
+
+// ClearRefreshTokenDead 清「RT 已死」标记——只在 refresh 成功（会话被证明活着）时调用。
+// 人工 revive 不清：点解冻不会让上游复活一张已被作废的票。
+func (p *Pool) ClearRefreshTokenDead(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.rtDeadAt.IsZero() {
+		return
+	}
+	e.rtDeadAt = time.Time{}
+	p.dirty.Store(true)
+}
+
+// RefreshTokenDead 报告该账号的 RT 是否已被上游判死（凭证层事实）。
+// 供请求路径跳过「明知会失败的预刷新」——AT 到期前那 10 分钟里，每个请求都去撞一次
+// 已死的 refresh 端点，既浪费又给上游多一个可观察的异常信号。
+func (p *Pool) RefreshTokenDead(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	return ok && !e.rtDeadAt.IsZero()
+}
+
+// NeedsReloginCount 统计「只能靠重登恢复」的账号数（disabled 且死因 session_dead）。
+// 供面板概况与运维告警用；不改 CountsDetailed* 的既有签名（那些口径是监控契约）。
+func (p *Pool) NeedsReloginCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for _, e := range p.byUID {
+		if e.disabled && e.disabledKind == DisableKindSessionDead {
+			n++
+		}
+	}
+	return n
 }
 
 // ClearSessionDead 清连续 12153 计数——账号被证明未死的任何时刻调用：
@@ -64,6 +131,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok && e.disabled {
 		e.disabled = false
+		e.disabledKind = DisableKindNone
 		e.reason = ""
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
@@ -82,6 +150,7 @@ func (p *Pool) Revive(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.disabledKind = DisableKindNone
 	e.paused = false // 解冻是全清：暂停选号一并解除
 	e.until = time.Time{}
 	e.coolKind = 0
@@ -605,6 +674,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
 		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
 		Disabled:                 e.disabled,
+		DisabledKind:             e.disabledKind,
+		NeedsRelogin:             e.disabled && e.disabledKind == DisableKindSessionDead,
+		RefreshTokenDead:         !e.rtDeadAt.IsZero(),
 		Paused:                   e.paused,
 		SuccessCount:             e.successCount,
 		ErrTotal:                 e.errTotal,
@@ -620,6 +692,15 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:                 int(e.inFlight.Load()),
 		BreakerFails:             e.fails,
 		BreakerUntil:             e.breakerUntil,
+	}
+	// RT 判死时刻与 AT 到期时刻放在字面量外：两者都需要零值判断。
+	// 锁序：p.mu(R) → a.mu（ExpiresAtValue）；反向路径不存在——刷新/落盘的 a.mu 临界区
+	// 内不调用任何 pool 方法，故不会成环。
+	if !e.rtDeadAt.IsZero() {
+		st.RefreshTokenDeadAt = e.rtDeadAt
+	}
+	if exp := e.a.ExpiresAtValue(); exp > 0 {
+		st.AccessTokenExpiresAt = time.Unix(exp, 0)
 	}
 	// reason 仅在冷却/禁用中透出（issue #171）：软冷却按 until 到期恢复，
 	// 但 until/coolKind/reason 字段按设计不主动清理（NoteSuccess 注释：

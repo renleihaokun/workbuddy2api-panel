@@ -45,6 +45,14 @@ type Config struct {
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
+	// VerifySessionOn401 401 先求证再计数（pool.verify_session_on_401）。
+	// 运行期以 livecfg 快照为准（热生效）；此处供 Live 为 nil 的裸用/测试路径。
+	// 零值 = 关闭（旧行为），生产由 main 注入配置默认值 true。
+	VerifySessionOn401 bool
+	// SessionVerifyInterval 同账号两次求证的最小间隔（pool.session_verify_interval）。
+	// 运行期同样以 livecfg 为准；<=0 时由 upstream 回落内置默认 60s。
+	SessionVerifyInterval time.Duration
+
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
@@ -169,6 +177,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SystemAsUserFallback: h.cfg.SystemAsUserFallback,
 		ModelIDStyle:         modelid.StyleOf(h.cfg.ModelsIDStyle),
 		RealmNamePrefix:      h.cfg.ModelsRealmNamePrefix,
+		VerifySessionOn401:   h.cfg.VerifySessionOn401,
+		SessionVerifyInterval: h.cfg.SessionVerifyInterval,
 	}
 }
 
@@ -188,6 +198,21 @@ func (h *Handler) softCooldown() time.Duration {
 // 若共用 soft_rate（600s 起 + 指数升级），一次偶发 404 会把好账号罚 10 分钟并逐次加倍。
 // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
 const notFoundCooldown = 60 * time.Second
+
+// 401 求证后的两档短冷却（都不是惩罚，只是别让同号在一秒内连环撞）。
+const (
+	// verifyAliveCooldown 求证=活（401 只是被边缘拦）后的短冷却：会话没死，
+	// 但刚刚这一发确实被拦了，立刻重试大概率再撞，让号歇 30s。
+	verifyAliveCooldown = 30 * time.Second
+	// verifyInconclusiveCooldown 求证=无判词（网络/5xx/429，或网关把 refresh 也拦了）
+	// 后的短冷却：不知道死没死，所以既不计数也不放行，歇 60s 再试。
+	verifyInconclusiveCooldown = 60 * time.Second
+)
+
+// verifyOn401 当前是否启用「401 先求证」（livecfg 热改优先，回退静态字段）。
+func (h *Handler) verifyOn401() bool {
+	return h.loadLive().VerifySessionOn401
+}
 
 // maxChatBodyBytes 聊天 / Responses 请求体上限（含多模态内联 base64 图片）。
 //
@@ -1088,25 +1113,38 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		heldUID = acct.UID
 
-		// token 临近过期 → 先 refresh（失败冷却换号）
-		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
+		// token 临近过期 → 先 refresh（失败冷却换号）。
+		// RT 已被判死的号跳过预刷新：明知会失败还每个请求撞一次刷新端点，只是给上游
+		// 多一个异常信号；AT 真过期后自然走 401 求证 → 计数 → 判死。
+		if acct.NeedsRefresh(h.cfg.RefreshSkew) && !h.cfg.Pool.RefreshTokenDead(acct.UID) {
+			refreshOK := true
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+				refreshOK = false
 				lastErr = err
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+				isDead := errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+				if isDead {
+					// RT 判死但 AT 可能仍有效：不计数（见 handleRefreshSessionDead）。
+					h.handleRefreshSessionDead(acct)
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
-				fail(acct.UID)
-				if !rotateBackoff(i, r.Context()) {
-					break // ctx 取消：终止轮转（refresh 失败换号退避）
+				// RT 死了、但 AT 还没过期 → 继续用当前 AT 发这一发请求：这个号现在
+				// 还能干活，换号只是浪费一次轮转（同类实测过 refresh 恒死、chat 全 200
+				// 的账号）。AT 已过期或非 session-dead 失败才换号重试。
+				if !isDead || !upstream.AccessUsableWithoutRefresh(acct) {
+					fail(acct.UID)
+					if !rotateBackoff(i, r.Context()) {
+						break // ctx 取消：终止轮转（refresh 失败换号退避）
+					}
+					continue
 				}
-				continue
 			}
-			if err := acct.SaveAtomic(); err != nil {
-				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+			if refreshOK {
+				if err := acct.SaveAtomic(); err != nil {
+					// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
+					log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+				}
 			}
 		}
 
@@ -1803,6 +1841,59 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 	return !clientGone && errors.Is(err, context.Canceled)
 }
 
+// penalizeSessionDead 处置一次「会话失效」信号（chat 401 路径）。
+//
+// 为什么不能直接 Disable（issue #215 现场）：上游 401 有两种成因——会话真被注销，
+// 或网关/边缘的瞬时拦截——两者响应体一模一样。直接按次数的旧实现把十个号里的七个
+// 踢出池，睡一觉又自己好了。判据只能是拿 refresh 端点问一次（见
+// upstream.VerifySession 的三态）。
+//
+// 三态处置：
+//   - 活：清连续计数 + 30s 短冷却（本次被拦，重试大概率还撞）；
+//   - 死：交给 NoteSessionDead 计数（连续 3 次才禁用）——不在这里直接杀号；
+//   - 无判词：不计数也不放行，60s 短冷却（不知道死没死，不能当判词用）。
+//
+// status 只认 401：12153 混在其他状态码里（极少）时保留旧行为，不发求证。
+func (h *Handler) penalizeSessionDead(uid string, a *auth.Auth, status int) {
+	if h.verifyOn401() && status == http.StatusUnauthorized && a != nil && h.cfg.Upstream != nil {
+		switch h.cfg.Upstream.VerifySession(a) {
+		case upstream.SessionAlive:
+			h.cfg.Pool.ClearSessionDead(uid)
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, verifyAliveCooldown, "401 transient (session verified alive)")
+			return
+		case upstream.SessionDead:
+			// 上游应用层明确拒绝：落到下面统一计数（仍需连续 3 次）。
+		default:
+			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, verifyInconclusiveCooldown, "401 unverified (refresh inconclusive)")
+			return
+		}
+	}
+	h.cfg.Pool.NoteSessionDead(uid)
+}
+
+// handleRefreshSessionDead 处置「请求前/搜索前刷新失败且分类为 session dead」。
+//
+// 与 chat 401 的区别：这里的 401 来自 refresh 端点，且 access token 可能仍然有效。
+// 此时不该计数——RT 死了不等于账号不可用（同类实测过 refresh 恒回 12153、chat 全 200
+// 的账号），连续三次保活就会把一个能干活的号禁掉。正确处置是记下凭证层事实
+// （MarkRefreshTokenDead），让面板提醒趁 AT 没过期重登。
+//
+// 也不再发一次求证请求：refresh 刚刚就被应用层拒绝（ErrSessionDead 只由带业务信封的
+// 12153 触发），再问一次既浪费又可能双花 RT。
+func (h *Handler) handleRefreshSessionDead(a *auth.Auth) {
+	if a == nil {
+		return
+	}
+	// 凭证层事实：RT 已被上游判死（无论 AT 是否还有效，这条都成立）。
+	h.cfg.Pool.MarkRefreshTokenDead(a.UID)
+	if upstream.AccessUsableWithoutRefresh(a) {
+		log.Printf("INFO: [server] %s refresh token 已失效但 access token 仍有效（至 %s），对话继续可用，建议尽快重登",
+			logfmt.Label(a.UID, a.Nickname), time.Unix(a.ExpiresAtValue(), 0).Format("2006-01-02"))
+		return
+	}
+	h.cfg.Pool.NoteSessionDead(a.UID)
+}
+
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify / ChatStreamContext 的 *Error 信封），
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
@@ -1818,7 +1909,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
-//   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrSessionDead → 401 求证三态（penalizeSessionDead）：活=30s 短冷却、死=连续计数、
+//     无判词=60s 短冷却；连续 3 次确证才禁用（需人工重登），不再一次就杀号。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号，且与 ErrPromptTooLong/ErrImageInvalid 同待遇：
 //     调用方在轮转循环内即刻 400 透传原文终止（换号必然同样失败）。
@@ -1886,7 +1978,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 401 不直接杀号：先按开关求证三态（见 penalizeSessionDead）。只有「上游
+		// 应用层明确拒绝」才计数，且连续 sessionDeadThreshold 次才禁用；求证=活则
+		// 只做 30s 短冷却，求证=无判词则 60s 短冷却不计数。
+		// uerr 为 nil（防御路径）时 status=0，走旧口径的连续计数。
+		status := 0
+		if uerr != nil {
+			status = uerr.Status
+		}
+		h.penalizeSessionDead(uid, h.cfg.Pool.AuthByUID(uid), status)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
@@ -1900,7 +2000,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 注意 11128 的 msg 同为 "request illegal"，但那是通道校验失败，已在
 		// Classify 分流到 ErrChannelRefused，走不到这里。
 		if upstream.IsAccountRestricted(body) {
-			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
+			h.cfg.Pool.DisableWithKind(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction", pool.DisableKindBanned)
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")

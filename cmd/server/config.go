@@ -296,6 +296,16 @@ type Config struct {
 		// 明确没有该模型；且另一域此刻有可服务账号。cn↔global 双向，每请求最多切一次。
 		// 两开关同开时，裸名沿用旧开关的宽松语义（不校验目录），显式前缀仍要求目录同名。
 		CrossDomainModelFallback bool `json:"cross_domain_model_fallback"`
+		// VerifySessionOn401 401 先求证再计数（默认 true）。
+		// 开启：请求路径拿到 401 时先用 refresh 端点求证三态（活 / 死 / 无判词），
+		// 只有「上游应用层明确拒绝」才计入 session dead（仍要连续 3 次才禁用）。
+		// 关闭 = 旧行为（401 命中的 session dead 直接计数，不发求证请求）——回滚闸：
+		// 出现异常时改成 false 即可完全退回，不必改代码。
+		VerifySessionOn401 bool `json:"verify_session_on_401"`
+		// SessionVerifyInterval 同账号两次求证的最小间隔（默认 "60s"）。
+		// 窗口内复用上次结论——上游大面积 401（issue #215 那种）时，每个失败请求都去
+		// 求证等于给刷新端点造风暴。<=0 回落默认。
+		SessionVerifyInterval string `json:"session_verify_interval"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -318,6 +328,8 @@ type Config struct {
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// SessionVerifyIntervalDur 解析后的 401 求证节流窗口（默认 60s）。
+	SessionVerifyIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 }
@@ -399,6 +411,10 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.PreferExpiring = true
+	// 401 先求证（默认开启）：本次改动的核心行为，也是唯一的回滚闸——
+	// JSON 显式写 false 才退回旧行为。
+	c.Pool.VerifySessionOn401 = true
+	c.Pool.SessionVerifyInterval = "60s"
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
@@ -640,6 +656,19 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 401 求证节流窗口：空值回落默认 60s；<=0 同样回落（"0" 若当作「每次都求证」
+	// 会把刷新端点变成风暴中心，这个值没有合理的「关停」语义——要关停请用
+	// pool.verify_session_on_401=false）。
+	if c.Pool.SessionVerifyInterval == "" {
+		c.Pool.SessionVerifyInterval = "60s"
+	}
+	if c.SessionVerifyIntervalDur, err = time.ParseDuration(c.Pool.SessionVerifyInterval); err != nil {
+		return fmt.Errorf("pool.session_verify_interval: %w", err)
+	}
+	if c.SessionVerifyIntervalDur <= 0 {
+		c.SessionVerifyIntervalDur = 60 * time.Second
+		c.Pool.SessionVerifyInterval = "60s"
 	}
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {

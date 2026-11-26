@@ -948,6 +948,20 @@ type Client struct {
 	refreshMu       sync.Mutex
 	refreshInFlight map[string]*refreshFlight
 
+	// verifyMu/verifyLast 是「401 求证」的节流表：同一账号 sessionVerifyInterval
+	// 内只向上游发一次 refresh 求证，窗口内后来者直接复用上次结论（见 verify.go）。
+	// 为什么要节流：上游大面积 401（issue #215 那种）时，每个失败请求都去求证等于
+	// 把刷新端点变成新的风暴中心——而刷新端点本身也挂在同一层网关上。
+	// 为什么复用结论而不是「跳过求证」：Dead 结论必须仍能累计三振，否则节流会把
+	// 判死流程饿死；Alive 结论同理（窗口内不再罚号）。
+	verifyMu   sync.Mutex
+	verifyLast map[string]verifyRecord
+
+	// verifyInterval 同账号两次 401 求证的最小间隔（纳秒，见 verify.go）。
+	// 0 = 默认 60s；面板改 pool.session_verify_interval 后热更新。
+	// atomic：配置热改与 chat 失败路径并发读写。
+	verifyInterval atomic.Int64
+
 	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
 	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
 	creditObserver atomic.Pointer[CreditObserver]
@@ -1216,12 +1230,31 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     写回；写回前若发现另一刷新已完成（两 token 同时变化）则直接采用。
 //   - 12153 兜底：若磁盘 auth 文件已被其他进程（server + signin 双进程部署）刷新
 //     过，则采纳磁盘 token 重试一次——进程内单飞挡不住跨进程竞态。
+//
+// 401 求证（VerifySession，见 verify.go）复用同一条单飞通道：求证与保活/请求路径
+// 并发时共享同一次上游调用，不会双花 RT。
 func (c *Client) RefreshToken(a *auth.Auth) error {
-	key := a.UID
-	if key == "" {
-		// 无 UID 的临时 auth：退化为按对象指针去重，仍保证同一对象串行。
-		key = fmt.Sprintf("%p", a)
+	return c.refresh(a, refreshIOTimeout)
+}
+
+// refreshKey 单飞/求证节流的账号键：优先 UID；无 UID 的临时 auth 退化为按对象
+// 指针去重，仍保证同一对象串行。
+func refreshKey(a *auth.Auth) string {
+	if a == nil {
+		return ""
 	}
+	if a.UID != "" {
+		return a.UID
+	}
+	return fmt.Sprintf("%p", a)
+}
+
+// refresh 单飞 + 跨进程采纳的刷新编排。timeout 只作用于本进程首个发起者（leader）
+// 的网络 I/O；等待者直接复用 leader 的结果，不重复消费 RT。
+// 抽成带 timeout 的内部入口是为了让 VerifySession 用更短的 8s 取证超时，而公共
+// RefreshToken 仍保持 30s（保活/请求路径口径不变）。
+func (c *Client) refresh(a *auth.Auth, timeout time.Duration) error {
+	key := refreshKey(a)
 	c.refreshMu.Lock()
 	if c.refreshInFlight == nil {
 		c.refreshInFlight = make(map[string]*refreshFlight)
@@ -1235,10 +1268,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.refreshInFlight[key] = f
 	c.refreshMu.Unlock()
 
-	err := c.refreshTokenOnce(a)
+	err := c.refreshTokenOnce(a, timeout)
 	if err != nil && isSessionDead(err) && adoptNewerTokensFromDisk(a) {
 		// 跨进程竞态：磁盘 RT 已被别的进程 rotate 过，用新 RT 再试一次。
-		err = c.refreshTokenOnce(a)
+		err = c.refreshTokenOnce(a, timeout)
 	}
 
 	// 先写结果再关 channel：等待者 <-f.done 之后读到的一定是最终 err。
@@ -1290,8 +1323,10 @@ func adoptNewerTokensFromDisk(a *auth.Auth) bool {
 	return true
 }
 
-// refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
-func (c *Client) refreshTokenOnce(a *auth.Auth) error {
+// refreshTokenOnce 是单次刷新本体（调用方 refresh 已保证同账号串行）。
+// timeout 由调用方给：公共 RefreshToken 用 refreshIOTimeout（30s），401 求证用更短的
+// verifyIOTimeout——取证不该把失败请求拖到 30 秒。
+func (c *Client) refreshTokenOnce(a *auth.Auth, timeout time.Duration) error {
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
@@ -1302,7 +1337,7 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	}
 
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
@@ -1369,6 +1404,9 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
+	// 刷新成功 = 会话未死的实证：清掉 401 求证缓存，避免窗口内残留的 Dead 结论
+	// 继续罚一个刚被证明还活着的账号（锁序：a.mu → verifyMu，反向不存在）。
+	c.clearVerify(a)
 	return nil
 }
 

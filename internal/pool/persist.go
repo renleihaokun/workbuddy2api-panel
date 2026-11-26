@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -151,6 +152,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			disabled:                 s.Disabled,
 			paused:                   s.Paused,
 			reason:                   s.Reason,
+			disabledKind:             s.DisabledKind,
 			until:                    s.Until,
 			coolKind:                 s.CoolKind,
 			successCount:             s.SuccessCount,
@@ -162,6 +164,18 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
+		}
+		// RT 判死时刻恢复：这是历史事实（无过期语义），有就恢复。
+		if s.RefreshTokenDeadAt != nil {
+			e.rtDeadAt = *s.RefreshTokenDeadAt
+		}
+		// 老 state 文件没有 disabled_kind：按 reason 文案做一次性兜底迁移，让升级后
+		// 既有的 session-dead 账号立刻能在面板上标「待重登」（否则要等下一次 12153）。
+		// 只认旧代码真实写过的两种文案；不猜其余措辞（宁可未分型，也不误标封禁）。
+		if e.disabled && e.disabledKind == DisableKindNone {
+			if strings.Contains(e.reason, "12153") || strings.Contains(e.reason, "session dead") {
+				e.disabledKind = DisableKindSessionDead
+			}
 		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
@@ -298,6 +312,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			Disabled:                 e.disabled,
 			Paused:                   e.paused,
 			Reason:                   e.reason,
+			DisabledKind:             e.disabledKind,
 			Until:                    e.until,
 			CoolKind:                 e.coolKind,
 			SuccessCount:             e.successCount,
@@ -313,6 +328,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 			CreditsEarliestRemaining: e.creditsEarliestRemaining,
 			CreditsExpiryBuckets:     append([]ExpiryBucket(nil), e.expiryBuckets...),
+		}
+		// RT 判死时刻：非零才落盘（指针 nil 才能被 omitempty 真省略）。
+		if !e.rtDeadAt.IsZero() {
+			t := e.rtDeadAt
+			s.RefreshTokenDeadAt = &t
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
