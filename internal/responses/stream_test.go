@@ -243,6 +243,91 @@ func TestStreamCustomTool(t *testing.T) {
 	}
 }
 
+// TestStreamNamespacedToolCall namespace 工具的流式 item 必须带 name + namespace：
+// output_item.added、output_item.done 与最终 completed output 三处都要一致。
+func TestStreamNamespacedToolCall(t *testing.T) {
+	rec := httptest.NewRecorder()
+	meta := Meta{
+		Model: "m",
+		ToolRefs: map[string]ToolRef{
+			"container.run_shell": {Namespace: "container", Name: "run_shell"},
+		},
+	}
+	tr := NewTranslator(rec, meta)
+	frames := []string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"container.run_shell","arguments":"{\"command\":\""}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"pwd\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n",
+	}
+	for _, f := range frames {
+		if err := tr.WriteFrame([]byte(f)); err != nil {
+			t.Fatalf("write frame: %v", err)
+		}
+	}
+	if err := tr.Finish(nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	events := parseEvents(t, rec.Body.String())
+
+	added, _ := events[2].Data["item"].(map[string]any)
+	if added["type"] != "function_call" || added["name"] != "run_shell" || added["namespace"] != "container" {
+		t.Fatalf("added item=%v", added)
+	}
+	var done map[string]any
+	for _, e := range events {
+		if e.Name == "response.output_item.done" {
+			done, _ = e.Data["item"].(map[string]any)
+		}
+	}
+	if done["name"] != "run_shell" || done["namespace"] != "container" {
+		t.Fatalf("done item=%v", done)
+	}
+	resp, _ := events[len(events)-1].Data["response"].(map[string]any)
+	out, _ := resp["output"].([]any)
+	item, _ := out[0].(map[string]any)
+	if item["name"] != "run_shell" || item["namespace"] != "container" {
+		t.Fatalf("completed item=%v", item)
+	}
+}
+
+// TestStreamNamespacedCustomTool namespace 里的 custom 工具仍走 custom_tool_call，
+// 并带原始 name + namespace。
+func TestStreamNamespacedCustomTool(t *testing.T) {
+	rec := httptest.NewRecorder()
+	meta := Meta{
+		Model:       "m",
+		CustomTools: map[string]bool{"container.apply_patch": true},
+		ToolRefs: map[string]ToolRef{
+			"container.apply_patch": {Namespace: "container", Name: "apply_patch"},
+		},
+	}
+	tr := NewTranslator(rec, meta)
+	frames := []string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_p","type":"function","function":{"name":"container.apply_patch","arguments":"{\"input\":\"patch\"}"}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
+	}
+	for _, f := range frames {
+		if err := tr.WriteFrame([]byte(f)); err != nil {
+			t.Fatalf("write frame: %v", err)
+		}
+	}
+	if err := tr.Finish(nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	events := parseEvents(t, rec.Body.String())
+	var done map[string]any
+	for _, e := range events {
+		if e.Name == "response.output_item.done" {
+			done, _ = e.Data["item"].(map[string]any)
+		}
+	}
+	if done["type"] != "custom_tool_call" || done["name"] != "apply_patch" || done["namespace"] != "container" {
+		t.Fatalf("done item=%v", done)
+	}
+	if done["input"] != "patch" {
+		t.Errorf("custom input=%v", done["input"])
+	}
+}
+
 // TestStreamErrorFrame 上游 error 帧 → error + response.failed，且不再发 completed。
 func TestStreamErrorFrame(t *testing.T) {
 	rec := httptest.NewRecorder()

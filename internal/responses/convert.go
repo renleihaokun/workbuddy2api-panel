@@ -12,9 +12,28 @@ package responses
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"strings"
 )
+
+const (
+	// defaultFunctionNamespace 是 Codex 顶层 function/custom 工具所在的命名空间。
+	// 这个命名空间的子工具摊平后直接用裸名，响应里也不回 namespace。
+	defaultFunctionNamespace = "functions"
+	// chatToolNameSep 是 namespace 子工具摊平到 chat 工具名时使用的分隔符。
+	// 若上游实测不接受点号，改成 "__" 即可；映射层不依赖具体分隔符。
+	chatToolNameSep = "."
+	// maxChatToolNameLen 与 OpenAI function name / 上游 DSML 工具名的上限一致。
+	maxChatToolNameLen = 64
+)
+
+// ToolRef 是一个 namespace 子工具的原始身份。chat 侧只看到摊平后的名字，
+// 响应侧要靠它还原成 Codex 能路由的 name + namespace。
+type ToolRef struct {
+	Namespace string
+	Name      string
+}
 
 // Meta 保存原始 Responses 请求里需要回显到响应对象的字段。
 //
@@ -42,7 +61,11 @@ type Meta struct {
 	// CustomTools 记录「本次请求里以 type=custom 声明的工具名」。
 	// 响应侧据此把对应的 function_call 还原成 custom_tool_call（apply_patch 这类
 	// freeform 工具只认后者；混成 function_call 会被 Codex 判为不兼容 payload）。
+	// namespace 子工具用摊平后的 chat 工具名做 key。
 	CustomTools map[string]bool
+	// ToolRefs 记录 namespace 子工具摊平后的 chat 工具名 → 原始 (namespace, name)。
+	// 响应侧据此把模型调用的扁平名还原成 Codex 能路由的 name + namespace。
+	ToolRefs map[string]ToolRef
 	// Unsupported 非空表示请求带了本网关不支持且无法安全忽略的参数，
 	// 由 handler 直接 400，不做静默降级。
 	Unsupported string
@@ -53,7 +76,7 @@ type Meta struct {
 // 返回的 chatBody 里已含 model / messages / stream / tools 等 chat 必需字段；
 // 未识别的 Responses 字段一律丢弃（OpenAI 的向前兼容语义：未知参数不报错）。
 func ConvertRequest(body []byte) ([]byte, Meta, error) {
-	meta := Meta{CustomTools: map[string]bool{}}
+	meta := Meta{CustomTools: map[string]bool{}, ToolRefs: map[string]ToolRef{}}
 	if len(body) == 0 {
 		return nil, meta, fmt.Errorf("request body is empty")
 	}
@@ -108,6 +131,33 @@ func ConvertRequest(body []byte) ([]byte, Meta, error) {
 		chat["stream_options"] = map[string]any{"include_usage": true}
 	}
 
+	// tools 必须先于 input 转换：input 里的 function_call / custom_tool_call
+	// 历史可能带 namespace 字段，需要按本次工具声明算出的最终扁平名回填 chat
+	// 的 tool_calls[].function.name；反过来会拿不到去重/截断后的名字。
+	//
+	// tools：Responses 的 function 工具是扁平结构（name/description/parameters 与
+	// type 同级），chat 要求嵌在 function 子对象里；custom（freeform）工具在 chat
+	// 侧没有对应概念，包装成「单个 input 字符串参数」的 function；namespace 组
+	// 摊平成普通 function（见 convertTools）。
+	if rawTools, ok := req["tools"].([]any); ok && len(rawTools) > 0 {
+		// 回显用「实际受支持的工具子集」：被丢弃的 web_search/local_shell 等
+		// 不应出现在响应快照里（客户端会以为它们生效了）。
+		meta.Tools = filterEchoTools(rawTools)
+		if tools := convertTools(rawTools, &meta); len(tools) > 0 {
+			chat["tools"] = tools
+			if tc := convertToolChoice(req["tool_choice"], tools, &meta); tc != nil {
+				chat["tool_choice"] = tc
+				// 回显用 Responses 形态（扁平 name），而不是 chat 的嵌套形态。
+				meta.ToolChoice = echoToolChoice(req["tool_choice"])
+			}
+			// parallel_tool_calls 只在有工具时下发：空工具集带该字段会被部分
+			// 上游当成非法参数。
+			if v, ok := req["parallel_tool_calls"].(bool); ok {
+				chat["parallel_tool_calls"] = v
+			}
+		}
+	}
+
 	// instructions → 首条 system。Codex 把系统提示词放在 instructions，而不是
 	// messages 里；丢掉它等于把 agent 的行为约束整段删除。
 	var messages []any
@@ -128,28 +178,6 @@ func ConvertRequest(body []byte) ([]byte, Meta, error) {
 		return nil, meta, fmt.Errorf("input is required")
 	}
 	chat["messages"] = messages
-
-	// tools：Responses 的 function 工具是扁平结构（name/description/parameters 与
-	// type 同级），chat 要求嵌在 function 子对象里；custom（freeform）工具在 chat
-	// 侧没有对应概念，包装成「单个 input 字符串参数」的 function。
-	if rawTools, ok := req["tools"].([]any); ok && len(rawTools) > 0 {
-		// 回显用「实际受支持的工具子集」：被丢弃的 web_search/local_shell 等
-		// 不应出现在响应快照里（客户端会以为它们生效了）。
-		meta.Tools = filterEchoTools(rawTools)
-		if tools := convertTools(rawTools, &meta); len(tools) > 0 {
-			chat["tools"] = tools
-			if tc := convertToolChoice(req["tool_choice"], tools); tc != nil {
-				chat["tool_choice"] = tc
-				// 回显用 Responses 形态（扁平 name），而不是 chat 的嵌套形态。
-				meta.ToolChoice = echoToolChoice(req["tool_choice"])
-			}
-			// parallel_tool_calls 只在有工具时下发：空工具集带该字段会被部分
-			// 上游当成非法参数。
-			if v, ok := req["parallel_tool_calls"].(bool); ok {
-				chat["parallel_tool_calls"] = v
-			}
-		}
-	}
 	if v, ok := req["parallel_tool_calls"].(bool); ok {
 		meta.ParallelToolCalls = &v
 	}
@@ -305,6 +333,13 @@ func convertInput(input any, meta *Meta) ([]any, error) {
 // assistant 回合的所有并行调用放在同一条消息里）。
 func appendToolCall(out []any, item map[string]any, typ string, meta *Meta) []any {
 	name, _ := item["name"].(string)
+	namespace, _ := item["namespace"].(string)
+	// 历史里 Codex 回传的是原始 (namespace, name)；chat 侧要用本次工具声明里
+	// 的扁平名，否则和 tools 数组对不上。
+	flat := meta.FlatNameFor(namespace, name)
+	if flat == "" {
+		flat = name
+	}
 	callID, _ := item["call_id"].(string)
 	if callID == "" {
 		callID = NewID("call")
@@ -315,17 +350,21 @@ func appendToolCall(out []any, item map[string]any, typ string, meta *Meta) []an
 		args = encodeArguments(map[string]any{"input": input})
 		// 历史里出现过 custom 调用 → 即便本次 tools 声明在链路上丢失，响应侧
 		// 也能把同名调用还原成 custom_tool_call（tools 丢失是本仓库的实测常态）。
-		if name != "" {
-			meta.CustomTools[name] = true
+		if flat != "" {
+			if meta.CustomTools == nil {
+				meta.CustomTools = map[string]bool{}
+			}
+			meta.CustomTools[flat] = true
 		}
 	} else {
 		args, _ = item["arguments"].(string)
 	}
+	meta.rememberToolRef(namespace, name, flat)
 	call := map[string]any{
 		"id":   callID,
 		"type": "function",
 		"function": map[string]any{
-			"name":      name,
+			"name":      flat,
 			"arguments": args,
 		},
 	}
@@ -453,10 +492,30 @@ func convertToolOutput(v any) string {
 //     输出约束，保留未知字段有 400 风险）；
 //   - custom：freeform 工具包装成「单 input 字符串参数」的 function，响应侧再
 //     还原成 custom_tool_call；
+//   - namespace：把 tools 里的 function/custom 摊平成普通 function。chat 侧名字
+//     用 <namespace>.<tool>（默认 functions 命名空间不加前缀），原始身份记进
+//     Meta.ToolRefs，响应侧再还原成 Codex 能路由的 name + namespace；
 //   - 其余内置工具：丢弃 + WARN（不整请求失败——Codex 默认会带 web_search 之类，
 //     直接 400 会让所有请求都不可用）。
 func convertTools(raw []any, meta *Meta) []any {
+	if meta.CustomTools == nil {
+		meta.CustomTools = map[string]bool{}
+	}
+	if meta.ToolRefs == nil {
+		meta.ToolRefs = map[string]ToolRef{}
+	}
 	out := make([]any, 0, len(raw))
+	used := make(map[string]bool, len(raw))
+	type pendingNamespace struct {
+		name        string
+		description string
+		tools       []any
+	}
+	var pending []pendingNamespace
+
+	// 第一遍：顶层 function/custom 先占名字；namespace 组排队，等顶层工具全部
+	// 注册完再摊平，这样默认 functions 命名空间里与顶层重名的子工具可以按
+	// 重复声明跳过，而不是被加后缀。
 	for _, item := range raw {
 		tool, ok := item.(map[string]any)
 		if !ok {
@@ -465,72 +524,199 @@ func convertTools(raw []any, meta *Meta) []any {
 		typ, _ := tool["type"].(string)
 		switch typ {
 		case "function":
-			// 兼容两种声明：Responses 扁平形态（name/description/parameters 与 type
-			// 同级）与 chat 嵌套形态（function:{...}，部分中转/客户端会混发）。
-			nested, _ := tool["function"].(map[string]any)
-			name, _ := tool["name"].(string)
-			desc, _ := tool["description"].(string)
-			params := tool["parameters"]
-			if name == "" && nested != nil {
-				name, _ = nested["name"].(string)
-			}
-			if desc == "" && nested != nil {
-				desc, _ = nested["description"].(string)
-			}
-			if params == nil && nested != nil {
-				params = nested["parameters"]
-			}
+			name, desc, params := functionToolFields(tool)
 			if name == "" {
 				log.Printf("WARN: [responses] dropped function tool without name")
 				continue
 			}
-			fn := map[string]any{"name": name}
-			if desc != "" {
-				fn["description"] = desc
-			}
-			if params == nil {
-				params = map[string]any{"type": "object", "properties": map[string]any{}}
-			}
-			fn["parameters"] = params
-			out = append(out, map[string]any{"type": "function", "function": fn})
+			appendFunctionTool(&out, used, name, desc, params)
 		case "custom":
 			name, _ := tool["name"].(string)
+			name = strings.TrimSpace(name)
 			if name == "" {
+				log.Printf("WARN: [responses] dropped custom tool without name")
 				continue
 			}
-			meta.CustomTools[name] = true
 			desc, _ := tool["description"].(string)
-			// 把 freeform 约定写进描述：模型必须把原始文本放进 input 字段，
-			// 否则响应侧拿不到可执行的补丁。
-			if desc != "" {
-				desc += "\n"
+			appendCustomTool(&out, used, meta, name, desc)
+		case "namespace":
+			name, _ := tool["name"].(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				log.Printf("WARN: [responses] dropped namespace tool group without name")
+				continue
 			}
-			desc += "Put the raw freeform text for this tool in the `input` argument."
-			out = append(out, map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        name,
-					"description": desc,
-					"parameters": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"input": map[string]any{"type": "string", "description": "Raw freeform tool input."},
-						},
-						"required": []any{"input"},
-					},
-				},
-			})
+			children, ok := tool["tools"].([]any)
+			if !ok || len(children) == 0 {
+				log.Printf("WARN: [responses] dropped namespace tool group %q without tools", name)
+				continue
+			}
+			desc, _ := tool["description"].(string)
+			pending = append(pending, pendingNamespace{name: name, description: desc, tools: children})
 		default:
-			// 内置工具（web_search/local_shell/mcp 等）是 Codex 默认会带的声明，
-			// 丢弃属预期行为，用 INFO 避免每个请求刷一条 WARN。
-			log.Printf("INFO: [responses] ignored unsupported tool type=%q", typ)
+			log.Printf("WARN: [responses] dropped unsupported tool type=%q (gateway cannot execute it; model will not see it)", typ)
 		}
+	}
+
+	// 默认 functions 命名空间先摊平：它和顶层工具是同一个命名空间，重名时
+	// 应以顶层声明为准，不能先让非默认命名空间占掉名字。
+	ordered := make([]pendingNamespace, 0, len(pending))
+	for _, group := range pending {
+		if normalizeNamespace(group.name) == "" {
+			ordered = append(ordered, group)
+		}
+	}
+	for _, group := range pending {
+		if normalizeNamespace(group.name) != "" {
+			ordered = append(ordered, group)
+		}
+	}
+
+	groups, added, dropped := 0, 0, 0
+	for _, group := range ordered {
+		groups++
+		ns := normalizeNamespace(group.name)
+		for _, rawChild := range group.tools {
+			child, ok := rawChild.(map[string]any)
+			if !ok {
+				dropped++
+				continue
+			}
+			typ, _ := child["type"].(string)
+			name, _ := child["name"].(string)
+			if typ == "function" {
+				// 子工具偶尔也会用 chat 嵌套形态声明 name。
+				if fname, _, _ := functionToolFields(child); fname != "" {
+					name = fname
+				}
+			}
+			name = strings.TrimSpace(name)
+			if name == "" {
+				log.Printf("WARN: [responses] dropped namespace tool namespace=%q type=%q without name", group.name, typ)
+				dropped++
+				continue
+			}
+
+			flat := name
+			if ns == "" {
+				// 默认命名空间的 name 必须原样保留：响应侧不回 namespace，
+				// Codex 会按 name 找默认命名空间里的工具。
+				if used[flat] {
+					log.Printf("INFO: [responses] skipped duplicate default-namespace tool %q", flat)
+					continue
+				}
+			} else {
+				flat = flattenToolName(ns, name)
+				flat = uniqueChatToolName(flat, used)
+				if flat == "" {
+					log.Printf("WARN: [responses] dropped namespace tool namespace=%q name=%q: no usable chat tool name", group.name, name)
+					dropped++
+					continue
+				}
+			}
+
+			childDesc, _ := child["description"].(string)
+			var params any
+			if typ == "function" {
+				// 兼容子工具也用 chat 嵌套形态声明的情况；params/desc 以
+				// functionToolFields 的结果为准。
+				_, fdesc, fparams := functionToolFields(child)
+				params = fparams
+				if fdesc != "" {
+					childDesc = fdesc
+				}
+			}
+			desc := namespacedToolDescription(ns, group.description, childDesc)
+			switch typ {
+			case "function":
+				appendFunctionTool(&out, used, flat, desc, params)
+				if ns != "" {
+					meta.ToolRefs[flat] = ToolRef{Namespace: ns, Name: name}
+				}
+				added++
+			case "custom":
+				appendCustomTool(&out, used, meta, flat, desc)
+				if ns != "" {
+					meta.ToolRefs[flat] = ToolRef{Namespace: ns, Name: name}
+				}
+				added++
+			default:
+				log.Printf("WARN: [responses] dropped unsupported namespace tool type=%q (namespace=%q name=%q)", typ, group.name, name)
+				dropped++
+			}
+		}
+	}
+	if groups > 0 {
+		log.Printf("INFO: [responses] flattened namespace tools groups=%d added=%d dropped=%d", groups, added, dropped)
 	}
 	return out
 }
 
+// functionToolFields 兼容两种 function 声明：Responses 扁平形态（name/description/
+// parameters 与 type 同级）与 chat 嵌套形态（function:{...}，部分中转/客户端会混发）。
+func functionToolFields(tool map[string]any) (name, desc string, params any) {
+	nested, _ := tool["function"].(map[string]any)
+	name, _ = tool["name"].(string)
+	desc, _ = tool["description"].(string)
+	params = tool["parameters"]
+	if name == "" && nested != nil {
+		name, _ = nested["name"].(string)
+	}
+	if desc == "" && nested != nil {
+		desc, _ = nested["description"].(string)
+	}
+	if params == nil && nested != nil {
+		params = nested["parameters"]
+	}
+	return strings.TrimSpace(name), desc, params
+}
+
+// appendFunctionTool 追加一个 chat function 工具。name 由调用方负责去重/截断。
+func appendFunctionTool(out *[]any, used map[string]bool, name, desc string, params any) {
+	fn := map[string]any{"name": name}
+	if desc != "" {
+		fn["description"] = desc
+	}
+	if params == nil {
+		params = map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	fn["parameters"] = params
+	*out = append(*out, map[string]any{"type": "function", "function": fn})
+	used[name] = true
+}
+
+// appendCustomTool 把 freeform 工具包装成「单 input 字符串参数」的 function。
+// 把 freeform 约定写进描述：模型必须把原始文本放进 input 字段，否则响应侧拿不到
+// 可执行的补丁。
+func appendCustomTool(out *[]any, used map[string]bool, meta *Meta, name, desc string) {
+	if meta.CustomTools == nil {
+		meta.CustomTools = map[string]bool{}
+	}
+	meta.CustomTools[name] = true
+	if desc != "" {
+		desc += "\n"
+	}
+	desc += "Put the raw freeform text for this tool in the `input` argument."
+	*out = append(*out, map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        name,
+			"description": desc,
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"input": map[string]any{"type": "string", "description": "Raw freeform tool input."},
+				},
+				"required": []any{"input"},
+			},
+		},
+	})
+	used[name] = true
+}
+
 // filterEchoTools 返回响应对象里要回显的工具子集：只保留本网关真正支持的
-// function / custom（其余内置工具已被丢弃，回显会让客户端误以为生效）。
+// function / custom / namespace（namespace 组里只保留能摊平的子工具；其余内置
+// 工具已被丢弃，回显会让客户端误以为生效）。
 func filterEchoTools(raw []any) []any {
 	out := make([]any, 0, len(raw))
 	for _, item := range raw {
@@ -541,6 +727,32 @@ func filterEchoTools(raw []any) []any {
 		switch typ, _ := tool["type"].(string); typ {
 		case "function", "custom":
 			out = append(out, tool)
+		case "namespace":
+			children, _ := tool["tools"].([]any)
+			kept := make([]any, 0, len(children))
+			for _, rawChild := range children {
+				child, ok := rawChild.(map[string]any)
+				if !ok {
+					continue
+				}
+				ctyp, _ := child["type"].(string)
+				cname, _ := child["name"].(string)
+				if strings.TrimSpace(cname) == "" {
+					continue
+				}
+				if ctyp == "function" || ctyp == "custom" {
+					kept = append(kept, child)
+				}
+			}
+			if len(kept) == 0 {
+				continue
+			}
+			cp := make(map[string]any, len(tool))
+			for k, v := range tool {
+				cp[k] = v
+			}
+			cp["tools"] = kept
+			out = append(out, cp)
 		}
 	}
 	return out
@@ -556,6 +768,9 @@ func echoToolChoice(v any) any {
 		}
 		return "auto"
 	case map[string]any:
+		if typ, _ := tc["type"].(string); typ == "namespace" {
+			return "auto"
+		}
 		name, _ := tc["name"].(string)
 		if name == "" {
 			if fn, ok := tc["function"].(map[string]any); ok {
@@ -564,10 +779,14 @@ func echoToolChoice(v any) any {
 		}
 		if name != "" {
 			typ, _ := tc["type"].(string)
-			if typ != "custom" {
+			if typ != "custom" && typ != "function" {
 				typ = "function"
 			}
-			return map[string]any{"type": typ, "name": name}
+			out := map[string]any{"type": typ, "name": name}
+			if ns, _ := tc["namespace"].(string); strings.TrimSpace(ns) != "" {
+				out["namespace"] = strings.TrimSpace(ns)
+			}
+			return out
 		}
 		return "auto"
 	default:
@@ -576,8 +795,8 @@ func echoToolChoice(v any) any {
 }
 
 // convertToolChoice 归一 tool_choice。tools 为空时返回 nil（上游对空工具集带
-// tool_choice 会 400）。
-func convertToolChoice(v any, tools []any) any {
+// tool_choice 会 400）。namespace 子工具要按 (namespace, name) 换成 chat 的扁平名。
+func convertToolChoice(v any, tools []any, meta *Meta) any {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -592,19 +811,176 @@ func convertToolChoice(v any, tools []any) any {
 			return "auto"
 		}
 	case map[string]any:
+		if typ, _ := tc["type"].(string); typ == "namespace" {
+			log.Printf("WARN: [responses] tool_choice targeting a whole namespace is not supported; using auto")
+			return "auto"
+		}
 		name, _ := tc["name"].(string)
 		if name == "" {
 			if fn, ok := tc["function"].(map[string]any); ok {
 				name, _ = fn["name"].(string)
 			}
 		}
-		if name != "" {
-			return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return "auto"
 		}
-		return "auto"
+		// 已经是本次声明的扁平名：直接用（客户端可能同时带了 stale namespace）。
+		if meta != nil {
+			if _, ok := meta.ToolRefs[name]; ok {
+				return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			}
+		}
+		flat := name
+		if meta != nil {
+			ns, _ := tc["namespace"].(string)
+			flat = meta.FlatNameFor(ns, name)
+		}
+		if flat == "" {
+			return "auto"
+		}
+		return map[string]any{"type": "function", "function": map[string]any{"name": flat}}
 	default:
 		return "auto"
 	}
+}
+
+// ResolveTool 把 chat 侧扁平工具名还原成 Responses 的 (name, namespace)。
+func (m Meta) ResolveTool(flat string) (string, string) {
+	if ref, ok := m.ToolRefs[flat]; ok {
+		return ref.Name, ref.Namespace
+	}
+	return flat, ""
+}
+
+// FlatNameFor 把 Responses 的 (namespace, name) 映射成本次请求实际使用的
+// chat 工具名。优先查本次 tools 声明里算出的名字（可能被截断/加过后缀）；
+// 没有声明时按同一规则确定性重建，供历史回传使用。
+func (m Meta) FlatNameFor(namespace, name string) string {
+	name = strings.TrimSpace(name)
+	ns := normalizeNamespace(namespace)
+	if ns == "" {
+		return name
+	}
+	for flat, ref := range m.ToolRefs {
+		if ref.Namespace == ns && ref.Name == name {
+			return flat
+		}
+	}
+	return flattenToolName(ns, name)
+}
+
+// rememberToolRef 在历史里第一次见到某个 namespace 调用、且本次 tools 声明
+// 没覆盖到它时，补一条映射；这样响应侧仍能把模型调用还原成 name + namespace。
+func (m *Meta) rememberToolRef(namespace, name, flat string) {
+	ns := normalizeNamespace(namespace)
+	if ns == "" || flat == "" || flat == name {
+		return
+	}
+	if m.ToolRefs == nil {
+		m.ToolRefs = map[string]ToolRef{}
+	}
+	if _, ok := m.ToolRefs[flat]; !ok {
+		m.ToolRefs[flat] = ToolRef{Namespace: ns, Name: strings.TrimSpace(name)}
+	}
+}
+
+// normalizeNamespace 把 Codex 的默认命名空间归一成空串；默认命名空间的工具
+// 在 chat 侧用裸名，响应侧也不回 namespace。
+func normalizeNamespace(namespace string) string {
+	ns := strings.TrimSpace(namespace)
+	if ns == "" || ns == defaultFunctionNamespace {
+		return ""
+	}
+	return ns
+}
+
+// flattenToolName 生成 namespace 子工具的 chat 侧名字。子工具名若已带命名空间
+// 前缀（Codex 的 MCP 工具常见），不重复加前缀。
+func flattenToolName(namespace, name string) string {
+	ns := normalizeNamespace(namespace)
+	name = strings.TrimSpace(name)
+	if ns == "" || name == "" {
+		return name
+	}
+	for _, sep := range []string{chatToolNameSep, "__", "_"} {
+		if strings.HasPrefix(name, ns+sep) {
+			return capChatToolName(sanitizeChatToolName(name))
+		}
+	}
+	return capChatToolName(sanitizeChatToolName(ns + chatToolNameSep + name))
+}
+
+// sanitizeChatToolName 把上游可能不接受的字符替换成下划线。保留下划线、短横线、
+// 点号和冒号：Codex 自己的工具名与上游 DSML 判定都接受这些字符。
+func sanitizeChatToolName(name string) string {
+	if name == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '_', r == '-', r == '.', r == ':':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+// capChatToolName 把超过 64 字符的工具名截断，并追加 fnv32 hash 保证确定性去重。
+func capChatToolName(name string) string {
+	if len(name) <= maxChatToolNameLen {
+		return name
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	suffix := fmt.Sprintf("_%08x", h.Sum32())
+	keep := maxChatToolNameLen - len(suffix)
+	if keep > len(name) {
+		keep = len(name)
+	}
+	for keep > 0 && name[keep]&0xC0 == 0x80 {
+		keep--
+	}
+	return name[:keep] + suffix
+}
+
+// uniqueChatToolName 在已占用的名字集合里找一个可用的扁平名：先试原名，冲突
+// 时依次尝试 _2、_3…；每次都重新截断，保证结果仍不超过 64 字符。
+func uniqueChatToolName(base string, used map[string]bool) string {
+	candidate := capChatToolName(base)
+	if candidate == "" {
+		return ""
+	}
+	if !used[candidate] {
+		return candidate
+	}
+	for i := 2; i <= 99; i++ {
+		candidate = capChatToolName(fmt.Sprintf("%s_%d", base, i))
+		if !used[candidate] {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// namespacedToolDescription 把 namespace 组的说明带进子工具描述。Codex 自动生成
+// 的泛化说明（Tools in the <ns> namespace.）不重复加，避免每个子工具都背一遍。
+func namespacedToolDescription(namespace, groupDesc, childDesc string) string {
+	ns := strings.TrimSpace(namespace)
+	groupDesc = strings.TrimSpace(groupDesc)
+	childDesc = strings.TrimSpace(childDesc)
+	if ns == "" || groupDesc == "" || groupDesc == fmt.Sprintf("Tools in the %s namespace.", ns) {
+		return childDesc
+	}
+	if childDesc == "" {
+		return fmt.Sprintf("Namespace %q: %s", ns, groupDesc)
+	}
+	return fmt.Sprintf("Namespace %q: %s\n\n%s", ns, groupDesc, childDesc)
 }
 
 // convertTextFormat 把 text.format 映射成 chat 的 response_format。

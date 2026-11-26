@@ -11,6 +11,7 @@ func FuzzConvertRequest(f *testing.F) {
 	f.Add([]byte(`{"model":"m","input":"hi"}`))
 	f.Add([]byte(`{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"x"}]}],"tools":[{"type":"function","name":"f"}]}`))
 	f.Add([]byte(`{"model":"m","input":"x","tools":[{"type":"custom","name":"apply_patch"}]}`))
+	f.Add([]byte(`{"model":"m","input":"x","tools":[{"type":"namespace","name":"container","tools":[{"type":"function","name":"run_shell","parameters":{"type":"object"}}]}]}`))
 	f.Add([]byte(`{"model":"m","input":"x","previous_response_id":"resp_1"}`))
 	f.Add([]byte(`not json`))
 

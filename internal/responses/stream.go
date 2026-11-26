@@ -228,7 +228,8 @@ func (t *Translator) Finish(streamErr error) error {
 				"output_index": it.index,
 				"arguments":    args,
 			})
-			item := functionCallItem(it.id, it.callID, it.name, args, status)
+			itemName, namespace := t.meta.ResolveTool(it.name)
+			item := functionCallItem(it.id, it.callID, itemName, namespace, args, status)
 			t.emit("response.output_item.done", map[string]any{"output_index": it.index, "item": item})
 			output = append(output, item)
 		case "custom_tool_call":
@@ -255,7 +256,8 @@ func (t *Translator) Finish(streamErr error) error {
 				"output_index": it.index,
 				"input":        input,
 			})
-			item := customToolCallItem(it.id, it.callID, it.name, input, status)
+			itemName, namespace := t.meta.ResolveTool(it.name)
+			item := customToolCallItem(it.id, it.callID, itemName, namespace, input, status)
 			t.emit("response.output_item.done", map[string]any{"output_index": it.index, "item": item})
 			output = append(output, item)
 		}
@@ -545,10 +547,11 @@ func (t *Translator) emitItemAdded(it *streamItem) {
 		return
 	}
 	var added map[string]any
+	itemName, namespace := t.meta.ResolveTool(it.name)
 	if it.kind == "custom_tool_call" {
-		added = customToolCallItem(it.id, it.callID, it.name, "", "in_progress")
+		added = customToolCallItem(it.id, it.callID, itemName, namespace, "", "in_progress")
 	} else {
-		added = functionCallItem(it.id, it.callID, it.name, "", "in_progress")
+		added = functionCallItem(it.id, it.callID, itemName, namespace, "", "in_progress")
 	}
 	t.emit("response.output_item.added", map[string]any{"output_index": it.index, "item": added})
 }
@@ -625,9 +628,11 @@ func (t *Translator) currentOutput() []any {
 		case "message":
 			out = append(out, messageItem(it.id, it.text.String(), "incomplete"))
 		case "function_call":
-			out = append(out, functionCallItem(it.id, it.callID, it.name, it.text.String(), "incomplete"))
+			itemName, namespace := t.meta.ResolveTool(it.name)
+			out = append(out, functionCallItem(it.id, it.callID, itemName, namespace, it.text.String(), "incomplete"))
 		case "custom_tool_call":
-			out = append(out, customToolCallItem(it.id, it.callID, it.name, customInputFromArguments(it.text.String()), "incomplete"))
+			itemName, namespace := t.meta.ResolveTool(it.name)
+			out = append(out, customToolCallItem(it.id, it.callID, itemName, namespace, customInputFromArguments(it.text.String()), "incomplete"))
 		}
 	}
 	return out

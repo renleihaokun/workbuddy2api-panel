@@ -48,8 +48,10 @@ func messageItem(id, text, status string) map[string]any {
 	}
 }
 
-// functionCallItem 构造一个 function_call output item。
-func functionCallItem(id, callID, name, arguments, status string) map[string]any {
+// functionCallItem 构造一个 function_call output item。namespace 非空时写入
+// namespace 字段：Codex 按 (namespace, name) 路由命名空间工具，缺了它就只能
+// 落到默认 functions 命名空间，表现为「unsupported call」。
+func functionCallItem(id, callID, name, namespace, arguments, status string) map[string]any {
 	item := map[string]any{
 		"id":        id,
 		"type":      "function_call",
@@ -58,6 +60,9 @@ func functionCallItem(id, callID, name, arguments, status string) map[string]any
 		"name":      name,
 		"arguments": arguments,
 	}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
 	return item
 }
 
@@ -65,8 +70,8 @@ func functionCallItem(id, callID, name, arguments, status string) map[string]any
 //
 // Codex 的 apply_patch 以 type=custom 声明，只接受 custom_tool_call + input
 // 字符串；返回 function_call 会被判为「不兼容 payload」。
-func customToolCallItem(id, callID, name, input, status string) map[string]any {
-	return map[string]any{
+func customToolCallItem(id, callID, name, namespace, input, status string) map[string]any {
+	item := map[string]any{
 		"id":      id,
 		"type":    "custom_tool_call",
 		"status":  status,
@@ -74,6 +79,10 @@ func customToolCallItem(id, callID, name, input, status string) map[string]any {
 		"name":    name,
 		"input":   input,
 	}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
+	return item
 }
 
 // customInputFromArguments 从 chat 工具调用的 arguments 里取 freeform 文本。
@@ -194,7 +203,7 @@ func FromChatCompletion(chat map[string]any, meta Meta) map[string]any {
 				continue
 			}
 			fn, _ := call["function"].(map[string]any)
-			name, _ := fn["name"].(string)
+			flat, _ := fn["name"].(string)
 			args, _ := fn["arguments"].(string)
 			callID, _ := call["id"].(string)
 			if callID == "" {
@@ -207,10 +216,13 @@ func FromChatCompletion(chat map[string]any, meta Meta) map[string]any {
 				status = "incomplete"
 				incomplete = nil
 			}
-			if meta.CustomTools[name] {
-				output = append(output, customToolCallItem(NewID("ctc"), callID, name, customInputFromArguments(args), itemStatusForCall))
+			// chat 侧看到的是摊平名；Responses 侧要回原始 (namespace, name)，
+			// Codex 才能按命名空间路由。
+			name, namespace := meta.ResolveTool(flat)
+			if meta.CustomTools[flat] {
+				output = append(output, customToolCallItem(NewID("ctc"), callID, name, namespace, customInputFromArguments(args), itemStatusForCall))
 			} else {
-				output = append(output, functionCallItem(NewID("fc"), callID, name, args, itemStatusForCall))
+				output = append(output, functionCallItem(NewID("fc"), callID, name, namespace, args, itemStatusForCall))
 			}
 		}
 	}

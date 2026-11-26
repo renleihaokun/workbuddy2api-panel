@@ -20,6 +20,31 @@ const sseToolCall = `data: {"id":"c1","object":"chat.completion.chunk","choices"
 	`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"[\"ls\"]}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
 	"data: [DONE]\n\n"
 
+// sseNamespacedToolCall 上游按 chat 扁平名调用 namespace 子工具；网关要把它
+// 还原成 name=run_shell + namespace=container。
+const sseNamespacedToolCall = `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_ns","type":"function","function":{"name":"container.run_shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}` + "\n\n" +
+	`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n" +
+	"data: [DONE]\n\n"
+
+// newCapturingUpstream 与 newFakeUpstream 类似，但把出站 chat body 抓出来，
+// 供「namespace 是否真的摊平」的端到端断言使用。
+func newCapturingUpstream(t *testing.T, captured *string, body string) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			*captured = string(raw)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
 // doResponses 发起一次 /v1/responses 请求。
 func doResponses(t *testing.T, h *Handler, apiKey, body string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -205,6 +230,97 @@ func TestResponsesNonStreamToolCall(t *testing.T) {
 	}
 	if item["arguments"] != `{"command":["ls"]}` {
 		t.Errorf("arguments=%v", item["arguments"])
+	}
+}
+
+// TestResponsesNamespaceToolsEndToEnd namespace 工具端到端：出站 chat body 必须
+// 是摊平后的 container.run_shell，响应 output item 必须是 name=run_shell +
+// namespace=container。
+func TestResponsesNamespaceToolsEndToEnd(t *testing.T) {
+	var sent string
+	up := newCapturingUpstream(t, &sent, sseNamespacedToolCall)
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	body := `{"model":"glm-5.2","input":"run","stream":false,"tools":[{"type":"namespace","name":"container","description":"Shell tools","tools":[{"type":"function","name":"run_shell","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}]}]}`
+	rec := doResponses(t, h, "", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var chat map[string]any
+	if err := json.Unmarshal([]byte(sent), &chat); err != nil {
+		t.Fatalf("outbound chat body is not JSON: %v (%s)", err, sent)
+	}
+	tools, _ := chat["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("outbound tools len=%d want 1 (namespace 应摊平成 1 个 function): %v", len(tools), chat["tools"])
+	}
+	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "container.run_shell" {
+		t.Fatalf("outbound tool name=%v want container.run_shell", fn["name"])
+	}
+	if desc, _ := fn["description"].(string); !strings.Contains(desc, "Shell tools") {
+		t.Errorf("outbound description lost namespace context: %q", desc)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid response JSON: %v (%s)", err, rec.Body)
+	}
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output len=%d want 1", len(output))
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "function_call" || item["name"] != "run_shell" || item["namespace"] != "container" {
+		t.Fatalf("output item=%v want name=run_shell namespace=container", item)
+	}
+	if item["arguments"] != `{"command":"pwd"}` {
+		t.Errorf("arguments=%v", item["arguments"])
+	}
+}
+
+// TestResponsesNamespacedStreamToolCall 流式端到端：added/done/completed 三处
+// 都要带同一个 name + namespace。
+func TestResponsesNamespacedStreamToolCall(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseNamespacedToolCall, true })
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	body := `{"model":"glm-5.2","input":"run","stream":true,"tools":[{"type":"namespace","name":"container","tools":[{"type":"function","name":"run_shell","parameters":{"type":"object"}}]}]}`
+	rec := doResponses(t, h, "", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	events := responsesEvents(t, rec.Body.String())
+	var added, done map[string]any
+	var completed map[string]any
+	for _, e := range events {
+		switch e["type"] {
+		case "response.output_item.added":
+			added, _ = e["item"].(map[string]any)
+		case "response.output_item.done":
+			done, _ = e["item"].(map[string]any)
+		case "response.completed":
+			completed, _ = e["response"].(map[string]any)
+		}
+	}
+	if added["name"] != "run_shell" || added["namespace"] != "container" {
+		t.Fatalf("added item=%v", added)
+	}
+	if done["name"] != "run_shell" || done["namespace"] != "container" {
+		t.Fatalf("done item=%v", done)
+	}
+	out, _ := completed["output"].([]any)
+	if len(out) != 1 {
+		t.Fatalf("completed output len=%d", len(out))
+	}
+	item, _ := out[0].(map[string]any)
+	if item["name"] != "run_shell" || item["namespace"] != "container" {
+		t.Fatalf("completed item=%v", item)
 	}
 }
 

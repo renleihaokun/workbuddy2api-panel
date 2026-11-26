@@ -1,7 +1,10 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"log"
 	"strings"
 	"testing"
 )
@@ -487,5 +490,319 @@ func TestConvertDropsUnsupportedToolTypes(t *testing.T) {
 	}
 	if len(meta.CustomTools) != 0 {
 		t.Errorf("web_search/local_shell must not be treated as custom tools")
+	}
+}
+
+// toolNamesOf 取 chat tools 里每个 function 的 name，保持顺序。
+func toolNamesOf(t *testing.T, tools []any) []string {
+	t.Helper()
+	out := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		out = append(out, name)
+	}
+	return out
+}
+
+// TestConvertNamespaceToolsFlattened namespace 里的 function/custom 都要摊平成
+// 普通 chat function，原始身份记进 Meta.ToolRefs；回显保留 namespace 组。
+func TestConvertNamespaceToolsFlattened(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"namespace","name":"container","description":"Shell tools","tools":[
+			{"type":"function","name":"run_shell","description":"run a shell","parameters":{"type":"object","properties":{"command":{"type":"string"}}}},
+			{"type":"custom","name":"apply_patch","description":"apply a patch","format":{"type":"grammar","syntax":"lark","definition":"x"}}
+		]}]}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	chat := decodeChat(t, raw)
+	tools, _ := chat["tools"].([]any)
+	names := toolNamesOf(t, tools)
+	if len(names) != 2 || names[0] != "container.run_shell" || names[1] != "container.apply_patch" {
+		t.Fatalf("chat tool names=%v want [container.run_shell container.apply_patch]", names)
+	}
+	if !meta.CustomTools["container.apply_patch"] {
+		t.Errorf("namespaced custom tool not recorded: %v", meta.CustomTools)
+	}
+	ref, ok := meta.ToolRefs["container.run_shell"]
+	if !ok || ref.Namespace != "container" || ref.Name != "run_shell" {
+		t.Fatalf("ToolRefs[container.run_shell]=%+v ok=%v", ref, ok)
+	}
+	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
+	if desc, _ := fn["description"].(string); !strings.Contains(desc, "Shell tools") {
+		t.Errorf("namespace description not prefixed: %q", desc)
+	}
+	if len(meta.Tools) != 1 {
+		t.Fatalf("echo tools len=%d want 1 (namespace 组应保留)", len(meta.Tools))
+	}
+	echo, _ := meta.Tools[0].(map[string]any)
+	if echo["type"] != "namespace" {
+		t.Errorf("echo tool type=%v want namespace", echo["type"])
+	}
+}
+
+// TestConvertDefaultNamespaceBare 默认 functions 命名空间的子工具用裸名；
+// 与顶层工具重名时按重复声明跳过，不加后缀。
+func TestConvertDefaultNamespaceBare(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"function","name":"shell","parameters":{"type":"object"}},
+		{"type":"namespace","name":"functions","tools":[
+			{"type":"function","name":"shell"},
+			{"type":"function","name":"read_file"}
+		]}]}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	chat := decodeChat(t, raw)
+	names := toolNamesOf(t, chat["tools"].([]any))
+	if len(names) != 2 || names[0] != "shell" || names[1] != "read_file" {
+		t.Fatalf("chat tool names=%v want [shell read_file]", names)
+	}
+	if len(meta.ToolRefs) != 0 {
+		t.Errorf("default namespace tools must not need ToolRefs: %v", meta.ToolRefs)
+	}
+}
+
+// TestConvertNamespaceHistory 历史里的 namespace 调用要还原成本次声明算出的
+// 扁平名；没有 tools 声明时也要能重建，并记住映射供响应侧使用。
+func TestConvertNamespaceHistory(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"type":"function_call","call_id":"c1","name":"run_shell","namespace":"container","arguments":"{\"command\":\"pwd\"}"},
+		{"type":"function_call_output","call_id":"c1","output":"/tmp"},
+		{"type":"custom_tool_call","call_id":"c2","name":"apply_patch","namespace":"container","input":"*** Begin Patch\n*** End Patch"},
+		{"type":"custom_tool_call_output","call_id":"c2","output":"ok"}
+	]}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	chat := decodeChat(t, raw)
+	msgs := messagesOf(t, chat)
+	if len(msgs) < 4 {
+		t.Fatalf("messages len=%d want 4 (call/output/call/output)", len(msgs))
+	}
+	firstCall, _ := msgAt(t, msgs, 0)["tool_calls"].([]any)
+	if len(firstCall) != 1 {
+		t.Fatalf("first assistant tool_calls=%d want 1", len(firstCall))
+	}
+	firstFn, _ := firstCall[0].(map[string]any)["function"].(map[string]any)
+	if firstFn["name"] != "container.run_shell" {
+		t.Errorf("first tool name=%v want container.run_shell", firstFn["name"])
+	}
+	secondCall, _ := msgAt(t, msgs, 2)["tool_calls"].([]any)
+	if len(secondCall) != 1 {
+		t.Fatalf("second assistant tool_calls=%d want 1", len(secondCall))
+	}
+	secondFn, _ := secondCall[0].(map[string]any)["function"].(map[string]any)
+	if secondFn["name"] != "container.apply_patch" {
+		t.Errorf("second tool name=%v want container.apply_patch", secondFn["name"])
+	}
+	if !meta.CustomTools["container.apply_patch"] {
+		t.Errorf("history custom call not recorded under flat name: %v", meta.CustomTools)
+	}
+	ref, ok := meta.ToolRefs["container.run_shell"]
+	if !ok || ref.Namespace != "container" || ref.Name != "run_shell" {
+		t.Fatalf("history ToolRefs=%+v ok=%v", ref, ok)
+	}
+}
+
+// TestConvertDefaultNamespaceHistory 历史里 namespace=functions 的调用保持裸名。
+func TestConvertDefaultNamespaceHistory(t *testing.T) {
+	body := `{"model":"m","input":[
+		{"type":"function_call","call_id":"c1","name":"run_shell","namespace":"functions","arguments":"{}"}
+	]}`
+	raw, _, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	chat := decodeChat(t, raw)
+	assistant := msgAt(t, messagesOf(t, chat), 0)
+	tcs, _ := assistant["tool_calls"].([]any)
+	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "run_shell" {
+		t.Errorf("default namespace history name=%v want run_shell", fn["name"])
+	}
+}
+
+// TestConvertNamespaceToolChoice tool_choice 带 namespace 时要换成 chat 扁平名，
+// 回显保留原始 namespace。
+func TestConvertNamespaceToolChoice(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"namespace","name":"container","tools":[
+			{"type":"function","name":"run_shell","parameters":{"type":"object"}}
+		]}],
+		"tool_choice":{"type":"function","name":"run_shell","namespace":"container"}}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	chat := decodeChat(t, raw)
+	tc, _ := chat["tool_choice"].(map[string]any)
+	fn, _ := tc["function"].(map[string]any)
+	if fn["name"] != "container.run_shell" {
+		t.Fatalf("chat tool_choice name=%v want container.run_shell", fn["name"])
+	}
+	echo, _ := meta.ToolChoice.(map[string]any)
+	if echo["namespace"] != "container" || echo["name"] != "run_shell" {
+		t.Fatalf("tool_choice echo=%v", meta.ToolChoice)
+	}
+
+	// 客户端直接给扁平名（没有 namespace）也要能用。
+	body2 := `{"model":"m","input":"x","tools":[
+		{"type":"namespace","name":"container","tools":[
+			{"type":"function","name":"run_shell","parameters":{"type":"object"}}
+		]}],
+		"tool_choice":{"type":"function","name":"container.run_shell"}}`
+	raw2, _, err := ConvertRequest([]byte(body2))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tc2, _ := decodeChat(t, raw2)["tool_choice"].(map[string]any)
+	fn2, _ := tc2["function"].(map[string]any)
+	if fn2["name"] != "container.run_shell" {
+		t.Errorf("flat tool_choice name=%v", fn2["name"])
+	}
+}
+
+// TestConvertNamespaceCollision 顶层工具已占用扁平名时，namespace 子工具加后缀，
+// 不丢能力也不覆盖顶层工具。
+func TestConvertNamespaceCollision(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"function","name":"container.run_shell","parameters":{"type":"object"}},
+		{"type":"namespace","name":"container","tools":[
+			{"type":"function","name":"run_shell","parameters":{"type":"object"}}
+		]}]}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	chat := decodeChat(t, raw)
+	names := toolNamesOf(t, chat["tools"].([]any))
+	if len(names) != 2 || names[0] != "container.run_shell" || names[1] != "container.run_shell_2" {
+		t.Fatalf("chat tool names=%v want [container.run_shell container.run_shell_2]", names)
+	}
+	ref, ok := meta.ToolRefs["container.run_shell_2"]
+	if !ok || ref.Namespace != "container" || ref.Name != "run_shell" {
+		t.Fatalf("collision ToolRefs=%+v ok=%v", ref, ok)
+	}
+}
+
+// TestConvertNamespaceNameCap 超长扁平名要确定性截断到 64 字符，映射仍可还原。
+func TestConvertNamespaceNameCap(t *testing.T) {
+	ns := "mcp__very_long_namespace_name_for_testing_cap"
+	toolName := strings.Repeat("x", 40)
+	body := fmt.Sprintf(`{"model":"m","input":"x","tools":[
+		{"type":"namespace","name":%q,"tools":[
+			{"type":"function","name":%q,"parameters":{"type":"object"}}
+		]}]}`, ns, toolName)
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	names := toolNamesOf(t, decodeChat(t, raw)["tools"].([]any))
+	if len(names) != 1 {
+		t.Fatalf("tools len=%d", len(names))
+	}
+	flat := names[0]
+	if len(flat) != maxChatToolNameLen {
+		t.Fatalf("flat name len=%d want %d (%q)", len(flat), maxChatToolNameLen, flat)
+	}
+	ref, ok := meta.ToolRefs[flat]
+	if !ok || ref.Namespace != ns || ref.Name != toolName {
+		t.Fatalf("capped ToolRefs=%+v ok=%v", ref, ok)
+	}
+	// 同一输入必须得到同一个截断名。
+	raw2, _, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if names2 := toolNamesOf(t, decodeChat(t, raw2)["tools"].([]any)); len(names2) != 1 || names2[0] != flat {
+		t.Fatalf("capped name not deterministic: %v vs %q", names2, flat)
+	}
+}
+
+// TestConvertNamespaceLogs namespace 摊平要有 INFO 汇总；web_search 必须 WARN，
+// 不能再出现旧的 namespace INFO 丢弃日志。
+func TestConvertNamespaceLogs(t *testing.T) {
+	old := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"web_search"},
+		{"type":"namespace","name":"container","tools":[
+			{"type":"function","name":"run_shell","parameters":{"type":"object"}}
+		]}]}`
+	if _, _, err := ConvertRequest([]byte(body)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "WARN") || !strings.Contains(out, "web_search") {
+		t.Fatalf("web_search should be dropped at WARN, got: %s", out)
+	}
+	if !strings.Contains(out, "flattened namespace tools") || !strings.Contains(out, "groups=1") {
+		t.Fatalf("missing namespace flatten INFO summary: %s", out)
+	}
+	if strings.Contains(out, `ignored unsupported tool type="namespace"`) {
+		t.Fatalf("namespace should not be logged as ignored: %s", out)
+	}
+}
+
+// TestConvertNamespaceMalformedContinues 畸形 namespace 只丢自己，不影响同请求
+// 里其他可摊平的子工具。
+func TestConvertNamespaceMalformedContinues(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"namespace"},
+		{"type":"namespace","name":"empty","tools":[]},
+		{"type":"namespace","name":"bad","tools":"nope"},
+		{"type":"namespace","name":"mixed","tools":[
+			{"type":"function"},
+			{"type":"mystery","name":"x"},
+			{"type":"function","name":"ok","parameters":{"type":"object"}}
+		]}]}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("malformed namespace must not reject the request: %v", err)
+	}
+	names := toolNamesOf(t, decodeChat(t, raw)["tools"].([]any))
+	if len(names) != 1 || names[0] != "mixed.ok" {
+		t.Fatalf("chat tool names=%v want [mixed.ok]", names)
+	}
+	if _, ok := meta.ToolRefs["mixed.ok"]; !ok {
+		t.Errorf("mixed.ok not recorded in ToolRefs: %v", meta.ToolRefs)
+	}
+}
+
+// TestConvertEchoToolsIncludesNamespace namespace 组属于受支持工具，回显要保留，
+// 但组内不支持的类型/无名字条目要过滤掉。
+func TestConvertEchoToolsIncludesNamespace(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"namespace","name":"container","tools":[
+			{"type":"function","name":"run_shell"},
+			{"type":"mystery","name":"x"},
+			{"type":"custom"}
+		]},
+		{"type":"web_search"}
+	]}`
+	_, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(meta.Tools) != 1 {
+		t.Fatalf("echo tools len=%d want 1: %v", len(meta.Tools), meta.Tools)
+	}
+	group, _ := meta.Tools[0].(map[string]any)
+	children, _ := group["tools"].([]any)
+	if len(children) != 1 {
+		t.Fatalf("echo namespace children=%d want 1: %v", len(children), children)
+	}
+	child, _ := children[0].(map[string]any)
+	if child["name"] != "run_shell" {
+		t.Errorf("echo child=%v", child)
 	}
 }

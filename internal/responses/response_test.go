@@ -1,6 +1,9 @@
 package responses
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // chatTextResponse 构造一个纯文本的 chat.completion 聚合结果。
 func chatTextResponse() map[string]any {
@@ -274,5 +277,108 @@ func TestBuildResponseEcho(t *testing.T) {
 	}
 	if tools, _ := resp["tools"].([]any); len(tools) != 1 {
 		t.Errorf("tools=%v", resp["tools"])
+	}
+}
+
+// TestFromChatCompletionNamespacedToolCalls chat 侧的扁平名要还原成原始
+// (namespace, name)，Codex 才能按命名空间路由。
+func TestFromChatCompletionNamespacedToolCalls(t *testing.T) {
+	chat := map[string]any{"choices": []any{map[string]any{
+		"message": map[string]any{
+			"role": "assistant",
+			"tool_calls": []any{
+				map[string]any{
+					"id": "call_1", "type": "function",
+					"function": map[string]any{"name": "container.run_shell", "arguments": `{"command":"pwd"}`},
+				},
+				map[string]any{
+					"id": "call_2", "type": "function",
+					"function": map[string]any{"name": "container.apply_patch", "arguments": `{"input":"patch"}`},
+				},
+			},
+		},
+		"finish_reason": "tool_calls",
+	}}}
+	meta := Meta{
+		Model:       "m",
+		CustomTools: map[string]bool{"container.apply_patch": true},
+		ToolRefs: map[string]ToolRef{
+			"container.run_shell":   {Namespace: "container", Name: "run_shell"},
+			"container.apply_patch": {Namespace: "container", Name: "apply_patch"},
+		},
+	}
+	resp := FromChatCompletion(chat, meta)
+	out := outputOf(t, resp)
+	if len(out) != 2 {
+		t.Fatalf("output len=%d want 2", len(out))
+	}
+	first, _ := out[0].(map[string]any)
+	if first["type"] != "function_call" || first["name"] != "run_shell" || first["namespace"] != "container" {
+		t.Fatalf("first item=%v", first)
+	}
+	second, _ := out[1].(map[string]any)
+	if second["type"] != "custom_tool_call" || second["name"] != "apply_patch" || second["namespace"] != "container" {
+		t.Fatalf("second item=%v", second)
+	}
+	if _, leaked := first["input"]; leaked {
+		t.Errorf("function_call must not carry input: %v", first)
+	}
+}
+
+// TestNamespaceToolRoundTrip 完整回环：namespace 工具摊平 → 模型用扁平名调用 →
+// 响应回 name + namespace → 下一轮历史再还原成同一个扁平名。
+func TestNamespaceToolRoundTrip(t *testing.T) {
+	toolsJSON := `{"type":"namespace","name":"container","description":"Shell tools","tools":[` +
+		`{"type":"function","name":"run_shell","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}]}`
+	body1 := `{"model":"m","input":"run pwd","tools":[` + toolsJSON + `]}`
+	_, meta, err := ConvertRequest([]byte(body1))
+	if err != nil {
+		t.Fatalf("first convert: %v", err)
+	}
+	flat := meta.FlatNameFor("container", "run_shell")
+	if flat != "container.run_shell" {
+		t.Fatalf("flat name=%q want container.run_shell", flat)
+	}
+
+	chat := map[string]any{"choices": []any{map[string]any{
+		"message": map[string]any{
+			"role": "assistant",
+			"tool_calls": []any{map[string]any{
+				"id": "call_1", "type": "function",
+				"function": map[string]any{"name": flat, "arguments": `{"command":"pwd"}`},
+			}},
+		},
+		"finish_reason": "tool_calls",
+	}}}
+	resp := FromChatCompletion(chat, meta)
+	out := outputOf(t, resp)
+	if len(out) != 1 {
+		t.Fatalf("output len=%d", len(out))
+	}
+	item, _ := out[0].(map[string]any)
+	if item["name"] != "run_shell" || item["namespace"] != "container" {
+		t.Fatalf("response item=%v (want name=run_shell namespace=container)", item)
+	}
+	itemJSON, err := json.Marshal(item)
+	if err != nil {
+		t.Fatalf("marshal item: %v", err)
+	}
+
+	// 下一轮：把模型输出 item 原样放进 input，再带 call output。
+	body2 := `{"model":"m","input":[` + string(itemJSON) +
+		`,{"type":"function_call_output","call_id":"call_1","output":"/tmp"}],"tools":[` + toolsJSON + `]}`
+	raw2, _, err := ConvertRequest([]byte(body2))
+	if err != nil {
+		t.Fatalf("second convert: %v", err)
+	}
+	chat2 := decodeChat(t, raw2)
+	assistant := msgAt(t, messagesOf(t, chat2), 0)
+	tcs, _ := assistant["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("assistant tool_calls=%d want 1", len(tcs))
+	}
+	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != flat {
+		t.Errorf("history tool name=%v want %q (namespace 回传没对上)", fn["name"], flat)
 	}
 }
