@@ -54,6 +54,7 @@
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
+    "identity_mode": "",
     "user_agent": "",
     "client_version": "",
     "cli_version": "",
@@ -105,7 +106,9 @@
     "cost_explore_interval": "30m",
     "credit_floor": 100,
     "cross_domain_fallback": false,
-    "cross_domain_model_fallback": false
+    "cross_domain_model_fallback": false,
+    "verify_session_on_401": true,
+    "session_verify_interval": "60s"
   },
   "session_sticky": {
     "enabled": true,

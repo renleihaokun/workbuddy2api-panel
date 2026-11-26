@@ -40,7 +40,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
+      # ubuntu runner 自带 node：面板 JS 冒烟 + 文档契约检查。
+      - run: node scripts/check-docs.js
+      - run: bash -n login.sh signin.sh credit.sh deploy-wb2api.sh
       # -race：pool/scheduler/auth 的并发路径只有 race detector 才抓得到（本地 Windows
       # 无 CGO 跑不了，CI 的 gcc 环境是唯一常规回归口）。
       - run: go test -race ./...
@@ -95,11 +97,11 @@ jobs:
           case "${{ matrix.goos }}" in
             windows)
               NAME="wb2api-panel-v${V}-windows-amd64.zip"
-              zip -q "$NAME" wb2api.exe config.example.json README.md
+              zip -q "$NAME" wb2api.exe config.example.json README.md deploy-wb2api.sh
               ;;
             *)
               NAME="wb2api-panel-v${V}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
-              tar czf "$NAME" wb2api config.example.json README.md
+              tar czf "$NAME" wb2api config.example.json README.md deploy-wb2api.sh
               ;;
           esac
           echo "name=$NAME" >> "$GITHUB_ENV"

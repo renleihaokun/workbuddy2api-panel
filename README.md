@@ -146,7 +146,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 
 ### 本 fork 的提交（相对基线 `73a7560`）
 
-共 19 个提交（`git log --oneline 73a7560..HEAD`），关键提交如下：
+下表是 fork 初期相对基线 `73a7560` 的关键提交快照；后续提交请看 `git log --oneline 73a7560..HEAD` 与 [Releases](https://github.com/renleihaokun/workbuddy2api-panel/releases)，不再在 README 维护提交总数。
 
 | 提交 | 内容 |
 |---|---|
@@ -167,7 +167,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | `5a9d293` / `90f2825` / `6824aa3` | 文档：fork 现状、Release / GHCR 说明、v1.15 前端重构记录 |
 | `e75ea11` / `6af4a46` | 版本号：`1.14.0-panel` / `1.16.0-panel` |
 
-> 当前版本 `1.24.3-panel`（脱敏补齐上游四条通道校验规则：身份句、per-model 身份句、system 全文产品名、`@` 路径说明的 AND 句对；后者是每轮必带、社区 2026-10-27 起复现的第三条指纹）。
+> 版本以 `cmd/server/main.go` 的 `appVersion` 与 Git tag / Releases 为准；README 不再重复维护“当前版本”数字。
 
 ## 核心能力
 
@@ -354,6 +354,22 @@ flowchart LR
 
 上游请求在出站前经历统一的改写管线（`internal/upstream/payload.go`）：强制 `stream:true`、`developer` 角色归一、tool_choice 归一、`image_url` 字符串兼容为 OpenAI 对象形态、DeepSeek 思维链注入、`reasoning_effort` 档位降级、`reasoning_content` 回填、指纹脱敏。
 
+## 文档导航
+
+根 README 保留完整能力、配置速查、核心行为语义、FAQ 与代码锚点；按任务拆分的入口在 [`docs/README.md`](docs/README.md)。
+
+| 任务 | 入口 |
+|---|---|
+| 第一次部署 / 添加账号 / 验证 | [快速开始](docs/getting-started.md) |
+| 查配置字段与易错约束 | [配置参考](docs/configuration.md) + [`config.example.json`](config.example.json) |
+| Docker Compose、单文件部署、升级回滚 | [部署与升级](docs/deployment.md) |
+| 备份、日志、时区、排障 | [运维手册](docs/operations.md) |
+| API / Responses / 搜索 | [API 端点](docs/api.md) |
+| 本地构建与测试 | [开发与测试](docs/development.md) |
+| 版本号 / tag / Release / GHCR | [发布与版本](docs/releases.md) |
+
+生产机连接信息与仓库级开发规范见 [`AGENTS.md`](AGENTS.md)；后者不含服务器地址或本机路径。
+
 ## 快速开始
 
 ### 环境要求
@@ -380,7 +396,7 @@ mkdir -p auths data && cp config.example.json config.json
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/renleihaokun/workbuddy2api-panel:1.17.6
+  ghcr.io/renleihaokun/workbuddy2api-panel:${WB2API_VERSION}
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -390,13 +406,13 @@ curl -s http://localhost:7863/healthz
 > Package settings → Change visibility → Public。若 `docker pull` 仍要求登录，先检查这里。
 >
 > 镜像 tag 规则（fork workflow）：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 发布
-> `1.17.6` / `1.17` / `sha-xxxxxx` 语义化版本；PR 仅构建验证、不推送。
+> `X.Y.Z` / `X.Y` / `sha-xxxxxx` 语义化版本（以 Release 实际 tag 为准）；PR 仅构建验证、不推送。
 
 ### 方式一：Docker Compose（推荐服务器部署）
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/renleihaokun/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
@@ -407,12 +423,14 @@ cp config.example.json config.json
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
 
-# 4. 健康检查（无可用账号时返回 503）
+# 4. 查看容器状态。注意：/healthz 是 readiness，不是 liveness；
+#    首次启动、还没添加账号时 healthy=0，按设计返回 503。
+docker compose ps
 curl -s http://localhost:7863/healthz
 # {"healthy":0,"total":0,"service":"workbuddy2api"}
 ```
 
-启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
+启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。**账号添加成功前，`/healthz` 返回 503 是预期行为**；这不代表进程没起来。容器自带的 `HEALTHCHECK` 也是同一判据，因此空池时 `echo $?` 非 0 并不等同于部署失败。若要用作存活探针，请检查端口可连接或 `/healthz` 的 `service` 字段，而不是只看 HTTP 状态码。
 
 常用运维命令：
 
@@ -446,7 +464,7 @@ go test ./...                      # 完整测试套件
 go run ./cmd/server -config config.json
 ```
 
-构建全部二进制：
+构建镜像内包含的核心四个二进制（另有 `cmd/hdrprobe`、`cmd/trial` 等诊断工具，不随 Release 打包）：
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wb2api ./cmd/server
@@ -1213,9 +1231,9 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 - 两个新图都复用现有 `.uschart` 外壳与刻度样式，新增的只有 `polyline.ctl-*` / `path.ctarea` / `rect.dbar` / `.dchip` 这几条规则；配色走既有令牌（`--accent` / `--ok` / `--warn` / `--bad` / `--chart-*`），没有引入新色板。
 - 窄屏同样走 440 宽 viewBox（刻度 4 个），与用量图的手机版同口径；错误分类表与分域表由 `mobile.js` 的 `labelTables()` 自动转成卡片。
 
-### 手机端（≤760px）
+### 手机端（≤1000px）
 
-无需配置：窗口宽度 ≤760px 时自动生效，>760px 完全不参与，桌面端逐像素不变。
+无需配置：窗口宽度 ≤1000px 时自动生效，>1000px 完全不参与，桌面端逐像素不变。
 
 - **侧栏 → 抽屉**：顶栏出现汉堡按钮，点遮罩 / 选中导航项 / `Esc` / 窗口拉宽都会自动关闭（拉宽不复位会留一层 fixed 遮罩把页面盖住点不动）
 - **宽表 → 卡片**：表头隐藏，每列字段名由 `mobile.js` 从 `<th>` 的纯文本抄进同列 `td[data-l]`，CSS 用 `content: attr(data-l)` 渲染——写死在 CSS 里会随表头改名漂移；桌面端的「数值列右对齐」在卡片模式下会重置回左对齐（每格是「字段名 + 值」的行内组合）
@@ -1291,8 +1309,8 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；无网关侧请求体上限（超限由上游返回） |
-| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API（Codex CLI 直连）；流式语义事件/非流式 Response 对象；无服务端会话存储（见下节） |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 64 MiB（安全网），超限网关直接返回 413 `request_too_large` |
+| `POST /v1/responses` | Bearer（`api_key` 非空时） | OpenAI Responses API（Codex CLI 直连）；流式语义事件/非流式 Response 对象；请求体 64 MiB 安全网；无服务端会话存储（见下节） |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；ID 写法随 `models.id_style`（默认 `cn:`，`slash` 时 `cn/`），可用 `?style=colon\|slash` 仅覆盖本次响应（调试/验证用）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性）+ `model_locks`（按「域 + 模型」聚合的限流视图：可选 / 总数、锁定账号数、`state`、最早解锁与全池解锁时间、限流原因；无锁定为空） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -1325,16 +1343,18 @@ Codex CLI 自 2026-02 起移除了 `wire_api = "chat"`，`responses` 是唯一�
 | 能力 | 状态 |
 |---|---|
 | `input`（字符串 / item 数组）、`instructions` | ✅ |
-| `tools`：`function` / `custom`（freeform，如 `apply_patch`） | ✅ |
+| `tools`：`function` / `custom`（freeform，如 `apply_patch`）/ `namespace`（摊平成 function） | ✅ |
 | `tool_choice` / `parallel_tool_calls` | ✅（`tool_choice` 归一化为上游可接受的形态） |
 | `max_output_tokens` / `temperature` / `top_p` / `reasoning.effort` | ✅（`minimal` 映射为 `low`，其余按模型档位降级） |
 | 流式语义事件（`response.created` / `output_item.added` / `content_part.added` / `output_text.delta` / `function_call_arguments.delta` / `response.completed` 等） | ✅ |
 | 图片输入（`input_image`，data URL / http） | ✅ |
 | `store` | 恒返回 `false`（网关不落盘） |
 | `previous_response_id` / `background` / `conversation` / `prompt` | ❌ 400 `unsupported_parameter`（不静默假装支持） |
-| 内置工具（`web_search` / `file_search` / `local_shell` / `mcp` 等） | 丢弃该工具声明并记日志，请求继续 |
+| 内置工具（`web_search` / `file_search` / `local_shell` / `mcp` 等） | 丢弃该工具声明并记 WARN，请求继续 |
 | `input_file` / `file_id` | 丢弃并记 WARN（上游无文件输入能力） |
 | `text.format`（`json_schema`） | 尽力映射到 `response_format`；上游是否支持未验证 |
+
+> **namespace 工具**：`namespace.tools` 里的 `function` / `custom` 会摊平成普通 chat function（Chat 侧名字为 `<namespace>__<tool>`，默认 `functions` 命名空间不加前缀；点号/冒号等字符会替换成 `_`，上游 11152 不接受）；模型调用后，响应里的 `function_call` / `custom_tool_call` 会同时回 `name`（子工具原名）与 `namespace`，Codex 按原命名空间路由。`defer_loading` 被忽略（网关不实现 `tool_search`，直接摊平；代价是工具表会变大）。
 
 > **语义差异（有意为之）**：网关没有服务端会话存储，**每一轮必须回传完整 `input`**（Codex 默认 `store:false` + 全量历史）。响应里的 `store` 恒为 `false`（请求里的 `store:true` 会被忽略，不落盘），`previous_response_id` 明确 400。另外不产出 `reasoning` item / 推理摘要事件（上游只有 `reasoning_content` 文本，无 encrypted_content 可回传）；custom 工具的 `input` 增量在收尾时一次性下发（partial JSON 无法安全解包）。上游以 `200 + error 帧` 报内容拦截/通道拒绝时只做分类透传，不执行 HTTP 400 路径的 degrade / SystemAsUser 同号重试。
 
@@ -1429,9 +1449,9 @@ wire_api = "responses"
 
 ### 发版（自动）
 
-**版本号就是发布开关**：把 `cmd/server/main.go` 里的 `appVersion` 改成新版本（如 `1.21.0-panel`）→ 推到 `main`，`.github/workflows/auto-release.yml` 自动完成：
+**版本号就是发布开关**：把 `cmd/server/main.go` 里的 `appVersion` 改成新版本（如 `1.28.0-panel`）→ 推到 `main`，`.github/workflows/auto-release.yml` 自动完成：
 
-1. 从源码读出 `appVersion`，剥掉 `-panel` 得到 tag 名 `v1.21.0`；
+1. 从源码读出 `appVersion`，剥掉 `-panel` 得到 tag 名 `v1.28.0`；
 2. tag 不存在就建并推送（**已存在则跳过**，重复推送 / 补提交都安全）；
 3. 显式触发 `go-binaries`（测试 → 五平台二进制 → GitHub Release + `checksums.txt`）与 `docker-ghcr`（amd64/arm64 镜像）。
 
@@ -1440,14 +1460,15 @@ wire_api = "responses"
 手工等价流程（演练 / 补发 / 回滚版本）仍然可用，直接推 tag 即可，`push` 事件照常触发两个发布工作流：
 
 ```bash
-git tag v1.21.0 && git push origin v1.21.0
+# 把 vX.Y.Z 换成目标版本；tag 必须等于 appVersion 去掉 -panel
+git tag v1.28.0 && git push origin v1.28.0
 ```
 
 发布纪律（CI 断言，不合规直接失败）：
 
 - tag `vX.Y.Z` 必须等于源码 `appVersion`（剥掉 `-panel` 后比对；`-ci` 演练 tag 豁免一致性断言）；
 - 二进制里必须能 `grep` 到 `appVersion`（防交叉编译矩阵编错树 / 漏 ldflags）；
-- 打包名不带 `-panel` 后缀：`wb2api-panel-v1.21.0-<os>-<arch>.tar.gz`。
+- 打包名不带 `-panel` 后缀：`wb2api-panel-v<X.Y.Z>-<os>-<arch>.tar.gz`。
 
 产物与去向：
 
@@ -1459,18 +1480,26 @@ git tag v1.21.0 && git push origin v1.21.0
 **部署到服务器（单文件二进制）**：
 
 ```bash
+# 以下以 vX.Y.Z 为例；实际版本请从 Releases 选。
 # 1) 本机下载并校验 arm64 包
-gh release download v1.21.0 -p '*linux-arm64.tar.gz' -p checksums.txt
-sha256sum -c checksums.txt --ignore-missing && tar xzf wb2api-panel-v1.21.0-linux-arm64.tar.gz
+gh release download vX.Y.Z -p '*linux-arm64.tar.gz' -p checksums.txt
+sha256sum -c checksums.txt --ignore-missing && tar xzf wb2api-panel-vX.Y.Z-linux-arm64.tar.gz
 
-# 2) 传到服务器，跑现成的滚动更新脚本（备份 → 原子替换 → 重启 → 健康检查 → 失败自动回滚）
+# 2) 传到服务器，并把新包命名为 wb2api.new，确认 sha256
 scp wb2api haokun:~/workbuddy2api-panel/wb2api.new
-ssh haokun 'cd ~/workbuddy2api-panel && sha256sum wb2api.new'   # 记下 sha，下一步用
+scp deploy-wb2api.sh haokun:~/workbuddy2api-panel/
+ssh haokun 'cd ~/workbuddy2api-panel && sha256sum wb2api.new && ls -l deploy-wb2api.sh'
+#    记下 sha256，下一步 EXPECT 用它；VER 用 appVersion（带 -panel）。
+
+# 3) 先做只校验、不替换的预演（新包与线上包必须是两个路径）
+ssh haokun 'cd ~/workbuddy2api-panel && EXPECT=<sha256> VER=<x.y.z>-panel NEW=./wb2api.new BIN=./wb2api DRY_RUN=1 bash ./deploy-wb2api.sh'
+
+# 4) 正式执行（脚本自己备份、替换、重启、健康检查，失败自动回滚）
 ssh haokun 'cd ~/workbuddy2api-panel && sudo systemd-run --unit=wb2api-deploy --collect \
-  env EXPECT=<sha256> VER=1.21.0-panel ./deploy-wb2api.sh'
+  env EXPECT=<sha256> VER=<x.y.z>-panel bash ./deploy-wb2api.sh'
 ```
 
-`deploy-wb2api.sh` 通过 `EXPECT`（二进制 sha256）与 `VER`（版本串）两个环境变量校验新包，缺省值保留上次发布的口径；脚本用 `systemd-run` 起，SSH 断线也会跑完，结果看 `deploy-last-status` 与 `deploy-<时间戳>.log`。
+`deploy-wb2api.sh` 的输入：`EXPECT`（新二进制 sha256，必填）、`VER`（版本串，必填）、`NEW`（默认 `./wb2api.new`）、`SERVICE`（默认 `workbuddy-panel`）、`BIN`（默认 `./wb2api`）。加上 `DRY_RUN=1` 时只校验 sha256 / 版本串，不动线上文件。脚本从 `wb2api.new` 替换 `wb2api`，会在同目录留下 `wb2api.bak-<时间戳>`；最终结果看 `deploy-last-status` 与 `deploy-<时间戳>.log`。若你的服务器使用别的二进制路径，务必显式传 `NEW` / `BIN`，不要假设目录布局。
 
 > 全自动「发版即部署」需要把服务器 SSH 私钥存进仓库 Secrets（如 `DEPLOY_SSH_KEY`）再加一个 deploy job；这一步涉及生产机凭据，**未默认开启**，需要时再单独加。
 
@@ -1591,7 +1620,7 @@ WB2A_AUDIT_URL=http://127.0.0.1:7863 WB2A_AUDIT_KEY=sk-xxx \
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
 - **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 落盘同样显式 `0600`（`os.open` 指定 mode + 写后 `chmod`，覆盖旧文件也不会继承宽权限）
-- **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
+- **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`；公开文档在 `docs/` 与 `AGENTS.md`，其他 `*.md` 工作文档仍默认忽略
 
 ### 2. 网络暴露与日志敏感度
 
@@ -1633,10 +1662,10 @@ WB2A_AUDIT_URL=http://127.0.0.1:7863 WB2A_AUDIT_KEY=sk-xxx \
 
 ### 多图会话请求体超限怎么办？
 
-网关**不再设请求体上限**（`server.max_body_mb` 已移除，对齐上游）：任意大小的请求体都会完整读入并转发上游，超限类问题由上游自然返回错误——其响应信息量更大（能看到上游的真实策略），网关不再以 413 提前拦截。
+可配置的 `server.max_body_mb` 业务上限已移除，但 `/v1/chat/completions` 与 `/v1/responses` 仍保留 **64 MiB** 的进程内存安全网（`internal/server/handler.go` 的 `maxChatBodyBytes`）。超过安全网时网关直接返回 `413 request_too_large`，不会请求上游；安全网以内的超限仍由上游判定。搜索端点 `/v1/search/messages` 另有 **1 MiB** 请求体上限。
 
-- 多图/长上下文会话（历史图片每轮以 base64 重发，编码再膨胀约 37%）不会再撞网关侧 413
-- 若上游真的返回 413/超限错误，网关按既有错误分类链路如实透传（不打码、不罚号——超限是请求侧问题）
+- 多图/长上下文会话（历史图片每轮以 base64 重发，编码再膨胀约 37%）只要不超过 64 MiB 就不会撞网关侧 413
+- 若上游返回 413/超限错误，网关按既有错误分类链路如实透传（不打码、不罚号——超限是请求侧问题）
 - 客户端中途断流导致的半截 body 在读入阶段即报 `400 invalid_request`，不会把截断 JSON 喂给上游（issue #41 语义保留在读错误路径）
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
@@ -1694,7 +1723,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 - 价格取厂商**中国区官网**牌价（人民币 / 百万 tokens），DeepSeek 按**峰谷价**：工作日 9–12、14–18 点高峰原价，其余时段与周末半价；90 天前折叠成日桶的数据按当天高峰小时数加权。
 - 上游没回缓存命中信息的请求按**未命中价**算 → 偏高；DeepSeek 取高峰价 → 也偏高。想对得更准就往 `data/prices.json` 里按你的实际口径覆盖（包括把 DeepSeek 改成空闲价）。
-- 模型没有官方牌价时**不计金额**，只在列表末尾标「未定价」、并计入覆盖率缺口；只有失败请求、没有任何 token 的模型不进明细表，只在页脚记「另有 N 个模型无 token 记录」；有未定价 token 时覆盖率最多显示 99.99%%（不会四舍五入成 100%%）；按模型明细就在同一块里（金额降序，默认显示前 6 个，点「展开全部」看全量），不用切到「用量明细」标签页。牌价的来源 `seed`（内置）/ `seed+file`（读到你的文件）与快照日期在区块 header 右侧。
+- 模型没有官方牌价时**不计金额**，只在列表末尾标「未定价」、并计入覆盖率缺口；只有失败请求、没有任何 token 的模型不进明细表，只在页脚记「另有 N 个模型无 token 记录」；有未定价 token 时覆盖率最多显示 99.99%（不会四舍五入成 100%）；按模型明细就在同一块里（金额降序，默认显示前 6 个，点「展开全部」看全量），不用切到「用量明细」标签页。牌价的来源 `seed`（内置）/ `seed+file`（读到你的文件）与快照日期在区块 header 右侧。
 - 时间窗与页面其它数字一致（切区间会变），卡片副行另给「累计」（全部历史，不受窗口影响）。
 
 ### 想给某个模型补牌价，但不知道官方价格？
@@ -1710,7 +1739,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | `prompt.mode` 默认 `passthrough` | `cmd/server/config.go` `Default()` |
 | `features.sanitize_blacklist_fingerprints` 默认 `true` | `cmd/server/config.go` `Default()` |
 | `features.system_as_user_fallback` 默认 `true` | `cmd/server/config.go` `Default()` |
-| 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` `chatCompletions` 读 body 段 |
+| 请求体安全网 64 MiB（`server.max_body_mb` 可配置业务上限已移除） | `internal/server/handler.go` `maxChatBodyBytes` / `readBodyLimited`；测试 `internal/server/bodylimit_test.go` |
 | 出站强制 `stream:true` | `internal/upstream/payload.go` `PrepareBodyOptWithEffortsAndDefault`（`obj["stream"] = true`） |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go` `injectThinking` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go` `defaultDeepSeekEffort` |
