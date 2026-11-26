@@ -940,9 +940,11 @@ type Client struct {
 	GlobalEnabled bool
 
 	// refreshMu/refreshInFlight 同账号 refresh 单飞（按 UID 分桶）：同一时刻只允许
-	// 一个 refresh 在途，其余调用等待并复用首个结果。上游对 refreshToken 反重放，
-	// 并发第二发会带着已被消费的 RT 撞 12153 并整链作废（issue #215：账号从此恒
-	// 401，只能人工重登）。单飞在这里是保号手段，不只是省流量。
+	// 一个 refresh 在途，其余调用等待并复用首个结果。单飞是保号手段，不只是省流量：
+	// 上游 RT 的轮换/反重放语义并不稳定——短窗口内重复使用可能都成功（2026-11-26
+	// CN 实测 R-E：同一 RT 并发两发都 200，旧票隔一会儿仍可用），但长窗口、跨机器
+	// 各持一份时存在旧票被作废、账号掉登录的报告（issue #215，同类项目 #184）。
+	// 不赌上游宽限：同进程并发输入被消掉，也不给多写者抢票留窗口。
 	refreshMu       sync.Mutex
 	refreshInFlight map[string]*refreshFlight
 
@@ -1205,10 +1207,11 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //
 // 并发安全模型（单飞 + 两段式）：
 //   - **单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并
-//     原样复用首个结果。上游对 refreshToken 有反重放：RT 被消费后再用会撞 12153
-//     （refresh token is invalid）并把整条 RT 链作废，账号从此恒 401、只能人工
-//     重新登录（issue #215：scheduler keepalive / handler 临近过期刷新 / signin
-//     会并发触发同一账号）。所以单飞在这里是保号手段，而不只是省流量。
+//     原样复用首个结果。理由不是"上游一定会在第二发撞 12153"——2026-11-26 CN
+//     实测 R-E 显示短窗口内同一 RT 可以并发成功、旧票也还能用；而是 RT 的轮换
+//     语义在长窗口/跨机器下会变（issue #215、同类项目 #184 都有"两份凭证抢刷新
+//     → invalid_grant → 只能重登"的报告）。单飞把"同进程并发"这条变量消掉，
+//     不赌上游宽限，也不给多写者留窗口。
 //   - 首个调用内部仍是两段式：锁内读快照 → 锁外 I/O（30s）→ 锁内校验快照一致后
 //     写回；写回前若发现另一刷新已完成（两 token 同时变化）则直接采用。
 //   - 12153 兜底：若磁盘 auth 文件已被其他进程（server + signin 双进程部署）刷新
@@ -1346,8 +1349,8 @@ func (c *Client) refreshTokenOnce(a *auth.Auth) error {
 	// 结果覆盖手工编辑。
 	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
 		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
-		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
-		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
+		// 2026-11-26 CN 实测 R-E 只覆盖"短窗口内并发两发都 200、两张新票都可用"，
+		// 不能据此认为旧票长期有效；这里提前返回只是避免无意义覆盖与 ExpiresAt 抖动。
 		return nil
 	}
 	a.AccessToken = tok.AccessToken

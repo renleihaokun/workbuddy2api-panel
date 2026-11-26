@@ -14,9 +14,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// TestRefreshTokenSingleFlightPerAccount 验证同一账号并发 refresh 只打一次上游：
-// 上游对 refreshToken 反重放，第二发带已消费的 RT 会撞 12153 并把整条 RT 链作废
-// （issue #215，账号只能人工重登）。单飞失败时本用例会看到 hits>1 且集中报 12153。
+// TestRefreshTokenSingleFlightPerAccount 验证同一账号并发 refresh 只打一次上游。
+// 单飞的理由不是"第二发必定 12153"：2026-11-26 CN 实测短窗口内同一 RT 并发两发
+// 都成功（R-E），旧票也还能用；但长窗口/跨机器各持一份时有旧票作废、账号掉登录的
+// 报告（issue #215，同类项目 #184）。单飞消除同进程并发这条变量，不赌上游宽限。
 func TestRefreshTokenSingleFlightPerAccount(t *testing.T) {
 	var hits, inFlight, maxInFlight int32
 	c := testClient(func(r *http.Request) (*http.Response, error) {
