@@ -289,11 +289,11 @@ func TestFromChatCompletionNamespacedToolCalls(t *testing.T) {
 			"tool_calls": []any{
 				map[string]any{
 					"id": "call_1", "type": "function",
-					"function": map[string]any{"name": "container.run_shell", "arguments": `{"command":"pwd"}`},
+					"function": map[string]any{"name": "container__run_shell", "arguments": `{"command":"pwd"}`},
 				},
 				map[string]any{
 					"id": "call_2", "type": "function",
-					"function": map[string]any{"name": "container.apply_patch", "arguments": `{"input":"patch"}`},
+					"function": map[string]any{"name": "container__apply_patch", "arguments": `{"input":"patch"}`},
 				},
 			},
 		},
@@ -301,10 +301,10 @@ func TestFromChatCompletionNamespacedToolCalls(t *testing.T) {
 	}}}
 	meta := Meta{
 		Model:       "m",
-		CustomTools: map[string]bool{"container.apply_patch": true},
+		CustomTools: map[string]bool{"container__apply_patch": true},
 		ToolRefs: map[string]ToolRef{
-			"container.run_shell":   {Namespace: "container", Name: "run_shell"},
-			"container.apply_patch": {Namespace: "container", Name: "apply_patch"},
+			"container__run_shell":   {Namespace: "container", Name: "run_shell"},
+			"container__apply_patch": {Namespace: "container", Name: "apply_patch"},
 		},
 	}
 	resp := FromChatCompletion(chat, meta)
@@ -336,8 +336,8 @@ func TestNamespaceToolRoundTrip(t *testing.T) {
 		t.Fatalf("first convert: %v", err)
 	}
 	flat := meta.FlatNameFor("container", "run_shell")
-	if flat != "container.run_shell" {
-		t.Fatalf("flat name=%q want container.run_shell", flat)
+	if flat != "container__run_shell" {
+		t.Fatalf("flat name=%q want container__run_shell", flat)
 	}
 
 	chat := map[string]any{"choices": []any{map[string]any{

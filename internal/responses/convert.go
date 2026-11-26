@@ -22,8 +22,9 @@ const (
 	// 这个命名空间的子工具摊平后直接用裸名，响应里也不回 namespace。
 	defaultFunctionNamespace = "functions"
 	// chatToolNameSep 是 namespace 子工具摊平到 chat 工具名时使用的分隔符。
-	// 若上游实测不接受点号，改成 "__" 即可；映射层不依赖具体分隔符。
-	chatToolNameSep = "."
+	// 上游 11152 明确拒绝点号（"the tool name is invalid or duplicated"），
+	// 所以用 Codex 自己摊平 MCP 工具时的双下划线写法。
+	chatToolNameSep = "__"
 	// maxChatToolNameLen 与 OpenAI function name / 上游 DSML 工具名的上限一致。
 	maxChatToolNameLen = 64
 )
@@ -911,8 +912,8 @@ func flattenToolName(namespace, name string) string {
 	return capChatToolName(sanitizeChatToolName(ns + chatToolNameSep + name))
 }
 
-// sanitizeChatToolName 把上游可能不接受的字符替换成下划线。保留下划线、短横线、
-// 点号和冒号：Codex 自己的工具名与上游 DSML 判定都接受这些字符。
+// sanitizeChatToolName 把上游可能不接受的字符替换成下划线。只保留字母、数字、
+// 下划线和短横线：上游的 function name 校验不接受点号/冒号（11152）。
 func sanitizeChatToolName(name string) string {
 	if name == "" {
 		return ""
@@ -922,7 +923,7 @@ func sanitizeChatToolName(name string) string {
 	for _, r := range name {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
-			r == '_', r == '-', r == '.', r == ':':
+			r == '_', r == '-':
 			b.WriteRune(r)
 		default:
 			b.WriteByte('_')

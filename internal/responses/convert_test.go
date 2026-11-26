@@ -521,15 +521,15 @@ func TestConvertNamespaceToolsFlattened(t *testing.T) {
 	chat := decodeChat(t, raw)
 	tools, _ := chat["tools"].([]any)
 	names := toolNamesOf(t, tools)
-	if len(names) != 2 || names[0] != "container.run_shell" || names[1] != "container.apply_patch" {
-		t.Fatalf("chat tool names=%v want [container.run_shell container.apply_patch]", names)
+	if len(names) != 2 || names[0] != "container__run_shell" || names[1] != "container__apply_patch" {
+		t.Fatalf("chat tool names=%v want [container__run_shell container__apply_patch]", names)
 	}
-	if !meta.CustomTools["container.apply_patch"] {
+	if !meta.CustomTools["container__apply_patch"] {
 		t.Errorf("namespaced custom tool not recorded: %v", meta.CustomTools)
 	}
-	ref, ok := meta.ToolRefs["container.run_shell"]
+	ref, ok := meta.ToolRefs["container__run_shell"]
 	if !ok || ref.Namespace != "container" || ref.Name != "run_shell" {
-		t.Fatalf("ToolRefs[container.run_shell]=%+v ok=%v", ref, ok)
+		t.Fatalf("ToolRefs[container__run_shell]=%+v ok=%v", ref, ok)
 	}
 	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
 	if desc, _ := fn["description"].(string); !strings.Contains(desc, "Shell tools") {
@@ -541,6 +541,36 @@ func TestConvertNamespaceToolsFlattened(t *testing.T) {
 	echo, _ := meta.Tools[0].(map[string]any)
 	if echo["type"] != "namespace" {
 		t.Errorf("echo tool type=%v want namespace", echo["type"])
+	}
+}
+
+// TestConvertNamespaceChatNameRules 上游 11152 不接受点号/冒号，chat 侧名字
+// 必须只剩 [A-Za-z0-9_-]；原始 namespace/name 仍要完整保留在 ToolRefs 里。
+func TestConvertNamespaceChatNameRules(t *testing.T) {
+	body := `{"model":"m","input":"x","tools":[
+		{"type":"namespace","name":"mcp.server","tools":[
+			{"type":"function","name":"tool.name","parameters":{"type":"object"}}
+		]},
+		{"type":"namespace","name":"mcp__srv","tools":[
+			{"type":"function","name":"mcp__srv__already_prefixed","parameters":{"type":"object"}}
+		]}]}`
+	raw, meta, err := ConvertRequest([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	names := toolNamesOf(t, decodeChat(t, raw)["tools"].([]any))
+	if len(names) != 2 {
+		t.Fatalf("tools=%v", names)
+	}
+	if names[0] != "mcp_server__tool_name" {
+		t.Errorf("dotted names not sanitized: %q", names[0])
+	}
+	ref, ok := meta.ToolRefs["mcp_server__tool_name"]
+	if !ok || ref.Namespace != "mcp.server" || ref.Name != "tool.name" {
+		t.Fatalf("original identity lost: %+v ok=%v", ref, ok)
+	}
+	if names[1] != "mcp__srv__already_prefixed" {
+		t.Errorf("already-prefixed name double-prefixed: %q", names[1])
 	}
 }
 
@@ -590,21 +620,21 @@ func TestConvertNamespaceHistory(t *testing.T) {
 		t.Fatalf("first assistant tool_calls=%d want 1", len(firstCall))
 	}
 	firstFn, _ := firstCall[0].(map[string]any)["function"].(map[string]any)
-	if firstFn["name"] != "container.run_shell" {
-		t.Errorf("first tool name=%v want container.run_shell", firstFn["name"])
+	if firstFn["name"] != "container__run_shell" {
+		t.Errorf("first tool name=%v want container__run_shell", firstFn["name"])
 	}
 	secondCall, _ := msgAt(t, msgs, 2)["tool_calls"].([]any)
 	if len(secondCall) != 1 {
 		t.Fatalf("second assistant tool_calls=%d want 1", len(secondCall))
 	}
 	secondFn, _ := secondCall[0].(map[string]any)["function"].(map[string]any)
-	if secondFn["name"] != "container.apply_patch" {
-		t.Errorf("second tool name=%v want container.apply_patch", secondFn["name"])
+	if secondFn["name"] != "container__apply_patch" {
+		t.Errorf("second tool name=%v want container__apply_patch", secondFn["name"])
 	}
-	if !meta.CustomTools["container.apply_patch"] {
+	if !meta.CustomTools["container__apply_patch"] {
 		t.Errorf("history custom call not recorded under flat name: %v", meta.CustomTools)
 	}
-	ref, ok := meta.ToolRefs["container.run_shell"]
+	ref, ok := meta.ToolRefs["container__run_shell"]
 	if !ok || ref.Namespace != "container" || ref.Name != "run_shell" {
 		t.Fatalf("history ToolRefs=%+v ok=%v", ref, ok)
 	}
@@ -643,8 +673,8 @@ func TestConvertNamespaceToolChoice(t *testing.T) {
 	chat := decodeChat(t, raw)
 	tc, _ := chat["tool_choice"].(map[string]any)
 	fn, _ := tc["function"].(map[string]any)
-	if fn["name"] != "container.run_shell" {
-		t.Fatalf("chat tool_choice name=%v want container.run_shell", fn["name"])
+	if fn["name"] != "container__run_shell" {
+		t.Fatalf("chat tool_choice name=%v want container__run_shell", fn["name"])
 	}
 	echo, _ := meta.ToolChoice.(map[string]any)
 	if echo["namespace"] != "container" || echo["name"] != "run_shell" {
@@ -656,14 +686,14 @@ func TestConvertNamespaceToolChoice(t *testing.T) {
 		{"type":"namespace","name":"container","tools":[
 			{"type":"function","name":"run_shell","parameters":{"type":"object"}}
 		]}],
-		"tool_choice":{"type":"function","name":"container.run_shell"}}`
+		"tool_choice":{"type":"function","name":"container__run_shell"}}`
 	raw2, _, err := ConvertRequest([]byte(body2))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	tc2, _ := decodeChat(t, raw2)["tool_choice"].(map[string]any)
 	fn2, _ := tc2["function"].(map[string]any)
-	if fn2["name"] != "container.run_shell" {
+	if fn2["name"] != "container__run_shell" {
 		t.Errorf("flat tool_choice name=%v", fn2["name"])
 	}
 }
@@ -672,7 +702,7 @@ func TestConvertNamespaceToolChoice(t *testing.T) {
 // 不丢能力也不覆盖顶层工具。
 func TestConvertNamespaceCollision(t *testing.T) {
 	body := `{"model":"m","input":"x","tools":[
-		{"type":"function","name":"container.run_shell","parameters":{"type":"object"}},
+		{"type":"function","name":"container__run_shell","parameters":{"type":"object"}},
 		{"type":"namespace","name":"container","tools":[
 			{"type":"function","name":"run_shell","parameters":{"type":"object"}}
 		]}]}`
@@ -682,10 +712,10 @@ func TestConvertNamespaceCollision(t *testing.T) {
 	}
 	chat := decodeChat(t, raw)
 	names := toolNamesOf(t, chat["tools"].([]any))
-	if len(names) != 2 || names[0] != "container.run_shell" || names[1] != "container.run_shell_2" {
-		t.Fatalf("chat tool names=%v want [container.run_shell container.run_shell_2]", names)
+	if len(names) != 2 || names[0] != "container__run_shell" || names[1] != "container__run_shell_2" {
+		t.Fatalf("chat tool names=%v want [container__run_shell container__run_shell_2]", names)
 	}
-	ref, ok := meta.ToolRefs["container.run_shell_2"]
+	ref, ok := meta.ToolRefs["container__run_shell_2"]
 	if !ok || ref.Namespace != "container" || ref.Name != "run_shell" {
 		t.Fatalf("collision ToolRefs=%+v ok=%v", ref, ok)
 	}
@@ -770,11 +800,11 @@ func TestConvertNamespaceMalformedContinues(t *testing.T) {
 		t.Fatalf("malformed namespace must not reject the request: %v", err)
 	}
 	names := toolNamesOf(t, decodeChat(t, raw)["tools"].([]any))
-	if len(names) != 1 || names[0] != "mixed.ok" {
-		t.Fatalf("chat tool names=%v want [mixed.ok]", names)
+	if len(names) != 1 || names[0] != "mixed__ok" {
+		t.Fatalf("chat tool names=%v want [mixed__ok]", names)
 	}
-	if _, ok := meta.ToolRefs["mixed.ok"]; !ok {
-		t.Errorf("mixed.ok not recorded in ToolRefs: %v", meta.ToolRefs)
+	if _, ok := meta.ToolRefs["mixed__ok"]; !ok {
+		t.Errorf("mixed__ok not recorded in ToolRefs: %v", meta.ToolRefs)
 	}
 }
 

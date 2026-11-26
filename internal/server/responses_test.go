@@ -22,7 +22,7 @@ const sseToolCall = `data: {"id":"c1","object":"chat.completion.chunk","choices"
 
 // sseNamespacedToolCall 上游按 chat 扁平名调用 namespace 子工具；网关要把它
 // 还原成 name=run_shell + namespace=container。
-const sseNamespacedToolCall = `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_ns","type":"function","function":{"name":"container.run_shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}` + "\n\n" +
+const sseNamespacedToolCall = `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_ns","type":"function","function":{"name":"container__run_shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}` + "\n\n" +
 	`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n" +
 	"data: [DONE]\n\n"
 
@@ -234,7 +234,7 @@ func TestResponsesNonStreamToolCall(t *testing.T) {
 }
 
 // TestResponsesNamespaceToolsEndToEnd namespace 工具端到端：出站 chat body 必须
-// 是摊平后的 container.run_shell，响应 output item 必须是 name=run_shell +
+// 是摊平后的 container__run_shell，响应 output item 必须是 name=run_shell +
 // namespace=container。
 func TestResponsesNamespaceToolsEndToEnd(t *testing.T) {
 	var sent string
@@ -258,8 +258,8 @@ func TestResponsesNamespaceToolsEndToEnd(t *testing.T) {
 		t.Fatalf("outbound tools len=%d want 1 (namespace 应摊平成 1 个 function): %v", len(tools), chat["tools"])
 	}
 	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
-	if fn["name"] != "container.run_shell" {
-		t.Fatalf("outbound tool name=%v want container.run_shell", fn["name"])
+	if fn["name"] != "container__run_shell" {
+		t.Fatalf("outbound tool name=%v want container__run_shell", fn["name"])
 	}
 	if desc, _ := fn["description"].(string); !strings.Contains(desc, "Shell tools") {
 		t.Errorf("outbound description lost namespace context: %q", desc)

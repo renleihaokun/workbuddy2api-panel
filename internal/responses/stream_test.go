@@ -250,12 +250,12 @@ func TestStreamNamespacedToolCall(t *testing.T) {
 	meta := Meta{
 		Model: "m",
 		ToolRefs: map[string]ToolRef{
-			"container.run_shell": {Namespace: "container", Name: "run_shell"},
+			"container__run_shell": {Namespace: "container", Name: "run_shell"},
 		},
 	}
 	tr := NewTranslator(rec, meta)
 	frames := []string{
-		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"container.run_shell","arguments":"{\"command\":\""}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"container__run_shell","arguments":"{\"command\":\""}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"pwd\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n",
 	}
 	for _, f := range frames {
@@ -295,14 +295,14 @@ func TestStreamNamespacedCustomTool(t *testing.T) {
 	rec := httptest.NewRecorder()
 	meta := Meta{
 		Model:       "m",
-		CustomTools: map[string]bool{"container.apply_patch": true},
+		CustomTools: map[string]bool{"container__apply_patch": true},
 		ToolRefs: map[string]ToolRef{
-			"container.apply_patch": {Namespace: "container", Name: "apply_patch"},
+			"container__apply_patch": {Namespace: "container", Name: "apply_patch"},
 		},
 	}
 	tr := NewTranslator(rec, meta)
 	frames := []string{
-		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_p","type":"function","function":{"name":"container.apply_patch","arguments":"{\"input\":\"patch\"}"}}]}}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_p","type":"function","function":{"name":"container__apply_patch","arguments":"{\"input\":\"patch\"}"}}]}}]}` + "\n\n",
 		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n",
 	}
 	for _, f := range frames {
