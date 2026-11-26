@@ -6,7 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"path/filepath"
+	"os"
 	"strings"
 	"time"
 
@@ -69,8 +69,11 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var total, imported, skipped int
+	var total, imported, overwritten, skipped int
 	var errs []string
+	// overwrite=1 才允许覆盖已存在的账号。默认跳过（覆盖会把好号写成死号：
+	// 导出文件里的 RT 往往早已被轮换，直接盖上去 = 本来能用的号变成要重登）。
+	overwrite := r.FormValue("overwrite") == "1"
 
 	for _, acc := range accounts {
 		uid := strings.TrimSpace(acc.UID)
@@ -84,6 +87,19 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		if !validImportUID(uid) {
 			skipped++
 			errs = append(errs, fmt.Sprintf("invalid uid (id=%s)", acc.ID))
+			continue
+		}
+		// 已存在（池里或 auths 目录里有同名文件）且未显式 overwrite → 跳过。
+		existingFile := p.authFileForUID(uid)
+		_, inPool := p.cfg.Pool.Status(uid)
+		fileExists := false
+		if _, err := os.Stat(existingFile); err == nil {
+			fileExists = true
+		}
+		replacing := inPool || fileExists
+		if replacing && !overwrite {
+			skipped++
+			errs = append(errs, fmt.Sprintf("uid=%s 已存在，已跳过（覆盖会替换现有凭证；确需覆盖请加 overwrite=1）", uid))
 			continue
 		}
 
@@ -108,7 +124,8 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			Domain:       acc.Domain,
 			UID:          uid,
 			Nickname:     nickname,
-			FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid)),
+			// 就地写已存在的那份（同 authFileForUID 口径），不在旁边新建同 uid 第二份。
+			FilePath: existingFile,
 		}
 
 		if realm == "global" {
@@ -121,14 +138,25 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			_, _ = a.BackfillRealm()
 		}
 
-		if err := a.SaveAtomic(); err != nil {
+		// 合并写：覆盖导入时保留 device_token / proxy / weight 等手写键
+		//（同类项目 issue #210/#187 就是「刷新/导入把 proxy 冲掉了」）。
+		if err := a.SaveAtomicMerged(); err != nil {
 			skipped++
 			errs = append(errs, fmt.Sprintf("uid=%s: save auth failed: %v", uid, err))
 			continue
 		}
 
 		p.cfg.Pool.Add(a)
-		p.cfg.Pool.Revive(uid)
+		// 新凭证 = RT 已换：旧的「RT 判死」标记不再成立（是否真活由后续请求说话）。
+		p.cfg.Pool.ClearRefreshTokenDead(uid)
+		if replacing {
+			// 覆盖导入**不自动解禁**：导入的凭证可能本身就是死的，解禁只会把死号
+			// 放回选号池反复被选中。解禁交给运维（面板 revive）或后续成功请求。
+			overwritten++
+		} else {
+			p.cfg.Pool.Revive(uid)
+			imported++
+		}
 
 		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
 		if realm == "global" {
@@ -150,18 +178,18 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
 			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 		}
-
-		imported++
 	}
 
 	total = len(accounts)
-	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
+	log.Printf("panel: cockpit import finished total=%d imported=%d overwritten=%d skipped=%d",
+		total, imported, overwritten, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"total":    total,
-		"imported": imported,
-		"skipped":  skipped,
-		"errors":   errs,
+		"ok":          true,
+		"total":       total,
+		"imported":    imported,
+		"overwritten": overwritten,
+		"skipped":     skipped,
+		"errors":      errs,
 	})
 }
 

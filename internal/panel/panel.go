@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -254,10 +255,17 @@ func (p *Panel) registerLoginLocked(state, realm string, now time.Time) {
 	p.logins[state] = loginSession{created: now, realm: realm}
 }
 
-// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
+// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）
+// + 可选的重登目标 uid。
+//
+// targetUID 非空表示这是「给某个已有账号重登」而不是「添加新账号」：
+//   - realm 由该账号决定（不跟界面的国内/国际开关，否则会把国际版号写成 cn）；
+//   - 扫回来的 uid 必须与它一致（否则等于又加了一个号，目标号纹丝未动）；
+//   - 落盘走「就地合并」而不是重建（保留 device_token / proxy / weight 等手写键）。
 type loginSession struct {
-	created time.Time
-	realm   string // "cn" / "global"，缺省 cn
+	created   time.Time
+	realm     string // "cn" / "global"，缺省 cn
+	targetUID string // 非空 = 重登目标账号
 }
 
 // New 构建面板。
@@ -298,6 +306,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	// 单号运维入口（needs_relogin 的两条出路）：
+	//   refresh → 手动刷一次 token，立刻知道「还能不能自愈」；
+	//   relogin/start → 给这个 uid 发一张码，扫回来就地改写并自动解禁。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/refresh", p.withAuth(p.accountRefresh))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/relogin/start", p.withAuth(p.accountReloginStart))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
@@ -405,7 +418,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":        disabled,
 		"paused":          paused,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		// needs_relogin 是「只能靠重登恢复」的账号数（disabled 且死因 session_dead）。
+		// 单独给一个数：它和 disabled 的处置完全不同（重登 vs 申诉 vs 解冻），
+		// 混在 disabled 里运维看不出该做什么。
+		"needs_relogin": p.cfg.Pool.NeedsReloginCount(),
+		"accounts":      p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -740,6 +757,72 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// accountRefresh 手动刷新单个账号的 token（面板「刷新」按钮 / 运维诊号）。
+//
+// 返回体把「还能不能自愈」直接讲清楚，不让用户对着 500 猜：
+//   - ok=true：刷新成功，凭证已落盘（RT 已轮换，不写回等于下次重启就死）。
+//   - ok=false + needs_relogin=true：上游明确拒绝刷新 —— 只能重登；其中
+//     access_usable=true 表示 AT 还没过期、对话暂时仍可用（趁早重登）。
+//   - ok=false + needs_relogin=false：网络/5xx/429 等无判词失败，稍后再试即可。
+//
+// 与「保活/请求路径自动刷新」的关系：这是唯一由人触发的刷新入口，语义上等同
+// 一次强制保活，不改任何开关。
+func (p *Panel) accountRefresh(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if a.RefreshTokenValue() == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "needs_relogin": true,
+			"message": "该账号没有 refreshToken（只能重新登录）",
+		})
+		return
+	}
+	if err := p.cfg.Upstream.RefreshToken(a); err != nil {
+		var ue *upstream.Error
+		isDead := errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
+		if !isDead {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": false, "needs_relogin": false,
+				"message": "刷新失败（网络/上游抖动，可稍后重试）：" + err.Error(),
+			})
+			return
+		}
+		// 上游明确拒绝：记凭证层事实；AT 还活着就只提醒、不计数。
+		p.cfg.Pool.MarkRefreshTokenDead(uid)
+		usable := upstream.AccessUsableWithoutRefresh(a)
+		msg := "refresh token 已被上游作废，只能重新登录"
+		if usable {
+			msg = "refresh token 已失效，但 access token 仍有效至 " +
+				time.Unix(a.ExpiresAtValue(), 0).Format("2006-01-02") + "；建议尽快重登"
+		} else {
+			p.cfg.Pool.NoteSessionDead(uid)
+		}
+		log.Printf("panel: refresh uid=%s 被上游判死（access_usable=%v）", uid, usable)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "needs_relogin": true, "access_usable": usable, "message": msg,
+		})
+		return
+	}
+	// 刷新成功 = 会话未死的实证：清计数与 RT 判死标记，再把新凭证落盘。
+	p.cfg.Pool.ClearSessionDead(uid)
+	p.cfg.Pool.ClearRefreshTokenDead(uid)
+	if err := a.SaveAtomic(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "refreshed in memory but persist failed: "+err.Error())
+		return
+	}
+	exp := time.Unix(a.ExpiresAtValue(), 0)
+	log.Printf("panel: refresh uid=%s 成功（access token 至 %s）", uid, exp.Format("2006-01-02 15:04"))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "needs_relogin": false,
+		"expires_at": exp.UTC().Format(time.RFC3339),
+		"message":    "刷新成功",
+	})
+}
+
 // accountDisable 人工禁用（不再参与选号，需面板 revive 或重登恢复）。
 func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
@@ -747,7 +830,7 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	p.cfg.Pool.Disable(uid, "manual disable (panel)")
+	p.cfg.Pool.DisableWithKind(uid, "manual disable (panel)", pool.DisableKindManual)
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -858,6 +941,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
+	st, ok := p.cfg.Pool.Status(uid)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	// 删除会永久丢掉凭证（不可逆，重来要人再扫一次码）。凭证看起来还活着时要求
+	// 显式 force=1 —— 手滑点「移除」是这条路上最贵的误操作。判据用本地状态
+	// （disabled / RT 判死），零上游调用，不给删除路径增加网络依赖。
+	if !st.Disabled && !st.RefreshTokenDead && r.URL.Query().Get("force") != "1" {
+		writeErr(w, http.StatusConflict,
+			"该账号凭证看起来仍有效：移除会永久删除 auth 文件（不可逆）。确需移除请带 force=1")
+		return
+	}
 	a := p.cfg.Pool.Remove(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")

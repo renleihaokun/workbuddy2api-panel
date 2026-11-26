@@ -116,8 +116,30 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
 // body 可带 {"realm":"global"}（缺省 cn）；state 会话记 realm，poll 同 realm 落盘。
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
+	p.startLogin(w, r, "")
+}
+
+// accountReloginStart 给指定账号发起重登（needs_relogin 的唯一出路）。
+// 与添加新账号共用同一条设备授权流程，差别只在：realm 跟账号走、扫回来必须是它、
+// 落盘就地合并（保留 device_token 等手写键）、成功后自动解禁。
+func (p *Panel) accountReloginStart(w http.ResponseWriter, r *http.Request) {
+	p.startLogin(w, r, r.PathValue("uid"))
+}
+
+// startLogin 设备授权流程本体。targetUID 非空 = 给该账号重登。
+func (p *Panel) startLogin(w http.ResponseWriter, r *http.Request, targetUID string) {
 	realm := "cn"
-	if r.Body != nil {
+	if targetUID != "" {
+		a := p.cfg.Pool.AuthByUID(targetUID)
+		if a == nil {
+			writeErr(w, http.StatusNotFound, "account not found")
+			return
+		}
+		// realm 必须跟账号走，不能跟界面的「国内版 / 国际版」开关：在国际版账号上
+		// 发了国内版的码，落盘时 realm 被改写成 cn，这个号下一发请求立刻 401
+		// ——同类项目踩过，重登队列里反复失败就是这个原因。
+		realm = a.Realm()
+	} else if r.Body != nil {
 		var reqBody struct {
 			Realm string `json:"realm"`
 		}
@@ -145,9 +167,21 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	// 顺手回收过期会话（防"开弹窗走开"的 state 滞留）+ 维护硬上限（防反复
 	// 发起登录把表撑大），两件事都收在 registerLoginLocked 里。
 	p.registerLoginLocked(st.State, realm, time.Now())
+	if targetUID != "" {
+		// 目标 uid 记进同一张表：poll 完成时据此校验「扫到的是不是它」。
+		sess := p.logins[st.State]
+		sess.targetUID = targetUID
+		p.logins[st.State] = sess
+	}
 	p.loginMu.Unlock()
-	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
+	action := "添加账号"
+	if targetUID != "" {
+		action = "重登 uid=" + targetUID
+	}
+	log.Printf("panel: 发起 OAuth %s realm=%s（state=%s...）", action, realm, st.State[:min(8, len(st.State))])
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm, "uid": targetUID,
+	})
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
@@ -204,6 +238,17 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "上游返回的 uid 含非法字符，拒绝落盘（防路径穿越）")
 		return
 	}
+	// 重登：扫回来的必须是目标账号本身。不一致时**一个字节都不动**——否则等于
+	// 又添加了一个号，而目标号纹丝未动（同类项目的「重登成功但队列里还在」）。
+	if sess.targetUID != "" && acct.UID != sess.targetUID {
+		p.loginMu.Lock()
+		delete(p.logins, state)
+		p.loginMu.Unlock()
+		writeErr(w, http.StatusConflict, fmt.Sprintf(
+			"扫到的账号（uid=%s）与目标账号（uid=%s）不一致：目标账号未被改动，请重新发起重登并确认扫的是同一个号",
+			acct.UID, sess.targetUID))
+		return
+	}
 
 	// 凭证落盘（嵌套形，与 auths/ 目录既有格式一致）→ 热加载进池。
 	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
@@ -218,7 +263,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		UID:          acct.UID,
 		EnterpriseID: acct.EnterpriseID,
 		Nickname:     acct.Nickname,
-		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
+		// 就地改写：优先找该 uid 已存在的那份文件。按 uid 新建会在旁边多出一份
+		// 同 uid 的不同名文件，LoadDir 读哪份变成文件名排序的运气问题。
+		FilePath: p.authFileForUID(acct.UID),
 	}
 	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
 	if sess.realm == "global" {
@@ -230,12 +277,16 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		// CN 也显式补 realm 键（幂等），让 auth 文件形态统一（与 LoadDir 存量迁移对齐）。
 		_, _ = a.BackfillRealm()
 	}
-	if err := a.SaveAtomic(); err != nil {
+	// 合并写：只覆盖 auth/account 两段，保留 device_token / proxy / weight 等手写键
+	//（全新账号没有旧文件，等价于全量写）。
+	if err := a.SaveAtomicMerged(); err != nil {
 		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
 		return
 	}
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
+	// 重登的语义就是「凭证已是全新的」：RT 判死标记一并清掉（否则面板还挂着黄标）。
+	p.cfg.Pool.ClearRefreshTokenDead(acct.UID)
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
 	// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
@@ -275,7 +326,12 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	delete(p.logins, state)
 	p.loginMu.Unlock()
-	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
+	relogin := sess.targetUID != ""
+	if relogin {
+		log.Printf("panel: 重登完成 uid=%s nickname=%q realm=%s（凭证已就地改写并解禁）", acct.UID, acct.Nickname, sess.realm)
+	} else {
+		log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
+	}
 	// 企业上下文预警：真企业空间签发的凭证（JWT enterprise_id 非空）下
 	// /v2/report 行为事件会被上游丢弃，成长任务全部无法点亮（签到/列表/额度
 	// 照常）。当场给出修复路径，避免用户事后对着「已上报但进度 0/x」排查。
@@ -293,7 +349,40 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits":         remain,
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
+		"relogin":         relogin,
 	})
+}
+
+// authFileForUID 找该 uid 已存在的 auth 文件（就地改写用）；找不到才回落
+// workbuddy-<uid>.json。
+//
+// 为什么不能直接拼默认名：用户从本机导入/手写的文件可能叫别的名字
+// （workbuddy-cn-1.json 之类）。按默认名新建会在 auths 里留下同 uid 的两份，
+// 而 LoadDir 用文件名排序决定谁覆盖谁——加载结果变成运气问题。
+func (p *Panel) authFileForUID(uid string) string {
+	files, err := filepath.Glob(filepath.Join(p.cfg.AuthDir, "workbuddy*.json"))
+	if err == nil {
+		for _, f := range files {
+			raw, err := os.ReadFile(f)
+			if err != nil {
+				continue
+			}
+			// 两种形态都认：嵌套形 account.uid / 扁平形顶层 uid。
+			var probe struct {
+				Account struct {
+					UID string `json:"uid"`
+				} `json:"account"`
+				UID string `json:"uid"`
+			}
+			if json.Unmarshal(raw, &probe) != nil {
+				continue
+			}
+			if probe.Account.UID == uid || probe.UID == uid {
+				return f
+			}
+		}
+	}
+	return filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid))
 }
 
 // joinMsg 拼接 login 完成后的提示消息（多段用「；」连接，空段跳过）。

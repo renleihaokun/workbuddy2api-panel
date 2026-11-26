@@ -398,6 +398,12 @@ func (a *Auth) SaveAtomic() error {
 	if a.FilePath == "" {
 		return fmt.Errorf("no FilePath set")
 	}
+	return a.writeDocLocked(a.docLocked())
+}
+
+// docLocked 构造本包权威的凭证文档（嵌套形，插件 OAuth 输出的形状）。
+// 调用方必须已持 a.mu。
+func (a *Auth) docLocked() map[string]any {
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
@@ -417,6 +423,85 @@ func (a *Auth) SaveAtomic() error {
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
 	}
+	return doc
+}
+
+// SaveAtomicMerged 以「合并」语义原子写回：保留文件里本包不认识的顶层键
+// （device_token / proxy / weight / 手写备注…），只覆盖 auth 与 account 两段。
+//
+// 为什么需要它（同类现场，issue #210/#187 同款）：登录 / 导入 / 重登都是「按上游响应
+// 重建整份文件」。直接 SaveAtomic 会把用户手写的 device_token（设备风控凭据）静默
+// 清掉——上游看到设备形态降级，属于「重登把好好的号重登坏了」；proxy/weight 同理。
+//
+// 形态兼容：文件是扁平形（凭证在顶层，Parse 的第二种形态）时按扁平形合并，
+// 不擅自改成嵌套形——形态突变会让排障和插件读取都变难。
+//
+// 副作用：合并后若内存里没有 device_token 而文件里有，会同步回 a.DeviceToken，
+// 否则后续 refresh 走 SaveAtomic 时又会把它写没（这是"合并写"必须闭环的一步）。
+func (a *Auth) SaveAtomicMerged() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if strings.TrimSpace(a.AccessToken) == "" {
+		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
+	}
+	if a.FilePath == "" {
+		return fmt.Errorf("no FilePath set")
+	}
+	doc := map[string]any{}
+	if raw, err := os.ReadFile(a.FilePath); err == nil {
+		var existing map[string]any
+		if json.Unmarshal(raw, &existing) == nil && existing != nil {
+			doc = existing
+		}
+		// 读失败/坏 JSON：退化为新建（与 SaveAtomic 等价）。坏文件本来也读不回字段。
+	}
+	_, nested := doc["auth"]
+	flat := !nested && doc["accessToken"] != nil
+	if flat {
+		doc["accessToken"] = a.AccessToken
+		doc["refreshToken"] = a.RefreshToken
+		doc["expiresAt"] = a.ExpiresAt
+		doc["domain"] = a.Domain
+		doc["realm"] = a.realm
+		doc["uid"] = a.UID
+		doc["enterpriseId"] = a.EnterpriseID
+		doc["nickname"] = a.Nickname
+	} else {
+		authObj, ok := doc["auth"].(map[string]any)
+		if !ok {
+			authObj = map[string]any{}
+			doc["auth"] = authObj
+		}
+		authObj["accessToken"] = a.AccessToken
+		authObj["refreshToken"] = a.RefreshToken
+		authObj["expiresAt"] = a.ExpiresAt
+		authObj["domain"] = a.Domain
+		authObj["realm"] = a.realm
+
+		acctObj, ok := doc["account"].(map[string]any)
+		if !ok {
+			acctObj = map[string]any{}
+			doc["account"] = acctObj
+		}
+		acctObj["uid"] = a.UID
+		acctObj["enterpriseId"] = a.EnterpriseID
+		acctObj["nickname"] = a.Nickname
+	}
+	if a.DeviceToken != "" {
+		doc["device_token"] = a.DeviceToken
+	} else if dt, ok := doc["device_token"].(string); ok {
+		// 文件里有、内存里没有 → 同步回内存，供后续 refresh 的 SaveAtomic 保留。
+		a.DeviceToken = dt
+	}
+	if err := a.writeDocLocked(doc); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeDocLocked 把 doc 原子写到 FilePath（tmp + rename，0600）。
+// 调用方必须已持 a.mu。
+func (a *Auth) writeDocLocked(doc map[string]any) error {
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
