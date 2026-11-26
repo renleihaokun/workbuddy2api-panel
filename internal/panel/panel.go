@@ -576,6 +576,36 @@ func (p *Panel) modelStyle() (modelid.Style, bool) {
 	return modelid.StyleOf(p.cfg.ModelsIDStyle), p.cfg.ModelsRealmNamePrefix
 }
 
+// hiddenModels 当前生效的模型黑名单（规范键 realm:bare，与 /v1/models 同源）。
+// 运行期以 livecfg 快照为准；快照缺失（测试/裸用）返回 nil = 不隐藏。
+func (p *Panel) hiddenModels() map[string]struct{} {
+	if p.cfg.Live == nil {
+		return nil
+	}
+	return p.cfg.Live.Load().HiddenModels
+}
+
+// filterHiddenModels 按 models.hidden 过滤一批模型，返回可见项与被藏条数。
+//
+// 抽成纯函数是为了能直接对"裸名藏两域 / cn: 只藏该域 / 换 id_style 不失效"这几条
+// 边界做单测——面板 handler 要起账号池 + 上游 stub，成本远高于本函数的价值。
+// realm 用 modelid.RealmCN / RealmGlobal；hidden 为 nil 时原样返回。
+func filterHiddenModels(hidden map[string]struct{}, realm string, infos []upstream.ModelInfo) ([]upstream.ModelInfo, int) {
+	if len(hidden) == 0 {
+		return infos, 0
+	}
+	out := make([]upstream.ModelInfo, 0, len(infos))
+	hiddenN := 0
+	for _, mi := range infos {
+		if _, hide := hidden[modelid.Key(realm, mi.ID)]; hide {
+			hiddenN++
+			continue
+		}
+		out = append(out, mi)
+	}
+	return out, hiddenN
+}
+
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
 // 与 /v1/models 同口径的双域输出：ID 写法随 models.id_style（默认 cn:model，
@@ -584,10 +614,16 @@ func (p *Panel) modelStyle() (modelid.Style, bool) {
 // 解析 ID 字符串（换标准写法时不会连带把筛选/可用性标签搞坏）。
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
+//
+// models.hidden 口径与 /v1/models 完全一致（modelid.Key(realm, bare)）：此前本页
+// 不看黑名单，配了 hidden 之后面板还是把藏掉的模型全列出来，看着像"没生效"。
+// 隐藏条数单独回给前端（hidden_count），免得"少了东西"却没有解释。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
 	style, namePrefix := p.modelStyle()
+	hidden := p.hiddenModels()
+	hiddenCount := 0
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
@@ -597,7 +633,9 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				fetchErrs = append(fetchErrs, "cn: "+err.Error())
 			} else {
-				for _, mi := range infos {
+				visible, hid := filterHiddenModels(hidden, modelid.RealmCN, infos)
+				hiddenCount += hid
+				for _, mi := range visible {
 					out = append(out, panelModelEntry(style, namePrefix, "cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
 				}
 			}
@@ -614,7 +652,9 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					for _, mi := range infos {
+					visible, hid := filterHiddenModels(hidden, modelid.RealmGlobal, infos)
+					hiddenCount += hid
+					for _, mi := range visible {
 						out = append(out, panelModelEntry(style, namePrefix, "global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
 					}
 				}
@@ -627,10 +667,14 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
 			return
 		}
-		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
-		return
+		// 全部被 models.hidden 藏掉 ≠ 没有账号：前者是配置结果（200 + 空列表 +
+		// hidden_count），后者才是 503。混在一起会让"藏太多"看起来像故障。
+		if hiddenCount == 0 {
+			writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+			return
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out, "hidden_count": hiddenCount})
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 按 style 拼 realm 前缀

@@ -161,6 +161,7 @@
 - **别名**：`models.aliases`（`alias → 规范模型`，支持 `cn:` / `global:` 前缀），`resolveModel` 先查别名；`/v1/models` 同时列出别名与真名。解决「客户端内置模型名对不上」的迁移痛点（new-api 的「模型重定向」、workbuddy-manager 的「模型别名映射」都在做）。
 - **元数据**：`/v1/models` 每项补 `context_length` / `max_output_tokens` / `capabilities`（tools / vision / thinking）/ `pricing_multiplier`。多数客户端会忽略多余字段，但 Cline、Cherry Studio 这类会用到上下文长度。数据我们面板里已有，只是没透出。
 - **工作量**：S（半天到 1 天）。**风险**：低。
+- **2026-11-26 补研（目录卫生 / 漂移监控）**：同源代码 `misakano7545/workbuddy2api-panel` 已落地两件我们还没有的东西——`models.allowed` 白名单（issue #68，与 `hidden` 取交集；"只放出常用的几个"比维护一张越滚越长的黑名单省事）与 `watchdog`（定期对 `/v1/models` 取指纹，模型增减 / 能力字段变动经 `alerting.webhook_url` 告警）；`workbuddy2api-hub` 走的是「网关 → 模型清单」页 + `model_aliases`（默认关闭，可先填好不生效）+ per-key 模型白名单。三家都**没有**处理上游模型对象上的 `disabled` 字段——本仓库这一轮的选择是两条目录路同口径剔除（见 README「目录端点取证与 `disabled` 口径」），并补 `cmd/catalogprobe` 做一次性取证；常驻 watchdog 暂不做，等真有告警通道需求再上。本节为 2026-11-26 快照，以当时仓库代码为准，后续同类项目变动不追认。
 
 ### P1-6　审计日志 + 鉴权防爆破 + 只读令牌
 

@@ -1111,7 +1111,12 @@ async function loadModels() {
     }
     mdProbeOf = m => mdProbeByKey[mdProbeKey(m)] || mdProbes[mdModelBare(m)] || undefined;
     const hit = mdAll.filter(m => mdProbeOf(m)).length;
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 目录已缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    // models.hidden 在服务端已过滤（与 /v1/models 同口径），这里只把条数说清楚，
+    // 否则"少了一堆模型"会被读成上游目录缩水。
+    const hiddenN = Number(d.hidden_count) || 0;
+    $('mdNote').textContent = mdAll.length + ' 个模型 · 目录已缓存'
+      + (hit ? ' · ' + hit + ' 个有实测上限' : '')
+      + (hiddenN ? ' · 已按 models.hidden 隐藏 ' + hiddenN + ' 个' : '');
     mdVisible = 20;
     renderModels();
   } catch (e) {

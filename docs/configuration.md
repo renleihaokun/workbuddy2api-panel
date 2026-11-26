@@ -34,6 +34,12 @@
 
 ## 容易踩错的字段
 
+### `models.hidden` / 上游 `disabled` 的区别
+
+- `models.hidden` 是**我们**的黑名单：`/v1/models` 列表过滤 + 点名调用 400 + 面板模型页同步过滤（页头显示已隐藏条数）。裸名藏两域，`cn:` / `global:` 只藏该域，热生效。
+- 上游 `disabled` 是**上游**写在模型对象上的下架标记：两条目录路（`/v3/config` 与企业端点）都已按它剔除，不需要也不应该手工抄进 `models.hidden`。
+- 想让列表更清爽，优先加 `models.hidden`（不重启）；想确认上游到底下架了什么，用 `cmd/catalogprobe`（见 [operations.md](operations.md#7-上游目录与端点取证cmdcatalogprobe)）。
+
 ### `pool.verify_session_on_401` / `pool.session_verify_interval`
 
 - 默认 `true` / `60s`，热生效。

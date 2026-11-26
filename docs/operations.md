@@ -123,7 +123,30 @@ systemctl start workbuddy-panel
 
 面板静态资源带内容哈希 ETag 与 `Cache-Control: no-cache`。先硬刷新 / 确认二进制版本；若仍异常，检查反向代理是否自行缓存了 `app.js`。
 
-## 7. 回滚原则
+## 7. 上游目录与端点取证（`cmd/catalogprobe`）
+
+模型列表"突然少了一堆/多了一堆"、或怀疑上游改了接口时，先取证再改配置：
+
+```bash
+# 在网关所在机器上执行（与 auths/ 同机）；只发 GET，不发推理请求，不打印 token
+go run ./cmd/catalogprobe -auth-dir ./auths                 # CN 域
+go run ./cmd/catalogprobe -auth-dir ./auths -realm global    # global 域
+go run ./cmd/catalogprobe -auth-dir ./auths -baseline data/catalog-cn.json   # 与上次指纹对比
+go run ./cmd/catalogprobe -auth-dir ./auths -write-baseline data/catalog-cn.json
+```
+
+看三样东西：
+
+1. **每路的 status** —— `404` = 路径被改；`401/403` = 鉴权/风控拦了；`500` + HTML = 边缘层。
+   global 的 `/console/enterprises/personal/models` 自 2026-11 起长期 500，属已知降级（只用 v3 三路）。
+2. **信封键**（`data` 段的键）—— 上游新增/删改结构会先在这里显形，即使本版本还没解析那些段。
+3. **`disabled` 清单** —— 上游标成下架的模型。两条目录路（`/v3/config` 与企业端点）都按它剔除；
+   过滤时进程日志会打 `INFO: [upstream] v3/config 过滤 disabled 模型 N 个…`。
+
+`-public` 会额外发 3 次**无鉴权** GET（`/v3/config`、企业模型端点、`/v2/chat/completions`），
+只用来区分"路径没了"与"要鉴权"，默认不开。
+
+## 8. 回滚原则
 
 1. 二进制回滚：使用最近的 `wb2api.bak-<时间戳>` 或上一 Release 包，替换后重启。
 2. 配置回滚：恢复备份的 `config.json`，不要用旧示例覆盖生产密钥。

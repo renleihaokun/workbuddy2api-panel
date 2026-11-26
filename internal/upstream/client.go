@@ -1740,30 +1740,44 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 	return out
 }
 
-// fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
-// 解析口径：agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除。
-func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
+// getEnterpriseModelsRaw GET 企业模型端点取原始响应体（仅 200 返回值）。
+//
+// 与 getV3ConfigRaw 同一定位：目录解析只关心「模型字段」，端点取证（ProbeCatalog）
+// 还要 status 与 disabled 标记，两边共用同一份请求头逻辑，避免指纹来源分裂。
+// 返回的 status 供取证区分「路径没了(404)」与「认证/风控拦了(401/403)」；传输层失败 status=0。
+func (c *Client) getEnterpriseModelsRaw(a *auth.Auth) (raw []byte, status int, err error) {
 	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
 	endpoint := c.chatBase(a) + "/console/enterprises/personal/models"
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误（handler 侧该路径不 NoteError）。
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, resp.StatusCode, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	return raw, resp.StatusCode, nil
+}
+
+// fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
+// 解析口径：agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除。
+// 请求头 / 错误口径见 getEnterpriseModelsRaw。
+func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
+	raw, _, err := c.getEnterpriseModelsRaw(a)
+	if err != nil {
+		return nil, err
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -2114,14 +2128,20 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	return "copilot.tencent.com"
 }
 
-// fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
-// 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
-// ua 为该次请求的 User-Agent；空串等价 v3ConfigUA(a)。该端点对 UA 敏感且**不同 UA 下发
-// 不同模型集合**，调用方据此并发多路取并集。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+// getV3ConfigRaw GET /v3/config 取原始响应体（仅 200 返回值；非 200 归一成带状态码的错误）。
+//
+// 抽出来的原因：目录解析（fetchV3ConfigModelMap）与端点取证（ProbeCatalog）要用
+// 同一套请求头 / UA / 错误口径。取证侧只需要「原始 JSON + disabled 标记」，让它
+// 自己再拼一遍头，等于给上游多一份会各自漂移的指纹来源。
+//
+// 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403；
+// 且**不同 UA 下发不同模型集合**，调用方据此并发多路取并集。
+// ua 为空等价 v3ConfigUA(a)。返回的 status 供端点取证区分「路径没了(404)」与
+// 「认证/风控拦了(401/403)」——目录解析不看它，取证必须看。传输层失败 status=0。
+func (c *Client) getV3ConfigRaw(a *auth.Auth, ua string) (raw []byte, status int, err error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -2139,16 +2159,31 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	raw, err = io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, resp.StatusCode, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	return raw, resp.StatusCode, nil
+}
+
+// fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
+// 请求头 / UA / 错误口径见 getV3ConfigRaw；ua 为空等价 v3ConfigUA(a)。
+//
+// disabled 口径：上游在每个模型对象上带 `disabled` 布尔（下架 / 该账号类型不可用），
+// 与 /console/enterprises/personal/models 那条路**同口径**——disabled 的一律不上架。
+// 此前这条路只解析不过滤，同一份上游数据两条路两套判定，已下架的模型会从这里漏进
+// /v1/models 与面板，客户端选中后才在调用时吃 11102/11158。
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+	raw, _, err := c.getV3ConfigRaw(a, ua)
+	if err != nil {
+		return nil, err
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -2175,11 +2210,25 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		return nil, fmt.Errorf("v3/config code=%d", env.Code)
 	}
 	out := make(map[string]ModelInfo, len(env.Data.Models))
+	var disabled []string
 	for _, m := range env.Data.Models {
 		if strings.TrimSpace(m.ID) == "" {
 			continue
 		}
+		if m.Disabled {
+			disabled = append(disabled, m.ID)
+			continue
+		}
 		out[m.ID] = m.modelInfo()
+	}
+	// 观测：上游确实下发 disabled 时留一行证据（同 UA 一天几百次探测，只在 >0 时打）。
+	if len(disabled) > 0 {
+		uaLabel := ua
+		if uaLabel == "" {
+			uaLabel = c.v3ConfigUA(a)
+		}
+		log.Printf("INFO: [upstream] v3/config 过滤 disabled 模型 %d 个（UA=%s）: %s",
+			len(disabled), truncate(uaLabel, 48), truncate(strings.Join(disabled, ", "), 200))
 	}
 	// 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」的模型只放在这里，
 	// data.models 里没有，故纯目录解析会漏（实测 global 侧 hy4-preview-f 即如此，

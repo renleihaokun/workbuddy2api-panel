@@ -137,7 +137,7 @@ INFO: [server] channel refused acct=... model=... -> systemAsUser retry (sys=xxx
 | 增量 | 说明 | 详见 |
 |---|---|---|
 | **OpenAI Responses API** | 原生 `POST /v1/responses`（Codex CLI 直连），复用全部选号 / 冷却 / 提示词管线 | [Responses API](#responses-apicodex-直连) |
-| **模型目录与牌价** | 按 2026-11-05 官方客户端快照刷新档位 / 上下文 / 输出上限；上游缺 `credits` 时用静态牌价兜底并标 `credits_reference` | [模型与档位数据维护](#模型与档位数据维护) |
+| **模型目录与牌价** | 按 2026-11-05 官方客户端快照刷新档位 / 上下文 / 输出上限；上游缺 `credits` 时用静态牌价兜底并标 `credits_reference`；上游 `disabled`（下架 / 该账号类型不可用）在两条目录路上同口径剔除，取证用 `cmd/catalogprobe` | [模型与档位数据维护](#模型与档位数据维护) |
 | **控制面批量闸门** | `pool.batch_concurrency` 让余额刷新 / 任务扫描 / 补领清扫等按账号扇出的任务共享并发闸门与单飞 | [批量任务并发与单飞](#批量任务并发与单飞poolbatch_concurrency) |
 | **5 个专家任务** | `expert_use_maidehao` / `douyinyin` / `shangjia_xuanchuan` / `bowangwang` / `WorkBuddy_Valorant` 一键完成 | [成长任务一键完成](#-成长任务一键完成2325) |
 | **错误分类修复** | `6000` 模型级限流、`14003` 模型忙（含 body `retry_after` 解析） | [错误分类与账号处置](#错误分类与账号处置) |
@@ -576,7 +576,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.passthrough_ip` | `false` | 是否把客户端 IP 透传给上游；默认关闭（反代安全边界）。改动需重启 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体**整句**指纹脱敏：Claude Code / Codex 模板句、裸 `11128`、DSH 身份句、三方 `dsh-auto-review` 与官方 `auto-review`（含中文副本 `auto-review-zh`）审查插件的身份句。**只作用于 system / developer / assistant 消息**，user 与 tool 消息逐字原样（上游通道校验只读 system / developer 与 assistant，2026-10-21 真机 A/B） |
 | `features.system_as_user_fallback` | `true` | **system→user 搬移重试**：只在「身份句被拒」（`request illegal` / `unapproved channel` / `illegal api invocation`）时把 system 原文搬进首条 user（`<instructions>` 包裹）、system 留中性提示词、同请求内重发一次；成功后记住该段 system（哈希，24h / 上限 512）。结构性拒绝（首条不是 system、缺会话 id）不重试；搬完仍拒 → `400 channel_refused` 终止轮转。`false` = 关闭搬移 |
-| `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`/`"cn/xxx"`/`"global/xxx"`=只藏该域（斜杠与冒号等价，大小写敏感）。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）。面板保存后热生效 |
+| `models.hidden` | `[]` | 模型黑名单：不对外暴露的模型。裸名=两域都藏；`"cn:xxx"`/`"global:xxx"`/`"cn/xxx"`/`"global/xxx"`=只藏该域（斜杠与冒号等价，大小写敏感）。`GET /v1/models` 列表过滤 + `POST /v1/chat/completions` 点名拒绝（400 `model_unavailable`）+ **面板「模型与档位」页同口径过滤**（页头显示「已按 models.hidden 隐藏 N 个」，避免面板与 API 两套目录）。面板保存后热生效 |
 | `models.id_style` | `colon` | 模型列表/面板输出的 ID 分隔符：`colon`=`cn:model`（默认，既有协议，零回归）；`slash`=`cn/model`（Cherry Studio 2.x 等按 `/` 取末段匹配内置模型目录的客户端必须用这个，否则模型会被降级成无能力/上下文的「自定义模型」）。**只影响展示**：请求侧永远同时接受 `cn:`、`global:`、`cn/`、`global/` 与裸名。面板保存后热生效，无需重启 |
 | `models.realm_name_prefix` | `false` | `true` 时列表/面板的模型 `name` 前置 `CN · ` / `Global · `，便于两域同 id（如 `deepseek-v4.1-flash`）在保留服务端 name 的客户端里区分；空 name 不编造。默认关闭 = 现有输出不变；热生效 |
 | `prompt.mode` | `passthrough` | 系统提示词模式：`passthrough` = 透传客户端原始 system（默认，保留 DSH / CLI 原生指令；降级重试仍切中性提示词）；`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动） |
@@ -1525,6 +1525,35 @@ ssh haokun 'cd ~/workbuddy2api-panel && sudo systemd-run --unit=wb2api-deploy --
 | `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节）；**不在镜像内**，需在宿主机运行 |
 
 二进制不在 git 中：`login.sh` / `signin.sh` 首次使用会自动 `go build` 对应 `cmd/*`，`credit.sh` 需手动编译（或使用 Docker 镜像内的预编译版本）；也可直接从 [Releases](https://github.com/renleihaokun/workbuddy2api-panel/releases) 下载五平台预编译包。
+
+### 目录端点取证与 `disabled` 口径
+
+`/v3/config` 的每个模型对象带一个 `disabled` 布尔（上游自己写的「这个模型对当前账号不可用」：
+下架 / 套餐不含 / 账号类型无权）。**两条目录路必须同口径**：企业端点
+（`/console/enterprises/personal/models`）一直按它剔除，`/v3/config` 此前只解析不过滤 ——
+同一份上游数据两条路两套「在架判定」，下架模型会从 v3 漏进 `/v1/models` 与面板，客户端选中
+后才在调用时吃 `11102`（模型不存在）或 `11158`（账号类型无权）。现在 v3 路也剔除，过滤时打
+一行 INFO（带被过滤的 id），方便事后对账。
+
+取证 / 判断上游端点有没有改版：
+
+```bash
+# 在网关所在机器上（与 auths/ 同机）。只发 GET、不发推理、不花积分、不打印 token
+go run ./cmd/catalogprobe -auth-dir ./auths                    # CN
+go run ./cmd/catalogprobe -auth-dir ./auths -realm global       # global
+go run ./cmd/catalogprobe -auth-dir ./auths -write-baseline data/catalog-cn.json
+go run ./cmd/catalogprobe -auth-dir ./auths -baseline data/catalog-cn.json   # 隔天 diff
+go run ./cmd/catalogprobe -auth-dir ./auths -public             # 额外 3 次无鉴权探测（只看路径在不在）
+```
+
+每路一行：`status / total / enabled / disabled` + 信封键（`data` 段的键，用来判断上游是否新增
+或删改了结构），`disabled` 单独列 id。`-baseline` 只比 `status / models / disabled` 三项，新增
+模型打 `+`、消失打 `-`。信封里还有本项目暂未解析的段（如 `modelTiers`、`featureToggles`、
+`endpoint`、`defaultVideoModel`），改版时它们会先在信封键里显形。
+
+2026-11-26 实测（各取一个号）：CN 桌面 UA 58 条 / 1 条 disabled（`wb-lite`）、IDE UA 25 / 1、
+CLI UA 34 / 0；global 桌面 28 / 0、IDE 13 / 1、CLI 28 / 0；企业端点在 global 恒 500（边缘层拦，
+已降级为「仅 v3 三路」）。
 
 ### 探测模型真实输出上限
 
