@@ -61,7 +61,12 @@
 ### `schedule.keepalive_renew_before`
 
 - 默认 `"168h"`（7 天）；`"0"` 表示每次保活都刷新。
-- 只影响定时保活排程：access token 剩余有效期高于该阈值（或已知 RT 已死但 AT 仍可用）时跳过刷新，减少无谓的 OAuth 轮换。
+- **同时影响定时保活排程与面板手动「全部保活」**：access token 剩余有效期高于该阈值（或已知 RT 已死但 AT 仍可用）时跳过刷新，减少无谓的 OAuth 轮换与集中刷新特征；强制单号刷新请使用账号行「刷新」。
+
+### `pool.batch_concurrency` / `pool.batch_delay_min_ms` / `pool.batch_delay_max_ms`
+
+- 默认 `1` / `800` / `2000`，全部**热生效**。
+- 控制面按账号扇出的任务默认严格串行，并在相邻账号间插入随机 `[min, max]` 停顿，避免同出口 IP 在同秒集中触发多号行为簇。显式设 `0` 可关闭停顿。
 
 ### `upstream.legacy_catalog_probe`
 

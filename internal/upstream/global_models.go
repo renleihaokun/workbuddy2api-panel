@@ -99,6 +99,43 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	return infos
 }
 
+// GlobalModelInfosCached 纯内存读取已缓存的 global 模型目录（零上游请求）。
+func (c *Client) GlobalModelInfosCached(ttl time.Duration) ([]ModelInfo, time.Time) {
+	if c == nil {
+		return nil, time.Time{}
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.infos) == 0 || c.globalModels.fetched.IsZero() {
+		return nil, time.Time{}
+	}
+	if ttl > 0 && time.Since(c.globalModels.fetched) >= ttl {
+		return nil, c.globalModels.fetched
+	}
+	out := make([]ModelInfo, len(c.globalModels.infos))
+	copy(out, c.globalModels.infos)
+	return out, c.globalModels.fetched
+}
+
+// RefreshGlobalModelInfos 面板手动刷新 global 模型目录（带 minCooldown 防抖；若近期已刷新直接复用缓存）。
+func (c *Client) RefreshGlobalModelInfos(a *auth.Auth, minCooldown time.Duration) []ModelInfo {
+	if c == nil || !c.globalOn(a) {
+		return nil
+	}
+	c.globalModels.Lock()
+	if minCooldown > 0 && len(c.globalModels.infos) > 0 && !c.globalModels.fetched.IsZero() && time.Since(c.globalModels.fetched) < minCooldown {
+		out := make([]ModelInfo, len(c.globalModels.infos))
+		copy(out, c.globalModels.infos)
+		c.globalModels.Unlock()
+		return out
+	}
+	// 清空过期时间戳以触发一轮顺序重探。
+	c.globalModels.fetched = time.Time{}
+	c.globalModels.lastFail = time.Time{}
+	c.globalModels.Unlock()
+	return c.FetchGlobalModelInfos(a)
+}
+
 // fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
 // 纯动态：成功 = 并集结果去重；一切失败 = nil（不回落静态）。
 // infos 仅对象形态成功探测时非 nil。
@@ -182,73 +219,61 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
 // 降级为其余路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
-	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
-	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
-	probeV3 := func(ua string) chan probeResult {
-		ch := make(chan probeResult, 1)
-		go func() {
-			// chatBase 已按 realm 切 global base。
-			byID, perr := c.fetchV3ConfigModelMap(a, ua)
-			if perr != nil {
-				ch <- probeResult{err: perr}
-				return
-			}
-			ids := make([]string, 0, len(byID))
-			outInfos := make([]ModelInfo, 0, len(byID))
-			for _, mi := range byID {
-				if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
-					continue
-				}
-				ids = append(ids, mi.ID)
-				outInfos = append(outInfos, mi)
-			}
-			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
-			ch <- probeResult{names: ids, infos: outInfos}
-		}()
-		return ch
-	}
-	// 主路桌面端 UA（真机形态）；仅当 LegacyCatalogProbe=true 时并发补两条历史 UA。
-	v3DesktopCh := probeV3(c.chatUA(a))
-	var v3IDECh, v3CLICh chan probeResult
-	legacy := c.LegacyCatalogProbe()
-	if legacy {
-		v3IDECh = probeV3(legacyIDEProbeUA)
-		v3CLICh = probeV3(legacyCLIProbeUA)
-	}
-	enterpriseCh := make(chan probeResult, 1)
-	go func() {
-		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
-		var lastErr error
-		for _, path := range globalModelsProbePaths {
-			names, infos, perr := c.globalModelsOnce(a, path)
-			if perr != nil {
-				lastErr = perr
+	// probeV3 单次 /v3/config 探测（UA 参数化）。为避免同账号同毫秒并发打出多路 UA，
+	// 各路改为顺序探测并插入微短间隔。
+	probeV3 := func(ua string) probeResult {
+		// chatBase 已按 realm 切 global base。
+		byID, perr := c.fetchV3ConfigModelMap(a, ua)
+		if perr != nil {
+			return probeResult{err: perr}
+		}
+		ids := make([]string, 0, len(byID))
+		outInfos := make([]ModelInfo, 0, len(byID))
+		for _, mi := range byID {
+			if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 				continue
 			}
-			enterpriseCh <- probeResult{names: names, infos: infos}
-			return
+			ids = append(ids, mi.ID)
+			outInfos = append(outInfos, mi)
 		}
-		enterpriseCh <- probeResult{err: lastErr}
-	}()
+		sort.Strings(ids) // map 迭代序随机，排序保输出稳定
+		return probeResult{names: ids, infos: outInfos}
+	}
 	routes := []struct {
 		label string
 		res   probeResult
 	}{
-		{"desktop-UA", <-v3DesktopCh},
+		{"desktop-UA", probeV3(c.chatUA(a))},
 	}
-	if legacy {
-		routes = append(routes,
-			struct {
-				label string
-				res   probeResult
-			}{"IDE-UA", <-v3IDECh},
-			struct {
-				label string
-				res   probeResult
-			}{"CLI-UA", <-v3CLICh},
-		)
+	if c.LegacyCatalogProbe() {
+		c.probeGap()
+		routes = append(routes, struct {
+			label string
+			res   probeResult
+		}{"IDE-UA", probeV3(legacyIDEProbeUA)})
+		c.probeGap()
+		routes = append(routes, struct {
+			label string
+			res   probeResult
+		}{"CLI-UA", probeV3(legacyCLIProbeUA)})
 	}
-	enterprise := <-enterpriseCh
+	c.probeGap()
+	// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
+	var enterprise probeResult
+	var lastErr error
+	for _, path := range globalModelsProbePaths {
+		entNames, entInfos, perr := c.globalModelsOnce(a, path)
+		if perr != nil {
+			lastErr = perr
+			continue
+		}
+		enterprise = probeResult{names: entNames, infos: entInfos}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		enterprise.err = lastErr
+	}
 	// v3 多路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
 	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
 	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。

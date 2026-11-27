@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/batch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
@@ -876,6 +877,12 @@ type Client struct {
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
+	// cnModels 缓存最近一次成功的 CN 模型目录探测结果（供 /v1/models 与面板共享，
+	// 避免切页或重复点击直接穿透打上游；FetchModels 仍按需更新本缓存）。
+	cnModels         cnModelsCache
+	modelsRefreshRun batch.Coalescer
+	probeGapEnabled  atomic.Bool
+
 	// catalog 每域最近一次成功探测的模型名快照（见 catalog.go）：同名模型跨域
 	// 回退用它回答「另一域到底有没有这个模型」，只读、不触发上游探测。
 	catalog realmCatalog
@@ -976,6 +983,14 @@ type Client struct {
 	creditObserver atomic.Pointer[CreditObserver]
 }
 
+type cnModelsCache struct {
+	sync.Mutex
+	infos       []ModelInfo
+	fetched     time.Time
+	lastFail    time.Time
+	lastRefresh time.Time
+}
+
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
 // 旁路通知，不改变任何透传字节；未挂载时零开销。用于积分历史留痕
 // （internal/credithist）：余额查询是"积分变动"唯一可靠的观测口——签到 / 活跃
@@ -998,7 +1013,17 @@ func New() *Client {
 		GlobalEnabled: true,
 	}
 	c.SanitizeFingerprints.Store(true)
+	c.probeGapEnabled.Store(true)
 	return c
+}
+
+// probeGap 在同一账号连续探测多个模型目录端点之间插入微短随机停顿（150~350ms），
+// 避免同号同一毫秒打出两路不同 UA/路径。测试裸构造 &Client{} 时零延迟，不拖慢单测。
+func (c *Client) probeGap() {
+	if c == nil || !c.probeGapEnabled.Load() {
+		return
+	}
+	time.Sleep(batch.RandomDelay(150*time.Millisecond, 350*time.Millisecond))
 }
 
 // SetLegacyCatalogProbe 热切换是否启用 /v3/config 的历史 UA 补充探测（CodeBuddyIDE / CLI）。
@@ -1722,42 +1747,42 @@ const legacyCLIProbeUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
-// v3-config-merge：动态目录 = /v3/config（主，IDE UA 完整能力版）+ 企业端点
-// （/console，cli 面过滤，补缺）的并集，两路**并发**探测。合并去重 key = 模型 id，
-// v3 条目优先（credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型。
-// /v3 失败（400/网络错/解析失败）不拖累企业端点结果——降级为仅企业端点，warn 日志；
-// 反之亦然（两路独立容错）。
+// v3-config-merge：动态目录 = /v3/config（主，桌面 UA 完整能力版）+ 企业端点
+// （/console，cli 面过滤，补缺）的并集。为避免同一账号同毫秒内发出双路并发特征，
+// 改为顺序探测并在两路间插入微短停顿；成功结果写入 cnModels 缓存供共享复用。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	type probeResult struct {
-		infos []ModelInfo
-		err   error
+	entInfos, entErr := c.fetchEnterpriseModels(a)
+	c.probeGap()
+	v3Infos, v3Err := c.fetchV3Models(a)
+	if entErr != nil && v3Err != nil {
+		c.cnModels.Lock()
+		c.cnModels.lastFail = time.Now()
+		c.cnModels.Unlock()
+		return nil, entErr // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
 	}
-	enterpriseCh := make(chan probeResult, 1)
-	v3Ch := make(chan probeResult, 1)
-	go func() {
-		infos, err := c.fetchEnterpriseModels(a)
-		enterpriseCh <- probeResult{infos, err}
-	}()
-	go func() {
-		infos, err := c.fetchV3Models(a)
-		v3Ch <- probeResult{infos, err}
-	}()
-	enterprise := <-enterpriseCh
-	v3 := <-v3Ch
-	if enterprise.err != nil && v3.err != nil {
-		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
-	}
-	if v3.err != nil {
+	if v3Err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3Err)
 	}
-	if enterprise.err != nil {
-		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+	if entErr != nil {
+		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", entErr)
 	}
-	out := mergeModelInfos(v3.infos, enterprise.infos)
+	out := mergeModelInfos(v3Infos, entInfos)
 	if len(out) == 0 {
+		c.cnModels.Lock()
+		c.cnModels.lastFail = time.Now()
+		c.cnModels.Unlock()
 		return nil, fmt.Errorf("models api returned empty list")
 	}
+	copied := make([]ModelInfo, len(out))
+	copy(copied, out)
+	now := time.Now()
+	c.cnModels.Lock()
+	c.cnModels.infos = copied
+	c.cnModels.fetched = now
+	c.cnModels.lastFail = time.Time{}
+	c.cnModels.Unlock()
+
 	c.storeModelRates(a.Realm(), out)
 	// 名字快照（catalog.go）：同名模型跨域回退的目录判据。与倍率表分开存——
 	// 倍率表只收「有可解析倍率」的模型，不能当目录用。
@@ -1784,6 +1809,55 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
 	c.storeEfforts(a.Realm(), cache, defCache)
 	return out, nil
+}
+
+// CNModelsCached 纯内存读取最近一次成功的 CN 模型目录缓存（零上游请求）。
+// ttl>0 时超期返回 nil；ttl<=0 时只要曾成功探测过即返回。
+func (c *Client) CNModelsCached(ttl time.Duration) ([]ModelInfo, time.Time) {
+	if c == nil {
+		return nil, time.Time{}
+	}
+	c.cnModels.Lock()
+	defer c.cnModels.Unlock()
+	if len(c.cnModels.infos) == 0 || c.cnModels.fetched.IsZero() {
+		return nil, time.Time{}
+	}
+	if ttl > 0 && time.Since(c.cnModels.fetched) >= ttl {
+		return nil, c.cnModels.fetched
+	}
+	out := make([]ModelInfo, len(c.cnModels.infos))
+	copy(out, c.cnModels.infos)
+	return out, c.cnModels.fetched
+}
+
+// RefreshCNModels 面板手动刷新 CN 模型目录：带 Coalescer 单飞合并与 minCooldown 防抖冷却。
+func (c *Client) RefreshCNModels(a *auth.Auth, minCooldown time.Duration) ([]ModelInfo, error) {
+	if c == nil || a == nil {
+		return nil, fmt.Errorf("missing client or account")
+	}
+	var out []ModelInfo
+	var err error
+	c.modelsRefreshRun.Do(func() {
+		c.cnModels.Lock()
+		recent := minCooldown > 0 && !c.cnModels.lastRefresh.IsZero() && time.Since(c.cnModels.lastRefresh) < minCooldown
+		cached := c.cnModels.infos
+		c.cnModels.Unlock()
+		if recent && len(cached) > 0 {
+			out = make([]ModelInfo, len(cached))
+			copy(out, cached)
+			return
+		}
+		out, err = c.FetchModels(a)
+		c.cnModels.Lock()
+		c.cnModels.lastRefresh = time.Now()
+		c.cnModels.Unlock()
+	})
+	if len(out) == 0 && err == nil {
+		if cached, _ := c.CNModelsCached(0); len(cached) > 0 {
+			return cached, nil
+		}
+	}
+	return out, err
 }
 
 // mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
@@ -1914,19 +1988,16 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 		byID map[string]ModelInfo
 		err  error
 	}
-	probe := func(ua string) chan v3Result {
-		ch := make(chan v3Result, 1)
-		go func() {
-			byID, err := c.fetchV3ConfigModelMap(a, ua)
-			ch <- v3Result{byID: byID, err: err}
-		}()
-		return ch
+	probe := func(ua string) v3Result {
+		byID, err := c.fetchV3ConfigModelMap(a, ua)
+		return v3Result{byID: byID, err: err}
 	}
-	r1 := <-probe(c.v3ConfigUA(a))
+	r1 := probe(c.v3ConfigUA(a))
 	var results []v3Result
 	results = append(results, r1)
 	if c.LegacyCatalogProbe() {
-		r2 := <-probe(legacyIDEProbeUA)
+		c.probeGap()
+		r2 := probe(legacyIDEProbeUA)
 		results = append(results, r2)
 		if r1.err != nil && r2.err != nil {
 			return nil, r1.err

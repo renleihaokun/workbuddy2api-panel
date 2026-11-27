@@ -166,6 +166,18 @@ function setBusy(btn, label) {
     btn.textContent = nextLabel == null ? prevText : nextLabel;
   };
 }
+function delayMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+async function pollUntilIdle(fetchFn, isRunning, onTick, opts) {
+  const interval = (opts && opts.interval) || 1200;
+  const maxAttempts = (opts && opts.maxAttempts) || 240;
+  for (let i = 0; i < maxAttempts; i++) {
+    await delayMs(interval);
+    const d = await fetchFn();
+    if (onTick) onTick(d);
+    if (!isRunning(d)) return d;
+  }
+  return await fetchFn();
+}
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
 // 显式替换 5 个字符：& < > " '（& 必须最先，避免二次转义）。
@@ -895,6 +907,7 @@ async function loadOverview(quiet) {
     // 「检查」之后卡片永远停在那一刻的旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
+    syncOverviewTaskButtons(d);
     markScrollables();
   } catch (e) {
     // 轮询失败不能装没事：顶栏状态切到「连接中断」，下一次成功会自动恢复。
@@ -994,38 +1007,68 @@ $('accBody').addEventListener('click', async ev => {
   await runAccountAction(a, u, b);
 });
 
-$('btnCheckinAll').onclick = async () => {
-  try {
-    const d = await api('checkin_all', { method: 'POST' });
-    const skipped = d && d.started === false;
-    toast(skipped ? '上一轮签到仍在执行，本次已跳过' : '全部签到已开始，结果见日志', skipped ? '' : 'ok');
+const OVERVIEW_TASK_BUTTONS = [
+  ['checkin', 'btnCheckinAll', '全部签到', '签到中'],
+  ['travel', 'btnTravelAll', '旅行巡检', '巡检中'],
+  ['activity', 'btnActivityAll', '活跃上报', '上报中'],
+  ['keepalive', 'btnKeepaliveAll', '全部保活', '保活中'],
+  ['balance', 'btnRefresh', '刷新余额', '刷新中'],
+];
+function syncOverviewTaskButtons(d) {
+  const tasks = d && d.tasks;
+  if (tasks) {
+    for (const [key, id, idleLabel, busyLabel] of OVERVIEW_TASK_BUTTONS) {
+      const btn = $(id);
+      if (!btn || btn._localBusy) continue;
+      const st = tasks[key];
+      if (st && st.running) {
+        btn.disabled = true;
+        if (btn.setAttribute) btn.setAttribute('aria-busy', 'true');
+        btn.textContent = busyLabel + (st.total ? ' (' + (st.done || 0) + '/' + st.total + ')' : '') + '…';
+      } else {
+        btn.disabled = false;
+        if (btn.removeAttribute) btn.removeAttribute('aria-busy');
+        btn.textContent = idleLabel;
+      }
+    }
   }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnKeepaliveAll').onclick = async () => {
-  try {
-    const d = await api('keepalive_all', { method: 'POST' });
-    const skipped = d && d.started === false;
-    toast(skipped ? '上一轮保活仍在执行，本次已跳过' : '全部保活已开始，结果见日志', skipped ? '' : 'ok');
+  const nb = $('btnNickSync');
+  if (nb && !nb._localBusy && d && d.nicknames_sync) {
+    if (d.nicknames_sync.scanning) {
+      nb.disabled = true;
+      if (nb.setAttribute) nb.setAttribute('aria-busy', 'true');
+      nb.textContent = '同步中…';
+    } else {
+      nb.disabled = false;
+      if (nb.removeAttribute) nb.removeAttribute('aria-busy');
+      nb.textContent = '同步昵称';
+    }
   }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnTravelAll').onclick = async () => {
-  try {
-    const d = await api('travel_all', { method: 'POST' });
-    const skipped = d && d.started === false;
-    toast(skipped ? '上一轮旅行巡检仍在执行，本次已跳过' : '旅行巡检已开始（含领养链路），结果见日志', skipped ? '' : 'ok');
-  }
-  catch (e) { toast(e.message, 'err'); }
-};
-$('btnActivityAll').onclick = async () => {
-  try {
-    const d = await api('activity_all', { method: 'POST' });
-    const skipped = d && d.started === false;
-    toast(skipped ? '上一轮活跃上报仍在执行，本次已跳过' : '活跃上报已开始，结果见日志', skipped ? '' : 'ok');
-  }
-  catch (e) { toast(e.message, 'err'); }
-};
+}
+function bindBatchActionBtn(id, endpoint, busyLabel, idleLabel, startMsg, skipMsg) {
+  const btn = $(id);
+  if (!btn) return;
+  btn.onclick = async () => {
+    if (btn._localBusy) return;
+    btn._localBusy = true;
+    const done = setBusy(btn, busyLabel);
+    try {
+      const d = await api(endpoint, { method: 'POST' });
+      const skipped = d && d.started === false;
+      toast(skipped ? skipMsg : startMsg, skipped ? '' : 'ok');
+      await loadOverview(true);
+    } catch (e) {
+      toast(e.message, 'err');
+      done(idleLabel);
+    } finally {
+      btn._localBusy = false;
+    }
+  };
+}
+bindBatchActionBtn('btnCheckinAll', 'checkin_all', '签到中…', '全部签到', '全部签到已开始（串行防探测），结果见日志', '上一轮签到仍在执行，本次已跳过');
+bindBatchActionBtn('btnKeepaliveAll', 'keepalive_all', '保活中…', '全部保活', '全部保活已开始（仅刷临期且串行），结果见日志', '上一轮保活仍在执行，本次已跳过');
+bindBatchActionBtn('btnTravelAll', 'travel_all', '巡检中…', '旅行巡检', '旅行巡检已开始（串行防探测），结果见日志', '上一轮旅行巡检仍在执行，本次已跳过');
+bindBatchActionBtn('btnActivityAll', 'activity_all', '上报中…', '活跃上报', '活跃上报已开始（串行防探测），结果见日志', '上一轮活跃上报仍在执行，本次已跳过');
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
@@ -1078,53 +1121,60 @@ function rateCell(m) {
   return m.credits ? '<span class="help"' + tip + '>' + esc(m.credits) + '</span>' : '—';
 }
 
-async function loadModels() {
+let modelsInFlight = null;
+async function loadModels(force) {
+  if (modelsInFlight) { await modelsInFlight; return; }
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">正在向上游查询…</div></td></tr>';
-  try {
-    // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
-    // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
-    const [d, pr, st, rm] = await Promise.all([
-      api('models'),
-      api('model_probes').catch(() => ({})),
-      // 模型锁取自 overview（/panel/api/status 并不存在，早前这里 404 被 catch 吞掉，
-      // 结果"模型与档位"页的限流可用性标签永远是空——账号池页的模型锁池却是好的）。
-      api('overview').catch(() => ({})),
-      api('request_metrics').catch(() => ({})),
-    ]);
-    mdAll = d.models || [];
-    mdProbes = pr.probes || {};
-    mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
-    mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
-    if (!mdAll.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">上游未返回模型</div></td></tr>';
+  const btn = $('btnModels');
+  const done = force ? setBusy(btn, '获取中…') : null;
+  if (!mdAll.length || force) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">' + (force ? '正在向上游查询…' : '正在读取目录缓存…') + '</div></td></tr>';
+  }
+  modelsInFlight = (async () => {
+    try {
+      const [d, pr, st, rm] = await Promise.all([
+        force ? api('models/refresh', { method: 'POST' }) : api('models'),
+        api('model_probes').catch(() => ({})),
+        api('overview').catch(() => ({})),
+        api('request_metrics').catch(() => ({})),
+      ]);
+      mdAll = d.models || [];
+      mdProbes = pr.probes || {};
+      mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
+      mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
+      if (!mdAll.length) {
+        const msg = force ? '上游未返回模型' : '暂无缓存模型目录 · 可点击右上角「重新获取」拉取';
+        tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">' + msg + '</div></td></tr>';
+        $('mdCount').textContent = '';
+        $('mdNote').textContent = force ? '上游未返回模型' : '缓存为空（点「重新获取」拉取）';
+        return;
+      }
+      mdProbeByKey = {};
+      for (const [k, v] of Object.entries(mdProbes)) {
+        const s = mdSplitId(k);
+        mdProbeByKey[s.realm + ':' + s.bare] = v;
+      }
+      mdProbeOf = m => mdProbeByKey[mdProbeKey(m)] || mdProbes[mdModelBare(m)] || undefined;
+      const hit = mdAll.filter(m => mdProbeOf(m)).length;
+      const hiddenN = Number(d.hidden_count) || 0;
+      const age = d.fetched_at ? ' · 更新于 ' + ago(new Date(d.fetched_at).getTime()) : '';
+      $('mdNote').textContent = mdAll.length + ' 个模型 · 共享缓存快照' + age
+        + (hit ? ' · ' + hit + ' 个有实测上限' : '')
+        + (hiddenN ? ' · 已按 models.hidden 隐藏 ' + hiddenN + ' 个' : '');
+      mdVisible = 20;
+      renderModels();
+    } catch (e) {
+      mdAll = [];
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">' + esc(shortErr(e.message)) + '</div></td></tr>';
       $('mdCount').textContent = '';
-      $('mdNote').textContent = '上游未返回模型';
-      return;
+      $('mdNote').textContent = '查询失败';
     }
-    // 探测契约键历史上是 realm:bare（cn:glm-5.2）；models.id_style=slash 后模型
-    // id 变成 cn/glm-5.2，统一归一化，避免实测标注凭空消失。
-    mdProbeByKey = {};
-    for (const [k, v] of Object.entries(mdProbes)) {
-      const s = mdSplitId(k);
-      mdProbeByKey[s.realm + ':' + s.bare] = v;
-    }
-    mdProbeOf = m => mdProbeByKey[mdProbeKey(m)] || mdProbes[mdModelBare(m)] || undefined;
-    const hit = mdAll.filter(m => mdProbeOf(m)).length;
-    // models.hidden 在服务端已过滤（与 /v1/models 同口径），这里只把条数说清楚，
-    // 否则"少了一堆模型"会被读成上游目录缩水。
-    const hiddenN = Number(d.hidden_count) || 0;
-    $('mdNote').textContent = mdAll.length + ' 个模型 · 目录已缓存'
-      + (hit ? ' · ' + hit + ' 个有实测上限' : '')
-      + (hiddenN ? ' · 已按 models.hidden 隐藏 ' + hiddenN + ' 个' : '');
-    mdVisible = 20;
-    renderModels();
-  } catch (e) {
-    mdAll = [];
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty inline">' + esc(shortErr(e.message)) + '</div></td></tr>';
-    $('mdCount').textContent = '';
-    // 头部说明也要改：否则表格里写着失败，标题还挂着"实时查询上游"，读起来像在查。
-    $('mdNote').textContent = '查询失败';
+  })();
+  try {
+    await modelsInFlight;
+  } finally {
+    modelsInFlight = null;
+    if (done) done('重新获取');
   }
 }
 
@@ -1328,7 +1378,7 @@ for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'e
   el.onchange = () => { mdFilter[key] = el.value; mdVisible = 20; renderModels(); };
 }
 $('mdReset').onclick = resetModelFilter;
-$('btnModels').onclick = loadModels;
+$('btnModels').onclick = () => loadModels(true);
 if ($('btnMdMore')) $('btnMdMore').onclick = () => { mdVisible += 20; renderModels(); };
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
@@ -1673,6 +1723,8 @@ const CFG_MAP = {
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   batch_concurrency: ['pool', 'batch_concurrency'],
+  batch_delay_min_ms: ['pool', 'batch_delay_min_ms'],
+  batch_delay_max_ms: ['pool', 'batch_delay_max_ms'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
@@ -2044,14 +2096,58 @@ $('importFile').onchange = async () => {
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
+  if (b._localBusy) return;
+  b._localBusy = true;
   const done = setBusy(b, '刷新中…');
   try {
-    await api('balance_all', { method: 'POST' });
+    const r = await api('balance_all', { method: 'POST' });
+    toast(r && r.started === false ? '余额刷新正在进行中，已合并到当前轮次' : '全量余额刷新已开始（串行防探测）', r && r.started === false ? '' : 'ok');
+    b._localBusy = false;
+    await pollUntilIdle(
+      () => api('overview'),
+      st => st && st.tasks && st.tasks.balance && st.tasks.balance.running,
+      st => {
+        if (st && st.tasks && st.tasks.balance && st.tasks.balance.running) {
+          const bal = st.tasks.balance;
+          b.textContent = '刷新中' + (bal.total ? ' (' + (bal.done || 0) + '/' + bal.total + ')' : '') + '…';
+        }
+      },
+      { interval: 1200, maxAttempts: 240 }
+    );
     await loadOverview(true);
-    toast('余额已从上游刷新', 'ok');
-  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
-  finally { done('刷新'); }
+    toast('全量余额已从上游刷新', 'ok');
+  } catch (e) {
+    toast('刷新失败：' + e.message, 'err');
+    await loadOverview(true);
+  } finally {
+    b._localBusy = false;
+    done('刷新余额');
+  }
   if (view === 'logs') loadLogs();
+};
+if ($('btnNickSync')) $('btnNickSync').onclick = async () => {
+  const b = $('btnNickSync');
+  if (b._localBusy) return;
+  b._localBusy = true;
+  const done = setBusy(b, '同步中…');
+  try {
+    const r = await api('nicknames/sync', { method: 'POST' });
+    toast(r && r.started === false ? '昵称同步正在进行中' : '昵称同步已开始（跳过 24h 内已同步账号）', r && r.started === false ? '' : 'ok');
+    b._localBusy = false;
+    await pollUntilIdle(
+      () => api('overview'),
+      st => st && st.nicknames_sync && st.nicknames_sync.scanning,
+      null,
+      { interval: 1500, maxAttempts: 200 }
+    );
+    await loadOverview(true);
+    toast('昵称同步完成', 'ok');
+  } catch (e) {
+    toast('昵称同步失败：' + e.message, 'err');
+  } finally {
+    b._localBusy = false;
+    done('同步昵称');
+  }
 };
 
 /* ── 官方补偿（issue #189）─────────────────────────────────────────
@@ -2158,26 +2254,73 @@ function renderCachedCompensation() {
 }
 
 async function loadCompensation() {
-  // 已有在途请求就等它跑完，而不是静默返回——领取后紧接着的刷新必须能看到新状态，
-  // 否则用户点了「领取」但列表纹丝不动。
-  if (compInFlight) { await compInFlight; return; }
+  // 纯只读服务端补偿缓存快照（零上游请求）；已有在途请求则合流等待。
+  if (compInFlight) { await compInFlight; return compCache; }
   compInFlight = (async () => {
     try {
       const d = await api('compensation');
       compCache = d;
       renderCompensation(d);
+      if (d && d.scanning && $('compNote')) {
+        $('compBox').hidden = false;
+        $('compNote').textContent = '检查中 (' + (d.done || 0) + '/' + (d.total || 0) + ')…';
+      }
+      return d;
     } catch (e) {
       const box = $('compBox');
       if (box) box.hidden = false;
       if ($('compList')) $('compList').innerHTML =
-        '<div class="empty">查询失败：' + esc(shortErr(e.message)) + '</div>';
+        '<div class="empty">读取缓存失败：' + esc(shortErr(e.message)) + '</div>';
       if ($('compNote')) $('compNote').textContent = '';
+      return null;
     }
   })();
   try {
-    await compInFlight;
+    return await compInFlight;
   } finally {
     compInFlight = null;   // 必须 finally：否则一次异常就让此后所有刷新永久失效
+  }
+}
+
+let compScanInFlight = null;
+async function triggerCompensationScan(btn) {
+  if (compScanInFlight) { await compScanInFlight; return; }
+  const done = setBusy(btn, '检查中…');
+  compScanInFlight = (async () => {
+    try {
+      const first = await api('compensation/scan', { method: 'POST' });
+      compCache = first;
+      renderCompensation(first);
+      let cur = first;
+      if (cur && cur.scanning) {
+        cur = await pollUntilIdle(
+          () => api('compensation'),
+          d => d && d.scanning,
+          d => {
+            compCache = d;
+            renderCompensation(d);
+            if (btn) btn.textContent = '检查中' + (d && d.total ? ' (' + (d.done || 0) + '/' + d.total + ')' : '') + '…';
+          },
+          { interval: 1200, maxAttempts: 240 }
+        );
+      }
+      compCache = cur;
+      renderCompensation(cur);
+      const rows = (cur && cur.accounts) || [];
+      const active = rows.filter(r => r && !r.error && r.status && r.status.active);
+      const failed = compErrored(rows);
+      if (!active.length && !failed.length) {
+        toast('全池 CN 个人号当前无待领补偿', '');
+      }
+    } catch (e) {
+      toast('补偿检查失败：' + e.message, 'err');
+    }
+  })();
+  try {
+    await compScanInFlight;
+  } finally {
+    compScanInFlight = null;
+    done();
   }
 }
 
@@ -2202,7 +2345,8 @@ if ($('compList')) $('compList').addEventListener('click', async e => {
   }
 });
 
-if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => loadCompensation();
+if ($('btnCompRefresh')) $('btnCompRefresh').onclick = () => triggerCompensationScan($('btnCompRefresh'));
+if ($('btnCompCheck')) $('btnCompCheck').onclick = () => triggerCompensationScan($('btnCompCheck'));
 
 if ($('btnCompClaimAll')) $('btnCompClaimAll').onclick = async () => {
   const b = $('btnCompClaimAll');
@@ -2636,72 +2780,137 @@ function vcCard(v) {
     '</div>';
 }
 
-async function loadSchoolVouchers() {
+function renderVouchers(d) {
   const body = $('vcBody');
+  const arr = (d && d.accounts) || [];
+  if (d && d.scanning && !arr.length) {
+    body.innerHTML = '<div class="state"><span class="dots">串行查询中 (' + (d.done || 0) + '/' + (d.total || 0) + ')</span></div>';
+    $('vcNote').textContent = '扫描中 (' + (d.done || 0) + '/' + (d.total || 0) + ')…';
+    return;
+  }
+  if (!d || (!d.fetched_at && !arr.length)) {
+    body.innerHTML = '<div class="empty"><div class="big">🎟️</div>尚未查询券码<div class="d">点击右下角「刷新」按串行防探测节奏查询全部 CN 账号</div></div>';
+    $('vcNote').textContent = '尚未查询（仅展示缓存）';
+    return;
+  }
+  const ok = arr.filter(a => !a.error);
+  const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
+  body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
+    '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
+    '<span>' + a.vouchers.length + ' 张</span></div>' +
+    a.vouchers.map(vcCard).join('')
+  ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
+  const age = d.fetched_at ? ' · 更新于 ' + ago(new Date(d.fetched_at).getTime()) : '';
+  $('vcNote').textContent = (total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '0 张券') + age;
+  const errs = arr.filter(a => a.error);
+  if (errs.length) {
+    body.insertAdjacentHTML('beforeend', '<div class="note txt-warn mt-2">查询失败：' +
+      errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(shortErr(a.error)) + '）').join('、') + '</div>');
+  }
+  body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
+    try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
+    catch (e) { toast('复制失败，请手动选择券码', 'err'); }
+  });
+  // 二维码：券码本体编码为 QR（到店出示扫描），点击切换显示/隐藏
+  body.querySelectorAll('button[data-qr]').forEach(b => b.onclick = () => {
+    const card = b.closest('.vc');
+    const old = card.querySelector('.vc-qr');
+    if (old) { old.remove(); return; }
+    const box = document.createElement('div');
+    box.className = 'vc-qr';
+    try { box.innerHTML = qrSVG(qrMatrix(b.dataset.qr), 148); }
+    catch (e) { box.innerHTML = '<span class="note">二维码生成失败：' + esc(shortErr(e.message)) + '</span>'; }
+    card.appendChild(box);
+  });
+}
+
+let vouchersInFlight = null;
+async function loadSchoolVouchers(force) {
+  if (vouchersInFlight) { await vouchersInFlight; return; }
   openVeil('vcVeil');
-  body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
-  $('vcNote').textContent = '';
-  try {
-    const d = await api('school/vouchers');
-    const arr = d.accounts || [];
-    const ok = arr.filter(a => !a.error);
-    const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
-    body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
-      '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
-      '<span>' + a.vouchers.length + ' 张</span></div>' +
-      a.vouchers.map(vcCard).join('')
-    ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
-    $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
-    const errs = arr.filter(a => a.error);
-    if (errs.length) {
-      body.insertAdjacentHTML('beforeend', '<div class="note txt-warn mt-2">查询失败：' +
-        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(shortErr(a.error)) + '）').join('、') + '</div>');
+  const body = $('vcBody');
+  const btn = force ? $('btnVcRefresh') : $('btnSchoolVouchers');
+  const done = setBusy(btn, force ? '查询中…' : '读取中…');
+  if (force) {
+    body.innerHTML = '<div class="state"><span class="dots">正在启动串行查询</span></div>';
+    $('vcNote').textContent = '';
+  }
+  vouchersInFlight = (async () => {
+    try {
+      let d;
+      if (force) {
+        d = await api('school/vouchers/refresh', { method: 'POST' });
+        renderVouchers(d);
+        if (d && d.scanning) {
+          d = await pollUntilIdle(
+            () => api('school/vouchers'),
+            res => res && res.scanning,
+            res => {
+              renderVouchers(res);
+              if (btn && res && res.total) btn.textContent = '查询中 (' + (res.done || 0) + '/' + res.total + ')…';
+            },
+            { interval: 1200, maxAttempts: 240 }
+          );
+        }
+      } else {
+        d = await api('school/vouchers');
+      }
+      renderVouchers(d);
+    } catch (e) {
+      body.innerHTML = '<div class="state err">' + esc(shortErr(e.message)) + '</div>';
     }
-    body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
-      try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
-      catch (e) { toast('复制失败，请手动选择券码', 'err'); }
-    });
-    // 二维码：券码本体编码为 QR（到店出示扫描），点击切换显示/隐藏
-    body.querySelectorAll('button[data-qr]').forEach(b => b.onclick = () => {
-      const card = b.closest('.vc');
-      const old = card.querySelector('.vc-qr');
-      if (old) { old.remove(); return; }
-      const box = document.createElement('div');
-      box.className = 'vc-qr';
-      try { box.innerHTML = qrSVG(qrMatrix(b.dataset.qr), 148); }
-      catch (e) { box.innerHTML = '<span class="note">二维码生成失败：' + esc(shortErr(e.message)) + '</span>'; }
-      card.appendChild(box);
-    });
-  } catch (e) {
-    body.innerHTML = '<div class="state err">' + esc(shortErr(e.message)) + '</div>';
+  })();
+  try {
+    await vouchersInFlight;
+  } finally {
+    vouchersInFlight = null;
+    done(force ? '刷新' : '查询券码');
   }
 }
-$('btnSchoolVouchers').onclick = loadSchoolVouchers;
+$('btnSchoolVouchers').onclick = () => loadSchoolVouchers(false);
 $('btnVcClose').onclick = () => closeVeil('vcVeil');
-$('btnVcRefresh').onclick = loadSchoolVouchers;
+$('btnVcRefresh').onclick = () => loadSchoolVouchers(true);
 
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮
    队列状态覆盖。 */
-let queueTimer = null, lastQueueSeq = 0;
+let queueTimer = null, lastQueueSeq = 0, scanInFlight = null;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+function applyScanView(d) {
+  const items = groupItems(d || {});
+  if (!items.length && !((d && d.accounts) || []).length) {
+    renderQueue([], null, '账号池是空的', '先去「账号池」用浏览器登录一个账号，再回来扫描成长任务。');
+  } else {
+    renderQueue(items, null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+  }
+}
 $('btnScanAll').onclick = async () => {
+  if (scanInFlight) { await scanInFlight; return; }
   const b = $('btnScanAll');
-  // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
-  // 结果冲掉重渲染回队列视图（服务端执行不受影响，只是不再实时回写本视图）。
   if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
   const done = setBusy(b, '扫描中…');
+  scanInFlight = (async () => {
+    try {
+      let d = await api('tasks/scan_all', { method: 'POST' });
+      if (d && d.scanning) {
+        d = await pollUntilIdle(
+          () => api('tasks/scan'),
+          res => res && res.scanning,
+          res => {
+            if (res && res.total) b.textContent = '扫描中 (' + (res.done || 0) + '/' + res.total + ')…';
+          },
+          { interval: 1200, maxAttempts: 240 }
+        );
+      }
+      applyScanView(d);
+    } catch (e) { toast(e.message, 'err'); }
+  })();
   try {
-    const d = await api('tasks/scan_all', { method: 'POST' });
-    const items = groupItems(d);
-    if (!items.length && !(d.accounts || []).length) {
-      // 账号池是空的：不能沿用"全部任务都已完成"的说法，那会让人以为扫过了。
-      renderQueue([], null, '账号池是空的', '先去「账号池」用浏览器登录一个账号，再回来扫描成长任务。');
-    } else {
-      renderQueue(items, null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
-    }
-  } catch (e) { toast(e.message, 'err'); }
-  finally { done('扫描待办'); }
+    await scanInFlight;
+  } finally {
+    scanInFlight = null;
+    done('扫描待办');
+  }
 };
 $('btnRunQueue').onclick = async () => {
   const conc = Number($('qcConc').value) || 1;
@@ -2815,15 +3024,20 @@ function startQueuePolling() {
 // reattachQueueView 切回任务中心视图时恢复队列进度：仅当本页启动的队列仍在
 // 执行才重新开轮询（残留态/别页队列不接管——视图不被旧结果冲掉）。
 function reattachQueueView() {
-  // 全程异步：go() 在顶层（app.js ~143 行）被调用时，本文件下方 let/const
-  //（queueTimer/lastQueueSeq 等）尚未初始化——同步读取即 TDZ ReferenceError
-  // 使整个脚本中断。await 之后才碰它们（旧 pollQueueOnce 正是靠开头的 await
-  // 侥幸安全）。queueTimer 的"已在跑"判定也挪到 await 后，语义不变。
+  // 全程异步：go() 在顶层被调用时，本文件下方 let/const 尚未初始化——await 之后才碰它们。
   (async () => {
     try {
       const q = await api('tasks/queue');
       if (queueTimer) return; // 轮询已在跑（跨视图不中断）
-      if (q.started && q.running && (!lastQueueSeq || q.seq === lastQueueSeq)) startQueuePolling();
+      if (q.started && q.running && (!lastQueueSeq || q.seq === lastQueueSeq)) {
+        startQueuePolling();
+        return;
+      }
+      // 队列没在跑且当前清单为空时，尝试只读缓存的扫描结果（零上游请求）。
+      if (!$('qcList').children.length) {
+        const s = await api('tasks/scan').catch(() => null);
+        if (s && s.fetched_at) applyScanView(s);
+      }
     } catch (e) { /* 静默 */ }
   })();
 }
@@ -4051,28 +4265,77 @@ if ($('pkSort')) {
   };
 }
 
-// loadPackages 按需拉取：有缓存（上次任意入口拉到的 packages 数据）先直接渲染，
-// 不再「切进积分构成页就打一次上游」——逐账号实时查询在账号多时既慢又压上游。
-// 无缓存（首次进入）才自动查一次；显式刷新（force=true，点「刷新」按钮）始终实时查。
+// loadPackages 默认只读服务端缓存/基线快照（零上游请求）；
+// 显式刷新（force=true，点击「刷新」/「刷新明细」）才异步单飞扫描上游并轮询收口。
+let pkgRefreshInFlight = null;
+async function refreshPackagesAsync(triggerBtn, idleLabel) {
+  if (pkgRefreshInFlight) { await pkgRefreshInFlight; return lastPackages; }
+  const done = setBusy(triggerBtn, '扫描中…');
+  pkgRefreshInFlight = (async () => {
+    try {
+      const [first, cfgRes] = await Promise.all([
+        api('packages/refresh', { method: 'POST' }),
+        api('config').catch(() => null),
+      ]);
+      if (cfgRes && cfgRes.config) lastDetailLimit = pkDetailLimit(cfgRes.config);
+      let d = first;
+      if (d && d.scanning) {
+        d = await pollUntilIdle(
+          () => api('packages'),
+          res => res && res.scanning,
+          res => {
+            if (triggerBtn && res && res.total) triggerBtn.textContent = '扫描中 (' + (res.done || 0) + '/' + res.total + ')…';
+            if ($('pkNote') && res) $('pkNote').textContent = '扫描中 (' + (res.done || 0) + '/' + (res.total || 0) + ')…';
+            if ($('expNote') && res) $('expNote').textContent = '扫描中 (' + (res.done || 0) + '/' + (res.total || 0) + ')…';
+          },
+          { interval: 1200, maxAttempts: 240 }
+        );
+      } else {
+        d = await api('packages');
+      }
+      lastPackages = d;
+      lastPackagesAt = d && d.fetched_at ? new Date(d.fetched_at).getTime() : Date.now();
+      return d;
+    } finally {
+      pkgRefreshInFlight = null;
+      done(idleLabel);
+    }
+  })();
+  return await pkgRefreshInFlight;
+}
+
 async function loadPackages(force) {
-  if (!force && lastPackages) {
+  if (!force && lastPackages && lastPackagesAt > 0) {
     renderPackages(lastPackages, lastDetailLimit);
     const ageMin = Math.floor((Date.now() - lastPackagesAt) / 60000);
     if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
     return;
   }
-  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('pkDetail').innerHTML = '';
-  $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
+  if (force) {
+    $('pkSummary').innerHTML = '<div class="empty">正在串行扫描全部启用账号的积分明细…</div>';
+    $('pkDetail').innerHTML = '';
+    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">扫描中…</div>';
+    try {
+      const d = await refreshPackagesAsync($('btnPk'), '刷新');
+      renderPackages(d, lastDetailLimit);
+    } catch (e) {
+      $('pkSummary').innerHTML = '<div class="empty">刷新失败：' + esc(shortErr(e.message)) + '</div>';
+      $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">刷新失败：' + esc(shortErr(e.message)) + '</div>';
+    }
+    return;
+  }
   try {
     const [d, c] = await Promise.all([
       api('packages'),
       api('config').catch(() => null),
     ]);
-    lastPackages = d;                            // 缓存供首页到期卡片与排序切换复用
-    lastPackagesAt = Date.now();
+    lastPackages = d;
+    lastPackagesAt = d && d.fetched_at ? new Date(d.fetched_at).getTime() : 0;
     lastDetailLimit = pkDetailLimit(c && c.config);
     renderPackages(d, lastDetailLimit);
+    if (!lastPackagesAt && $('pkNote')) {
+      $('pkNote').textContent = (d.accounts || []).length + ' 个启用账号 · 池内基线快照，点击「刷新」向上游拉取逐包明细';
+    }
   } catch (e) {
     $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
     $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(shortErr(e.message)) + '</div>';
@@ -4315,27 +4578,31 @@ function snapshotNoteText(count, d) {
 async function loadExpiry(force) {
   if (!$('expBox')) return;
   if (expFetching) return;
-  const fresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
+  const fresh = lastPackages && lastPackagesAt > 0 && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
   if (fresh && !force) { renderExpiry(lastPackages); return; }
   expFetching = true;
   $('expBox').hidden = false;
-  if (!$('expList').children.length) $('expList').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('expNote').textContent = '查询中…';
+  if (!$('expList').children.length) $('expList').innerHTML = '<div class="empty">查询中…</div>';
+  $('expNote').textContent = force ? '正在串行刷新明细…' : '读取缓存…';
   try {
-    const d = await api('packages');
-    lastPackages = d;                            // 与「积分构成」视图共用同一份缓存
-    lastPackagesAt = Date.now();
+    const d = force
+      ? await refreshPackagesAsync($('btnExp'), '刷新明细')
+      : await api('packages');
+    lastPackages = d;
+    lastPackagesAt = d && d.fetched_at ? new Date(d.fetched_at).getTime() : 0;
     renderExpiry(d);
+    if (force) await loadOverview(true);
   } catch (e) {
     // textContent 赋值不能再 esc：那样会把 &lt;html&gt; 原样显示出来（双重转义）。
     $('expNote').textContent = '查询失败：' + shortErr(e.message);
+  } finally {
+    expFetching = false;
   }
-  expFetching = false;
 }
 
 if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);
 
-// 「刷新」始终实时查（显式 force，不依赖事件对象真值）
+// 「刷新」始终异步串行刷上游明细（显式 force，不依赖事件对象真值）
 if ($('btnPk')) $('btnPk').onclick = () => { loadPackages(true); loadCreditTrend(); };
 
 /* ══ 账号备注（只写本机 localStorage；账号池 / 用量两个视图共用同一份映射）══════

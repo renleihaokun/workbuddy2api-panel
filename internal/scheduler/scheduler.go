@@ -33,10 +33,15 @@ type Config struct {
 	GrowthHours    []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
 	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
 
-	// KeepaliveRenewBefore 定时保活的临期刷新阈值：AT 剩余有效期大于该值时跳过刷新
+	// KeepaliveRenewBefore 保活的临期刷新阈值：AT 剩余有效期大于该值时跳过刷新
 	// （0 = 每次保活都刷新，保持测试与零值 Config 既有行为；默认由装配层设为 168h=7d）。
-	// 手动触发（RunKeepaliveNow / 面板「全部保活」）不受此阈值限制。
+	// 定时保活与面板手动「全部保活」统一受此阈值与「坏 RT 跳过」保护；单号强刷保留独立接口。
 	KeepaliveRenewBefore time.Duration
+
+	// BatchDelayMin / BatchDelayMax 批量任务相邻账号之间的随机停顿区间；
+	// 零值代表测试/手工构造时不额外等待（生产装配层默认注入 800~2000ms）。
+	BatchDelayMin time.Duration
+	BatchDelayMax time.Duration
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
 	// <= now+window 的套餐余额标记为"快过期"（pool 据此做最早到期优先，见
@@ -136,14 +141,48 @@ type Scheduler struct {
 	//   - 其余四个任务用 TryLock 跳过：动作幂等但重复跑纯属浪费配额，直接让
 	//     后来者拿到 false / 打一行跳过日志。
 	balanceRun   batch.Coalescer
+	balanceAsync sync.Mutex
 	checkinRun   sync.Mutex
 	travelRun    sync.Mutex
 	activityRun  sync.Mutex
 	keepaliveRun sync.Mutex
 	blackcatRun  sync.Mutex
 
+	// batchDelayConfigured / batchDelayMin / batchDelayMax 控制账号间随机停顿节拍（热生效）。
+	batchDelayConfigured atomic.Bool
+	batchDelayMin        atomic.Int64
+	batchDelayMax        atomic.Int64
+
+	// 任务实时运行态与补偿结果缓存（供面板 overview/compensation 纯只读轮询与展示进度）。
+	progressMu sync.Mutex
+	taskStates TasksStatusSnapshot
+	compMu     sync.Mutex
+	compCache  []CompensationRow
+	compAt     time.Time
+	compActive bool
+	compDone   int
+	compTotal  int
+	compRun    sync.Mutex
+
 	// batchPaused 批量掉号风控闸门触发后暂停所有定时后台调度（手动按钮仍可用）。
 	batchPaused atomic.Bool
+}
+
+// TaskRunState 单个后台/全量任务的运行态与进度摘要（供面板轮询显示，不触发上游）。
+type TaskRunState struct {
+	Running   bool      `json:"running"`
+	Done      int       `json:"done,omitempty"`
+	Total     int       `json:"total,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
+// TasksStatusSnapshot 五类主要全量任务的运行态汇总。
+type TasksStatusSnapshot struct {
+	Checkin   TaskRunState `json:"checkin"`
+	Travel    TaskRunState `json:"travel"`
+	Activity  TaskRunState `json:"activity"`
+	Keepalive TaskRunState `json:"keepalive"`
+	Balance   TaskRunState `json:"balance"`
 }
 
 // New 构建。
@@ -163,13 +202,17 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 		rearmSweep:    make(chan struct{}, 1),
 	}
+	if cfg.BatchDelayMin > 0 || cfg.BatchDelayMax > 0 {
+		s.SetBatchDelay(cfg.BatchDelayMin, cfg.BatchDelayMax)
+	}
+	return s
 }
 
 // ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
@@ -252,7 +295,7 @@ func (s *Scheduler) keepaliveRenewBefore() time.Duration {
 	return s.cfg.KeepaliveRenewBefore
 }
 
-// SetKeepaliveRenewBefore 热更新定时保活的临期刷新阈值（schedule.keepalive_renew_before）。
+// SetKeepaliveRenewBefore 热更新保活的临期刷新阈值（schedule.keepalive_renew_before）。
 func (s *Scheduler) SetKeepaliveRenewBefore(d time.Duration) {
 	if d < 0 {
 		d = 0
@@ -260,6 +303,116 @@ func (s *Scheduler) SetKeepaliveRenewBefore(d time.Duration) {
 	s.schedMu.Lock()
 	s.cfg.KeepaliveRenewBefore = d
 	s.schedMu.Unlock()
+}
+
+// SetBatchDelay 热更新调度器各批量循环的账号间随机停顿区间 [min, max]；
+// 显式传入 (0, 0) 会覆盖内置包级延迟。
+func (s *Scheduler) SetBatchDelay(min, max time.Duration) {
+	if min < 0 {
+		min = 0
+	}
+	if max < min {
+		max = min
+	}
+	s.batchDelayMin.Store(int64(min))
+	s.batchDelayMax.Store(int64(max))
+	s.batchDelayConfigured.Store(true)
+}
+
+// paceDelay 返回账号间随机停顿时长：优先用配置注入窗口，未配置时回落 [fallback, 2.5*fallback]。
+func (s *Scheduler) paceDelay(fallback time.Duration) time.Duration {
+	if s.batchDelayConfigured.Load() {
+		return batch.RandomDelay(time.Duration(s.batchDelayMin.Load()), time.Duration(s.batchDelayMax.Load()))
+	}
+	if fallback <= 0 {
+		return 0
+	}
+	return batch.RandomDelay(fallback, fallback*5/2)
+}
+
+// subStepDelay 返回同账号多个相邻步骤（如签到后紧接连登任务）间的短随机停顿；
+// 仅在启用了账号间延迟时生效，测试零延迟路径返回 0。
+func (s *Scheduler) subStepDelay() time.Duration {
+	d := s.paceDelay(0)
+	if d <= 0 {
+		return 0
+	}
+	gap := batch.RandomDelay(200*time.Millisecond, 500*time.Millisecond)
+	if gap > d {
+		return d
+	}
+	return gap
+}
+
+func (s *Scheduler) taskStatePtr(kind string) *TaskRunState {
+	switch kind {
+	case "checkin":
+		return &s.taskStates.Checkin
+	case "travel":
+		return &s.taskStates.Travel
+	case "activity":
+		return &s.taskStates.Activity
+	case "keepalive":
+		return &s.taskStates.Keepalive
+	case "balance":
+		return &s.taskStates.Balance
+	default:
+		return nil
+	}
+}
+
+func (s *Scheduler) beginTask(kind string, total int) {
+	s.progressMu.Lock()
+	if st := s.taskStatePtr(kind); st != nil {
+		st.Running = true
+		st.Done = 0
+		st.Total = total
+		st.UpdatedAt = time.Now()
+	}
+	s.progressMu.Unlock()
+}
+
+func (s *Scheduler) setTaskTotal(kind string, total int) {
+	s.progressMu.Lock()
+	if st := s.taskStatePtr(kind); st != nil {
+		st.Total = total
+		st.UpdatedAt = time.Now()
+	}
+	s.progressMu.Unlock()
+}
+
+func (s *Scheduler) stepTask(kind string, done int) {
+	s.progressMu.Lock()
+	if st := s.taskStatePtr(kind); st != nil {
+		st.Done = done
+		st.UpdatedAt = time.Now()
+	}
+	s.progressMu.Unlock()
+}
+
+func (s *Scheduler) endTask(kind string) {
+	s.progressMu.Lock()
+	if st := s.taskStatePtr(kind); st != nil {
+		st.Running = false
+		st.UpdatedAt = time.Now()
+	}
+	s.progressMu.Unlock()
+}
+
+func (s *Scheduler) isTaskRunning(kind string) bool {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+	if st := s.taskStatePtr(kind); st != nil {
+		return st.Running
+	}
+	return false
+}
+
+// TasksStatus 返回五类全量任务的当前在途状态与进度（纯内存读取）。
+func (s *Scheduler) TasksStatus() TasksStatusSnapshot {
+	s.progressMu.Lock()
+	defer s.progressMu.Unlock()
+	return s.taskStates
 }
 
 // SetBatchPaused 暂停或恢复全部定时后台任务（批量掉号闸门触发时由 pool hook 置 true，
@@ -691,12 +844,17 @@ func (s *Scheduler) runCheckin(scheduled bool) {
 func (s *Scheduler) runCheckinAt(now time.Time, scheduled bool) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	list := s.cfg.Pool.List()
+	s.beginTask("checkin", len(list))
+	defer s.endTask("checkin")
+
 	// 抖动基准：本轮小时起点（如 09:00）。每个账号按 uid 散列到该小时内的
-	// 不同分钟，避免 24 个号在同一时刻从同一个出口 IP 同时签到。
-	// 手动触发（scheduled=false）不抖动：用户点了按钮就该立刻全跑。
+	// 不同分钟，避免多号在同一时刻从同一个出口 IP 同时签到。
 	hourBase := now.Truncate(time.Hour)
 	ranAny := false
-	for _, st := range s.cfg.Pool.List() {
+	first := true
+	for idx, st := range list {
+		s.stepTask("checkin", idx+1)
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -714,6 +872,12 @@ func (s *Scheduler) runCheckinAt(now time.Time, scheduled bool) {
 		if a.IsGlobal() {
 			continue
 		}
+		if !first {
+			if d := s.paceDelay(0); d > 0 {
+				time.Sleep(d)
+			}
+		}
+		first = false
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
@@ -752,15 +916,14 @@ func (s *Scheduler) runCheckinAt(now time.Time, scheduled bool) {
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
 		}
-		// 定时抖动口径下，连登/补签/补偿必须跟该账号在同一轮 shouldFire 内执行：
-		// 若放在循环外调 RunStreakBonusNow()，抖动续跑每分钟唤醒一次会把全部 CN
-		// 账号的连登/补偿接口重放 45 遍。
-		if scheduled && !st.Disabled && !a.IsEnterpriseSession() && a.AccessTokenValue() != "" {
+		// 统一在同一账号迭代内按序接连登/补签/补偿（定时与手动一致），避免手动签到后
+		// 再紧挨着以 0ms 间隔重扫全池第二遍。
+		if !st.Disabled && !a.IsEnterpriseSession() && a.AccessTokenValue() != "" {
+			if gap := s.subStepDelay(); gap > 0 {
+				time.Sleep(gap)
+			}
 			s.streakBonusAccount(a)
 		}
-	}
-	if !scheduled {
-		s.RunStreakBonusNow()
 	}
 	// 签到也刷新了全部账号的余额（上面循环里的 UserResourceSnapshot）→ 同样落一个
 	// 走势采样点。放在 streak 之后：连登兑换/抽奖可能刚发了积分，采样越晚越接近真实。
@@ -811,9 +974,13 @@ func (s *Scheduler) runActivityWith(ctx context.Context, scheduled bool) bool {
 func (s *Scheduler) runActivityBody(ctx context.Context, scheduled bool) {
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
+	list := s.cfg.Pool.List()
+	s.beginTask("activity", len(list))
+	defer s.endTask("activity")
 	now := time.Now()
 	hourBase := now.Truncate(time.Hour)
-	for _, st := range s.cfg.Pool.List() {
+	for idx, st := range list {
+		s.stepTask("activity", idx+1)
 		if st.Disabled && !includeDisabled {
 			continue
 		}
@@ -840,7 +1007,7 @@ func (s *Scheduler) runActivityBody(ctx context.Context, scheduled bool) {
 		// 判断不成立——国际版 /v2/report 可用，跳过即国际版账号永远点不亮连登（上游
 		// a190252 同口径修复）。checkin/travel 的 global 门控不受影响，仍跳过。
 		if !first {
-			if !sleepCtx(ctx, activityAccountDelay) {
+			if !sleepCtx(ctx, s.paceDelay(activityAccountDelay)) {
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
 			}
 		}
@@ -908,16 +1075,24 @@ func (s *Scheduler) runKeepaliveLocked(scheduled bool) bool {
 }
 
 // runKeepalive 保活任务体（不含单飞锁）。
-// scheduled=true 表示定时排程触发（应用账号抖动）；false = 面板手动触发（全跑）。
+// scheduled=true 表示定时排程触发（应用账号抖动）；false = 面板手动触发。
+// 两种路径统一遵守「已知 RT 已死但 AT 仍有效」跳过规则与 keepalive_renew_before 临期阈值，
+// 并在实际发起刷新的账号间插入随机间隔，避免同 IP 下集中轮换全部 RT；强制单号刷新留给单号接口。
 func (s *Scheduler) runKeepalive(scheduled bool) {
 	includeDisabled := s.includeDisabledInTasks()
+	list := s.cfg.Pool.List()
+	s.beginTask("keepalive", len(list))
+	defer s.endTask("keepalive")
+
 	now := time.Now()
 	hourBase := now.Truncate(time.Hour)
-	for _, st := range s.cfg.Pool.List() {
+	first := true
+	for idx, st := range list {
+		s.stepTask("keepalive", idx+1)
 		if st.Disabled && !includeDisabled {
 			continue
 		}
-		// 抖动判定：24 个号同时刷新 token 会在上游形成一次明显的行为簇；
+		// 抖动判定：多号同时刷新 token 会在上游形成明显的行为簇；
 		// 台账保证窗口内每个号只刷新一次。
 		if !s.shouldFire(now, hourBase, st.UID, "keepalive", scheduled) {
 			continue
@@ -926,18 +1101,22 @@ func (s *Scheduler) runKeepalive(scheduled bool) {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if scheduled {
-			// 已知 RT 已死但 AT 仍有效时，不再每晚重复撞 refresh 端点；等用户扫码重登或 AT 到期。
-			if s.cfg.Pool.RefreshTokenDead(st.UID) && upstream.AccessUsableWithoutRefresh(a) {
+		// 已知 RT 已死但 AT 仍有效时，不再重复撞 refresh 端点；等用户扫码重登或 AT 到期。
+		if s.cfg.Pool.RefreshTokenDead(st.UID) && upstream.AccessUsableWithoutRefresh(a) {
+			continue
+		}
+		// 临期阈值：AT 剩余有效期 > keepalive_renew_before 时跳过刷新，减少无谓的 OAuth 轮换与风控曝光。
+		if renewBefore := s.keepaliveRenewBefore(); renewBefore > 0 {
+			if exp := a.ExpiresAtValue(); exp > 0 && time.Until(time.Unix(exp, 0)) > renewBefore {
 				continue
 			}
-			// 临期阈值：AT 剩余有效期 > keepalive_renew_before 时跳过刷新，减少无谓的 OAuth 轮换与风控曝光。
-			if renewBefore := s.keepaliveRenewBefore(); renewBefore > 0 {
-				if exp := a.ExpiresAtValue(); exp > 0 && time.Until(time.Unix(exp, 0)) > renewBefore {
-					continue
-				}
+		}
+		if !first {
+			if d := s.paceDelay(0); d > 0 {
+				time.Sleep(d)
 			}
 		}
+		first = false
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			var ue *upstream.Error
 			isDead := errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead
@@ -1028,6 +1207,26 @@ func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // 并发上限走 pool.BatchForEach（pool.batch_concurrency，默认 3）。本轮进行中再次
 // 触发（定时器撞面板手动刷新）由 Coalescer 合并：等待方在这轮结束后返回，数据就是
 // 刚查回来那份，不重复打上游。
+// StartBalanceRefreshNow 异步单飞触发一轮全池余额刷新（面板按钮用）：已在跑直接返回 false。
+func (s *Scheduler) StartBalanceRefreshNow() bool {
+	if s.isTaskRunning("balance") {
+		return false
+	}
+	if !s.balanceAsync.TryLock() {
+		return false
+	}
+	if s.isTaskRunning("balance") {
+		s.balanceAsync.Unlock()
+		return false
+	}
+	s.beginTask("balance", 0)
+	go func() {
+		defer s.balanceAsync.Unlock()
+		s.RunBalanceRefreshNow()
+	}()
+	return true
+}
+
 func (s *Scheduler) RunBalanceRefreshNow() {
 	s.balanceRun.Do(func() {
 		expiringSoon := s.ExpiringSoonWindow()
@@ -1047,7 +1246,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			}
 			targets = append(targets, target{uid: st.UID, a: a})
 		}
-		s.cfg.Pool.BatchForEach(len(targets), func(i int) {
+		s.beginTask("balance", len(targets))
+		defer s.endTask("balance")
+		s.cfg.Pool.BatchForEachProgress(len(targets), func(i int) {
 			t := targets[i]
 			remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(t.a, expiringSoon)
 			if err != nil {
@@ -1063,6 +1264,8 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				EarliestRemaining: earliestRemaining,
 				ExpiryBuckets:     poolExpiryBuckets(buckets),
 			})
+		}, func(done, _ int) {
+			s.stepTask("balance", done)
 		})
 		s.lastBalanceRefresh.Store(time.Now().UnixNano())
 		// 余额走势采样：这一轮刚把权威余额写回池，是最有意义的采样时点。

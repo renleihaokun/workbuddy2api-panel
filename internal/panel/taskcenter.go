@@ -54,9 +54,91 @@ func growthPending(t upstream.Task) bool {
 	return autoActionFor(t.TaskCode) != nil
 }
 
-// tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，账号间并发上限走 pool.batch_concurrency（默认 3）。
+func (p *Panel) tasksScanMeta() map[string]any {
+	p.scanMu.Lock()
+	defer p.scanMu.Unlock()
+	return map[string]any{
+		"fetched_at":    p.scanAt,
+		"scanning":      p.scanScanning,
+		"done":          p.scanDone,
+		"total":         p.scanTotal,
+		"pending_count": p.scanPending,
+	}
+}
+
+// tasksScanCached 读取最近一次待办扫描的内存缓存与进度（只读，零上游请求）。
+func (p *Panel) tasksScanCached(w http.ResponseWriter, r *http.Request) {
+	p.scanMu.Lock()
+	items := make([]scanAccountItem, len(p.scanCache))
+	copy(items, p.scanCache)
+	pending := p.scanPending
+	at := p.scanAt
+	scanning := p.scanScanning
+	done := p.scanDone
+	total := p.scanTotal
+	p.scanMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"accounts":      items,
+		"pending_count": pending,
+		"cached":        true,
+		"fetched_at":    at,
+		"scanning":      scanning,
+		"done":          done,
+		"total":         total,
+	})
+}
+
+// tasksScanAll 异步单飞触发全账号成长待办扫描（避免长时间占用 HTTP 或连点重放）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
+	started := p.startTasksScanAsync()
+	p.scanMu.Lock()
+	items := make([]scanAccountItem, len(p.scanCache))
+	copy(items, p.scanCache)
+	pending := p.scanPending
+	at := p.scanAt
+	scanning := p.scanScanning
+	done := p.scanDone
+	total := p.scanTotal
+	p.scanMu.Unlock()
+	msg := "全池待办扫描已开始（串行防探测节奏）"
+	if !started {
+		msg = "待办扫描正在进行中"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"started":       started,
+		"scanning":      scanning,
+		"done":          done,
+		"total":         total,
+		"fetched_at":    at,
+		"accounts":      items,
+		"pending_count": pending,
+		"message":       msg,
+	})
+}
+
+func (p *Panel) startTasksScanAsync() bool {
+	p.scanMu.Lock()
+	if p.scanScanning {
+		p.scanMu.Unlock()
+		return false
+	}
+	p.scanScanning = true
+	p.scanDone = 0
+	p.scanTotal = 0
+	p.scanMu.Unlock()
+
+	go func() {
+		p.scanRun.Do(func() {
+			p.runTasksScanSync()
+		})
+	}()
+	return true
+}
+
+// runTasksScanSync 真正按 pool 闸门（默认串行+随机间隔）扫全池待办，单号双口径间插入微短停顿，并更新缓存。
+func (p *Panel) runTasksScanSync() ([]scanAccountItem, int) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
 	type scanJob struct {
@@ -70,7 +152,13 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		}
 		jobs = append(jobs, scanJob{idx: i, uid: st.UID})
 	}
-	p.cfg.Pool.BatchForEach(len(jobs), func(k int) {
+	p.scanMu.Lock()
+	p.scanScanning = true
+	p.scanDone = 0
+	p.scanTotal = len(jobs)
+	p.scanMu.Unlock()
+
+	p.cfg.Pool.BatchForEachProgress(len(jobs), func(k int) {
 		j := jobs[k]
 		a := p.cfg.Pool.AuthByUID(j.uid)
 		if a == nil {
@@ -96,6 +184,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if gap := p.batchSubDelay(); gap > 0 {
+			time.Sleep(gap)
+		}
 		// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
 		// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
 		// 静默（无 mp 任务的部署/活动结束时零影响）。
@@ -110,13 +201,28 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}, func(done, total int) {
+		p.scanMu.Lock()
+		p.scanDone = done
+		p.scanTotal = total
+		p.scanMu.Unlock()
 	})
 	pending := 0
 	for _, it := range items {
 		pending += len(it.Growth)
 	}
+	cached := make([]scanAccountItem, len(items))
+	copy(cached, items)
+	p.scanMu.Lock()
+	p.scanCache = cached
+	p.scanPending = pending
+	p.scanAt = time.Now()
+	p.scanScanning = false
+	p.scanDone = len(jobs)
+	p.scanTotal = len(jobs)
+	p.scanMu.Unlock()
 	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+	return items, pending
 }
 
 // ---------------------------------------------------------------------------
@@ -203,54 +309,113 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	q.startedAt = time.Now()
 	q.mu.Unlock()
 
-	// 扫描待办（复用扫描逻辑的拉取部分）。
-	states := p.cfg.Pool.List()
-
+	// 若 3 分钟内刚完成过一次全池扫描，直接复用缓存待办列表，避免刚点扫描又点执行时重复扫两遍；
+	// 若池中新增了缓存未覆盖的活跃个人号，或缓存行含扫描报错，则回退完整扫描。
 	var accts []queueAccount
-	var mu sync.Mutex
-	var scanAccts []*auth.Auth
-	for _, st := range states {
-		if st.Disabled {
-			continue
+	usedCache := false
+	if growth {
+		var snap []scanAccountItem
+		var snapAt time.Time
+		p.scanMu.Lock()
+		if !p.scanAt.IsZero() && time.Since(p.scanAt) < 3*time.Minute && len(p.scanCache) > 0 {
+			snap = make([]scanAccountItem, len(p.scanCache))
+			copy(snap, p.scanCache)
+			snapAt = p.scanAt
 		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		scanAccts = append(scanAccts, a)
-	}
-	// 扫描段并发上限走 pool.batch_concurrency；执行段的账号并发仍由
-	// runQueueItems 的 1-4 信号量控制（那是用户显式选择，且含真实对话）。
-	p.cfg.Pool.BatchForEach(len(scanAccts), func(i int) {
-		a := scanAccts[i]
-		one := queueAccount{a: a}
-		// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-		if a.IsGlobal() {
-			return
-		}
-		// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-		// 真企业上下文（JWT enterprise_id 非空）同跳：行为事件被上游丢弃
-		// （200 不计分）——每项都是零收益白跑（含 expert_5 等真实对话配额），
-		// 故不入队并给出重登指引。注意 token_source=enterprise_switch 自
-		// 2026-11 起也会出现在个人号上（enterprise_id 为空），那种形态计分
-		// 正常，不再跳过（见 auth.IsEnterpriseSession）。
-		if a.IsEnterprise() {
-			return
-		}
-		if a.IsEnterpriseSession() {
-			log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证带企业上下文（JWT enterprise_id 非空），成长任务行为事件会被上游丢弃；请移除该账号后以个人身份重新登录", a.UID, a.Nickname)
-			return
-		}
-		if growth {
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
-				for _, t := range tasks {
-					if growthPending(t) {
-						one.grow = append(one.grow, t)
+		p.scanMu.Unlock()
+		if !snapAt.IsZero() && len(snap) > 0 {
+			seenUID := make(map[string]bool, len(snap))
+			cacheHealthy := true
+			for _, item := range snap {
+				if item.UID == "" {
+					continue
+				}
+				seenUID[item.UID] = true
+				if item.GrowthErr != "" {
+					if st, ok := p.cfg.Pool.Status(item.UID); ok && !st.Disabled {
+						if a := p.cfg.Pool.AuthByUID(item.UID); a != nil && !a.IsGlobal() && !a.IsEnterprise() && !a.IsEnterpriseSession() {
+							cacheHealthy = false
+							break
+						}
 					}
 				}
-				// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
-				// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
-				// mp 待办而队列报"无可执行待办"。
+			}
+			if cacheHealthy {
+				for _, st := range p.cfg.Pool.List() {
+					if st.Disabled {
+						continue
+					}
+					a := p.cfg.Pool.AuthByUID(st.UID)
+					if a == nil || a.IsGlobal() || a.IsEnterprise() || a.IsEnterpriseSession() {
+						continue
+					}
+					if !seenUID[st.UID] {
+						cacheHealthy = false
+						break
+					}
+				}
+			}
+			if cacheHealthy {
+				for _, item := range snap {
+					if item.UID == "" || len(item.Growth) == 0 {
+						continue
+					}
+					if st, ok := p.cfg.Pool.Status(item.UID); !ok || st.Disabled {
+						continue
+					}
+					a := p.cfg.Pool.AuthByUID(item.UID)
+					if a == nil || a.IsGlobal() || a.IsEnterprise() || a.IsEnterpriseSession() {
+						continue
+					}
+					grow := make([]upstream.Task, len(item.Growth))
+					copy(grow, item.Growth)
+					sort.Slice(grow, func(i, j int) bool {
+						return autoActionIndex(grow[i].TaskCode) < autoActionIndex(grow[j].TaskCode)
+					})
+					accts = append(accts, queueAccount{a: a, grow: grow})
+				}
+				usedCache = true
+			}
+		}
+	}
+
+	if !usedCache {
+		// 扫描待办（复用扫描逻辑的拉取部分）。
+		states := p.cfg.Pool.List()
+		var mu sync.Mutex
+		var scanAccts []*auth.Auth
+		for _, st := range states {
+			if st.Disabled {
+				continue
+			}
+			a := p.cfg.Pool.AuthByUID(st.UID)
+			if a == nil {
+				continue
+			}
+			scanAccts = append(scanAccts, a)
+		}
+		// 扫描段并发上限与停顿走 pool.BatchForEach（默认串行+随机抖动）。
+		p.cfg.Pool.BatchForEach(len(scanAccts), func(i int) {
+			a := scanAccts[i]
+			one := queueAccount{a: a}
+			if a.IsGlobal() || a.IsEnterprise() {
+				return
+			}
+			if a.IsEnterpriseSession() {
+				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证带企业上下文（JWT enterprise_id 非空），成长任务行为事件会被上游丢弃；请移除该账号后以个人身份重新登录", a.UID, a.Nickname)
+				return
+			}
+			if growth {
+				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+					for _, t := range tasks {
+						if growthPending(t) {
+							one.grow = append(one.grow, t)
+						}
+					}
+				}
+				if gap := p.batchSubDelay(); gap > 0 {
+					time.Sleep(gap)
+				}
 				if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
 					seen := map[string]bool{}
 					for _, t := range one.grow {
@@ -262,17 +427,17 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 						}
 					}
 				}
-				sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
+				sort.Slice(one.grow, func(i, j int) bool {
 					return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
 				})
 			}
-		}
-		if len(one.grow) > 0 {
-			mu.Lock()
-			accts = append(accts, one)
-			mu.Unlock()
-		}
-	})
+			if len(one.grow) > 0 {
+				mu.Lock()
+				accts = append(accts, one)
+				mu.Unlock()
+			}
+		})
+	}
 
 	// 组装队列（账号分组，保持顺序）。
 	var items []queueItem
@@ -326,7 +491,12 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	for _, one := range accts {
+	for idx, one := range accts {
+		if idx > 0 {
+			if d := p.batchPaceDelay(); d > 0 {
+				time.Sleep(d)
+			}
+		}
 		wg.Add(1)
 		go func(one queueAccount) {
 			defer wg.Done()
@@ -491,17 +661,79 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
-// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
-func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
-	accts := p.cfg.Pool.List()
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
-		Err      string                   `json:"error,omitempty"`
+func (p *Panel) vouchersMeta() cacheMeta {
+	p.vcMu.Lock()
+	defer p.vcMu.Unlock()
+	return cacheMeta{
+		FetchedAt: p.vcAt,
+		Scanning:  p.vcScanning,
+		Done:      p.vcDone,
+		Total:     p.vcTotal,
 	}
-	out := make([]row, len(accts))
+}
+
+// schoolVouchers 只读返回开学季券码扫描的内存缓存快照（零上游请求）。
+func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
+	p.vcMu.Lock()
+	res := make([]voucherRow, len(p.vcCache))
+	copy(res, p.vcCache)
+	at := p.vcAt
+	scanning := p.vcScanning
+	done := p.vcDone
+	total := p.vcTotal
+	p.vcMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"accounts":   res,
+		"cached":     true,
+		"fetched_at": at,
+		"scanning":   scanning,
+		"done":       done,
+		"total":      total,
+	})
+}
+
+// schoolVouchersRefresh 显式异步单飞触发券码查询（串行+随机间隔，防并发扫号）。
+func (p *Panel) schoolVouchersRefresh(w http.ResponseWriter, r *http.Request) {
+	started := p.startSchoolVouchersAsync()
+	meta := p.vouchersMeta()
+	msg := "券码查询已开始（串行防探测节奏）"
+	if !started {
+		msg = "券码查询正在进行中"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"started":    started,
+		"scanning":   meta.Scanning,
+		"done":       meta.Done,
+		"total":      meta.Total,
+		"fetched_at": meta.FetchedAt,
+		"message":    msg,
+	})
+}
+
+func (p *Panel) startSchoolVouchersAsync() bool {
+	p.vcMu.Lock()
+	if p.vcScanning {
+		p.vcMu.Unlock()
+		return false
+	}
+	p.vcScanning = true
+	p.vcDone = 0
+	p.vcTotal = 0
+	p.vcMu.Unlock()
+
+	go func() {
+		p.vcRun.Do(func() {
+			p.refreshSchoolVouchersSync()
+		})
+	}()
+	return true
+}
+
+func (p *Panel) refreshSchoolVouchersSync() []voucherRow {
+	accts := p.cfg.Pool.List()
+	out := make([]voucherRow, len(accts))
 	type voucherJob struct {
 		idx int
 		a   *auth.Auth
@@ -517,11 +749,16 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		}
 		jobs = append(jobs, voucherJob{idx: i, a: a})
 	}
-	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
-	p.cfg.Pool.BatchForEach(len(jobs), func(k int) {
+	p.vcMu.Lock()
+	p.vcScanning = true
+	p.vcDone = 0
+	p.vcTotal = len(jobs)
+	p.vcMu.Unlock()
+
+	p.cfg.Pool.BatchForEachProgress(len(jobs), func(k int) {
 		j := jobs[k]
 		a := j.a
-		it := row{UID: a.UID, Nickname: a.Nickname}
+		it := voucherRow{UID: a.UID, Nickname: a.Nickname}
 		switch {
 		case a.IsGlobal():
 			it.Err = "global realm（无开学季活动）"
@@ -534,12 +771,26 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		out[j.idx] = it
+	}, func(done, total int) {
+		p.vcMu.Lock()
+		p.vcDone = done
+		p.vcTotal = total
+		p.vcMu.Unlock()
 	})
-	res := make([]row, 0, len(out))
+	res := make([]voucherRow, 0, len(out))
 	for _, it := range out {
 		if it.UID != "" {
 			res = append(res, it)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
+	cached := make([]voucherRow, len(res))
+	copy(cached, res)
+	p.vcMu.Lock()
+	p.vcCache = cached
+	p.vcAt = time.Now()
+	p.vcScanning = false
+	p.vcDone = len(jobs)
+	p.vcTotal = len(jobs)
+	p.vcMu.Unlock()
+	return res
 }

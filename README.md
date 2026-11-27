@@ -558,11 +558,11 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.growth_enabled` | `true` | 成长任务队列自动排程总开关；`false` = 关闭每日自动扫描 / 执行（面板「执行全部待办」仍可手动触发） |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
 | `schedule.balance_refresh_enabled` | `true` | 余额后台刷新开关；开启时按 `balance_refresh_minutes`（默认 5）周期查全部账号余额 |
-| `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；并发上限受 `pool.batch_concurrency` 约束 |
+| `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；并发与账号间停顿受 `pool.batch_concurrency` / `pool.batch_delay_*` 约束 |
 | `schedule.task_sweep_enabled` | `true` | 任务补领清扫开关：分钟级、幂等地 accept 未接受任务、claim 已达标未领奖励（不跑任何行为链路）。默认开启 |
 | `schedule.task_sweep_minutes` | `15` | 补领清扫周期（分钟）；与成长队列（行为链路、成本高）不同，清扫只做 accept/claim 两条幂等 RPC |
-| `schedule.jitter_minutes` | `45` | 按账号的分钟级时刻抖动窗口。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/旅行/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换、按任务区分）。显式 `0` = 关闭。**只影响定时排程**：面板手动「立即签到/上报/保活」仍立刻对全部账号执行。**热生效** |
-| `schedule.keepalive_renew_before` | `168h` | 定时保活临期刷新阈值：只有 access token 剩余有效期 `<=` 该值时才执行定时刷新，避免每晚对长有效期账号无谓轮换 RT；`0` = 每次保活都刷新。手动「全部保活」不受限。**热生效** |
+| `schedule.jitter_minutes` | `45` | 按账号的分钟级时刻抖动窗口。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/旅行/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换、按任务区分）。显式 `0` = 关闭。面板手动全量触发则经 `pool.batch_concurrency` 与 `pool.batch_delay_*` 串行错峰。**热生效** |
+| `schedule.keepalive_renew_before` | `168h` | 保活临期刷新阈值：只有 access token 剩余有效期 `<=` 该值（且非已知 `rt_dead`）时才执行刷新，避免对长有效期账号无谓轮换 RT；`0` = 每次保活都刷新。**定时保活与手动「全部保活」统一生效**，单号「刷新」才做强制探测。**热生效** |
 | `global.enabled` | `true` | global 域路由总开关。`false` = 纯 CN 逃生门：即便 auth 写了 `realm=global` 也不路由 global base（`auth.Realm()` 的第一道闸）。改动需重启 |
 | `global.chat_base` / `global.billing_base` | 空 | 国际版上游 base 覆盖；空 = 内置默认 `https://www.workbuddy.ai`。改动需重启 |
 | `cn.chat_base` | 空 | 国内版 chat / 模型目录上游 base 覆盖；空 = 内置默认 `https://copilot.tencent.com`。`copilot.tencent.com` 对部分海外出口（Clash 全局 + TUN 等）会 TLS 复位，可改官方桌面端同构的 `https://www.workbuddy.cn`。改动需重启 |
@@ -588,7 +588,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
-| `pool.batch_concurrency` | `3` | **控制面批量任务并发**：余额刷新 / 任务补领清扫 / 任务中心扫描 / 积分构成 / 补偿状态 / 券码 / 昵称同步等「按账号扇出」的任务，同一时刻最多有几个账号在打上游（`<=0` 回落 3，`>8` 钳到 8）。这些任务共享同一个进程级闸门，多个任务同时跑也不会叠加成 N×3；与数据面 `max_in_flight*` 正交（后者只管 chat/search 单号在途）。面板保存后热生效（下一轮批量任务起效） |
+| `pool.batch_concurrency` | `1` | **控制面批量任务并发**：余额刷新 / 任务补领清扫 / 任务中心扫描 / 积分构成 / 补偿状态 / 券码 / 昵称同步等「按账号扇出」的任务，同一时刻最多有几个账号在打上游（默认 `1` 严格串行防反代并发特征；`<=0` 回落 `1`，`>8` 钳到 `8`）。这些任务共享同一个进程级闸门，多个任务同时跑也不会叠加；与数据面 `max_in_flight*` 正交（后者只管 chat/search 单号在途）。面板保存后热生效（下一轮批量任务起效） |
+| `pool.batch_delay_min_ms` / `batch_delay_max_ms` | `800` / `2000` | **控制面批量任务账号间随机停顿**（毫秒）：在所有多号批量扫描、手动全量签到/保活/旅行/上报/补偿领取之间插入 `[min, max]` 随机间隔，避免单出口 IP 在同秒集中发出同类型请求簇；显式设为 `0` 可关闭。**热生效** |
 | `pool.degrade_threshold` | `5` | 连败降权阈值：未知错误（ErrClient/传输层）连败 N 次临时出池 |
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与上限钳制 |
 | `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：免费层垄断且存在未知号时，每窗口把一个真实请求搭车改道给未知号（零新增上游请求；成功即毕业，失败走既有错误策略）。`0` = 关停 |
@@ -864,12 +865,10 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 按账号扇出的控制面任务（余额刷新、任务补领清扫、任务中心扫描、成长队列扫描、积分构成、
 补偿状态、券码、昵称同步）共享同一个进程级闸门：同一时刻最多 `pool.batch_concurrency`
-个账号在打上游（缺省 3，范围 1-8，面板保存后热生效、下一轮任务起效）。改造前这些任务
+个账号在打上游（**缺省 `1` 严格串行**，范围 `1-8`，并在相邻账号间叠加 `batch_delay_min_ms`~`batch_delay_max_ms` 默认 `800~2000ms` 随机间隔，面板保存后热生效、下一轮任务起效）。改造前这些任务
 每个账号一个 goroutine、彼此独立，账号一多就是 N～2N 个请求同时打出，还会和 chat 流量叠加。
 
-同一任务还带单飞（同一时刻只跑一轮）：余额刷新用**合并**语义（手动刷新恰逢后台在跑时，
-等这一轮结束即返回，数据就是刚查回来的），签到 / 旅行 / 活跃上报 / 保活 / 补领清扫用
-**跳过**语义（后来者直接返回「上一轮仍在执行」，面板按钮会如实提示）。数据面
+同一任务还带单飞与缓存语义：控制面 `GET` 视图读取服务端内存缓存（零上游请求），显式点击刷新按钮触发**异步单飞**扫描并通过轮询展示进度；签到 / 旅行 / 活跃上报 / 保活 / 补领清扫采用**跳过**语义（后来者直接返回「上一轮仍在执行」，面板按钮同步锁定并显示进度）。数据面
 （`/v1/chat/completions` 等）不经此闸门，仍由 `pool.max_in_flight*` 按账号控制在途。
 多实例部署时闸门不跨进程协调。
 
@@ -1025,7 +1024,7 @@ baseURL 指向 `<网关>/v1/search`，即可零代码接入本网关的搜索能
 > `blocked_domains`（折成 `(-site:)` 拼进 query）在服务端均**静默失效**——传了不报错也
 > 不生效。本端点因此不接受这三个字段，避免调用方产生「已过滤」的错误预期。
 
-**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟并发查询全部账号余额并更新池内积分（并发上限 `pool.batch_concurrency`，缺省 3；与补领清扫等批量任务共享同一进程级闸门）——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「立即刷新」按钮也是全量刷余额；5 秒自动轮询只读内存，不打上游。
+**余额后台刷新**（`schedule.balance_refresh_enabled`，缺省开启）：每 `balance_refresh_minutes`（缺省 5）分钟按 `pool.batch_concurrency`（缺省 1）与账号间随机停顿查询全部账号余额并更新池内积分（与补领清扫等批量任务共享同一进程级闸门）——两次签到时点之间 credits 保持新鲜，余额恢复的冷却账号也会自动解冻（语义同签到，但不做签到不刷 token）。面板「刷新余额」按钮为异步单飞全量刷余额；5 秒自动轮询只读内存，不打上游。
 
 ## 🖥️ Web 管理面板
 
@@ -1045,7 +1044,7 @@ http://127.0.0.1:7863/panel/
 | **积分构成** | **剩余积分走势**（全池合计 + cn/global 分域折线，余额后台刷新/签到结束时采样；企业版不限量账号不计入合计）+ **积分到期分布**（按批次到期日聚合，颜色区分账号）+ **账号对比**（按来源归并的面额 / 余额 / 包数卡片与混合构成条）+ 逐包明细（按到期日排序，默认展开最近到期的 `panel.package_detail_limit` 个，其余与已用完的包折叠） |
 | **通道健康** | 上游拦截与出站改写：**6 张 KPI**（请求 / 失败率 / 11-128 拦截 / 搬移重试 / 出站改写 / 限流·容量，每张带单位与口径）+ **状态条**（通道正常/降级中徽标 + 提示词模式 + 上次降级 + 已学习指纹「本进程/历史」 + 跨域回退）+ **覆盖条**（窗口 + 事件/用量/归档各自的数据起点 + 服务端分桶时区）+ **双度量趋势图**（拦截事件堆叠柱：通道拒绝 / 限流·容量 / 流中断·超时 / 其他；出站改写双折线：归一 / 清洗；可切绝对量/每千请求，覆盖带标出「数据起点」）+ **失败率折线**（窗口定域、断档分段、均值/峰值）+ **事件分类表**（注册表标签 / 次数 / 每千请求 / 最近一次 / 说明，可按表头排序）+ **分域对比**（只比较 cn/global，标注带域标记覆盖率，不把历史全算「未标注」）。支持关 / 30 秒 / 60 秒 / 5 分钟自动刷新。事件计数来自网关决策点（**含被救回的请求**），失败率来自用量账本（90 天），分域来自请求归档 |
 | **任务中心** | 成长任务队列：一键扫描全部账号未完成待办（默认口径 + 小程序口径）→ 按账号排队执行（账号内串行，账号间可选并发 1-3），进度实时更新；另含开学季券码查询（活动已结束，仅历史券）。详见 [任务中心](#-任务中心面板新视图) |
-| **模型与档位** | 实时查询上游：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
+| **模型与档位** | 读取共享缓存快照（零切页探测，点「重新获取」显式刷新）：每模型的积分倍率（含限时免费 / 夜间折扣等**生效价**与划线牌价）、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；存在探测数据时最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商 / 标签，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率 / 上下文 / 最大输出 / ID 排序 |
 | **配置** | 在线编辑 config.json：服务（监听地址 / API 密钥 / 单账号明细条数）、定时任务（签到 / 保活 / 旅行 / 活跃 / 成长 / 补领清扫 时点与开关 + 余额刷新间隔；夜猫子时点与开关仅 `config.json`）、账号池与流量治理、上游与高级（超时 / 出站 UA / 提示词模式 / 指纹脱敏 / system→user 兜底 / 粘性路由）、日志（调用来源记录开关） |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持按 IP·UA·模型·账号·请求 ID 与结果筛选、读取条数、时间范围；下方 **运行日志** 按「任务 / 对话 / 系统」分频道，可开关自动滚动；新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
@@ -1292,10 +1291,10 @@ v1.21.0 的第一版看板数的是「请求最终失败没有」，在真实部
 
 | 分组 | 端点 |
 |---|---|
-| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages` · `GET models` · `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET credit_trend`（`from` / `to`；走势采样点 + 实时 `current`）· `GET channel_health`（`from` / `to`；`requests` 失败率序列 + `events` 事件序列（每点带 `groups`）+ `groups` 堆叠组元数据 + `kinds` 事件表（`label/group/unit/hint/per_1k/last_at`）+ `state`（未接线为 `null`）+ `sources` 各源 `from/to/since` + `tz` + `realms` 分域 + `realm_labeled/realm_total`）· `GET config` · `GET tasks/queue` · `GET school/vouchers` |
-| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `refresh`（手动刷一次 token，回包带 `needs_relogin` / `access_usable`）· `relogin/start`（给该 uid 发一张扫码码；扫回来必须同 uid、就地改写、成功后自动解禁）· `remove`（凭证看起来仍有效时需 `?force=1`）；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all` |
-| 补偿 | `GET compensation`（逐号查补偿状态，**只读**）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
-| 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all` · `tasks/run_queue` |
+| 只读 | `GET overview` · `GET usage`（`hours` 或 `from`/`to`；响应含 `saved_yuan` / `priced_tokens` / `unpriced_tokens` 与 `pricing{enabled,source,updated,coverage_pct,lifetime_saved_yuan,...}`）· `GET packages`（只读缓存）· `GET models`（只读缓存）· `GET model_probes` · `GET logs` · `GET request_metrics` · `GET request_logs`（`limit` / `outcome` / `account` / `model` / `client_ip` / `user_agent` / `from` / `to`）· `GET credit_history`（`limit` / `uid`）· `GET credit_trend`（`from` / `to`；走势采样点 + 实时 `current`）· `GET channel_health`（`from` / `to`；`requests` 失败率序列 + `events` 事件序列（每点带 `groups`）+ `groups` 堆叠组元数据 + `kinds` 事件表（`label/group/unit/hint/per_1k/last_at`）+ `state`（未接线为 `null`）+ `sources` 各源 `from/to/since` + `tz` + `realms` 分域 + `realm_labeled/realm_total`）· `GET config` · `GET tasks/scan`（只读缓存）· `GET tasks/queue` · `GET school/vouchers`（只读缓存） |
+| 账号运维 | `POST accounts/{uid}/checkin` · `balance` · `revive` · `disable` · `pause` · `resume` · `refresh`（手动刷一次 token，回包带 `needs_relogin` / `access_usable`）· `relogin/start`（给该 uid 发一张扫码码；扫回来必须同 uid、就地改写、成功后自动解禁）· `remove`（凭证看起来仍有效时需 `?force=1`）；`POST checkin_all` · `travel_all` · `activity_all` · `keepalive_all` · `balance_all`（异步单飞）· `nicknames/sync`（低频手动同步昵称）· `packages/refresh`（异步扫描积分包明细）· `models/refresh`（防抖重探目录） |
+| 补偿 | `GET compensation`（只读内存补偿缓存，零上游请求）；`POST compensation/scan`（显式触发异步单飞扫描）；`POST accounts/{uid}/compensation`（单号领）；`POST compensation_all`（全量串行隔峰领，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**，否则会把「全部查询失败」说成「没有待领补偿」） |
+| 任务 | `GET accounts/{uid}/tasks`；`POST accounts/{uid}/tasks/accept` · `accept_all` · `claim` · `auto` · `auto_all`；`POST tasks/scan_all`（异步单飞扫描）· `tasks/run_queue` · `school/vouchers/refresh`（异步查询券码） |
 | 添加账号 | `POST login/start` · `GET login/poll` · `GET login/regions` · `POST import/cockpit`（默认**跳过**已存在的 uid，`overwrite=1` 才覆盖且保留 `device_token` 等手写键，回包含 `imported` / `overwritten` / `skipped`） |
 | 写入 | `POST config`（校验 → 落盘 → 热应用，返回需重启字段清单）· `POST usage/save`（立即把内存用量落盘） |
 

@@ -329,8 +329,8 @@ func (p *Pool) batchGateHandle() *batch.Gate {
 }
 
 // SetBatchConcurrency 注入控制面批量任务的账号并发上限（pool.batch_concurrency）。
-// <=0 回落默认 3，>8 钳到 8；面板保存后热生效——正在跑的一轮按旧上限，下一轮起
-// 用新值。与 max_in_flight 无关：它只管余额刷新/补领清扫/任务扫描这类批量任务。
+// <=0 回落默认 1（严格串行），>8 钳到 8；面板保存后热生效——正在跑的一轮按旧上限，
+// 下一轮起用新值。与 max_in_flight 无关：它只管余额刷新/补领清扫/任务扫描这类批量任务。
 func (p *Pool) SetBatchConcurrency(n int) {
 	p.batchGateHandle().Set(n)
 }
@@ -340,10 +340,25 @@ func (p *Pool) BatchConcurrency() int {
 	return p.batchGateHandle().Limit()
 }
 
+// SetBatchDelay 注入控制面批量任务相邻账号之间的随机间隔窗口 [min, max]（热生效）。
+func (p *Pool) SetBatchDelay(min, max time.Duration) {
+	p.batchGateHandle().SetDelay(min, max)
+}
+
+// BatchDelay 返回当前生效的批量任务随机间隔窗口 [min, max]。
+func (p *Pool) BatchDelay() (min, max time.Duration) {
+	return p.batchGateHandle().Delay()
+}
+
 // BatchForEach 以不超过批量上限的并发对 0..n-1 各执行一次 fn。
 // 供 scheduler / panel 的批量任务复用；fn 内不得再调用 BatchForEach（禁止嵌套占位）。
 func (p *Pool) BatchForEach(n int, fn func(int)) {
 	p.batchGateHandle().ForEach(n, fn)
+}
+
+// BatchForEachProgress 与 BatchForEach 相同，但每完成一项回调 onProgress(done, total)。
+func (p *Pool) BatchForEachProgress(n int, fn func(int), onProgress func(done, total int)) {
+	p.batchGateHandle().ForEachProgress(n, fn, onProgress)
 }
 
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；

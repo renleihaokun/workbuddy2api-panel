@@ -77,8 +77,12 @@ func (s *Scheduler) runTravel(scheduled bool) {
 
 func (s *Scheduler) runTravelAt(now time.Time, scheduled bool) {
 	first := true
+	list := s.cfg.Pool.List()
+	s.beginTask("travel", len(list))
+	defer s.endTask("travel")
 	hourBase := now.Truncate(time.Hour)
-	for _, st := range s.cfg.Pool.List() {
+	for idx, st := range list {
+		s.stepTask("travel", idx+1)
 		if st.Disabled {
 			continue
 		}
@@ -96,7 +100,9 @@ func (s *Scheduler) runTravelAt(now time.Time, scheduled bool) {
 			continue // 企业版 / 企业切换会话门控：无成长体系（growth 端点企业号 403；切换会话不计分），不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if d := s.paceDelay(travelAccountDelay); d > 0 {
+				time.Sleep(d)
+			}
 		}
 		first = false
 		s.travelOne(a)

@@ -6,23 +6,27 @@ import (
 	"time"
 )
 
-// TestBatchConcurrencyDefaultAndHotSet 批量并发上限：默认 3、热改可读回、越界收敛。
+// TestBatchConcurrencyDefaultAndHotSet 批量并发上限：默认 1（严格串行）、热改可读回、越界收敛。
 func TestBatchConcurrencyDefaultAndHotSet(t *testing.T) {
 	p := New("")
-	if got := p.BatchConcurrency(); got != 3 {
-		t.Fatalf("默认 BatchConcurrency=%d want 3", got)
+	if got := p.BatchConcurrency(); got != 1 {
+		t.Fatalf("默认 BatchConcurrency=%d want 1", got)
 	}
 	p.SetBatchConcurrency(5)
 	if got := p.BatchConcurrency(); got != 5 {
 		t.Fatalf("SetBatchConcurrency(5) 后 =%d want 5", got)
 	}
 	p.SetBatchConcurrency(0)
-	if got := p.BatchConcurrency(); got != 3 {
-		t.Fatalf("SetBatchConcurrency(0) 后 =%d want 3（回落默认）", got)
+	if got := p.BatchConcurrency(); got != 1 {
+		t.Fatalf("SetBatchConcurrency(0) 后 =%d want 1（回落默认）", got)
 	}
 	p.SetBatchConcurrency(99)
 	if got := p.BatchConcurrency(); got != 8 {
 		t.Fatalf("SetBatchConcurrency(99) 后 =%d want 8（钳制）", got)
+	}
+	p.SetBatchDelay(15*time.Millisecond, 30*time.Millisecond)
+	if minD, maxD := p.BatchDelay(); minD != 15*time.Millisecond || maxD != 30*time.Millisecond {
+		t.Fatalf("BatchDelay=(%v,%v) want (15ms,30ms)", minD, maxD)
 	}
 }
 
@@ -50,8 +54,8 @@ func TestBatchForEachBounded(t *testing.T) {
 // TestBatchGateZeroValuePool 零值 Pool（测试/裸构造）也要安全：懒创建闸门并用默认上限。
 func TestBatchGateZeroValuePool(t *testing.T) {
 	p := &Pool{}
-	if got := p.BatchConcurrency(); got != 3 {
-		t.Fatalf("零值 Pool BatchConcurrency=%d want 3", got)
+	if got := p.BatchConcurrency(); got != 1 {
+		t.Fatalf("零值 Pool BatchConcurrency=%d want 1", got)
 	}
 	var ran atomic.Int32
 	p.BatchForEach(3, func(int) { ran.Add(1) })

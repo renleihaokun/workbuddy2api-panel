@@ -42,6 +42,8 @@ if (config) {
   check(has(config.pool, 'verify_session_on_401'), 'config.example.json 含 pool.verify_session_on_401');
   check(has(config.pool, 'session_verify_interval'), 'config.example.json 含 pool.session_verify_interval');
   check(has(config.schedule, 'jitter_minutes'), 'config.example.json 含 schedule.jitter_minutes');
+  check(config.pool && config.pool.batch_concurrency === 1, 'config.example.json 默认 pool.batch_concurrency 为 1');
+  check(has(config.pool, 'batch_delay_min_ms') && has(config.pool, 'batch_delay_max_ms'), 'config.example.json 含 pool.batch_delay_min_ms/max_ms');
   check(has(config.server, 'read_timeout'), 'config.example.json 含 server.read_timeout');
   check(config.api_key === '', 'config.example.json 的 api_key 保持空串占位（不是真实密钥）');
 }

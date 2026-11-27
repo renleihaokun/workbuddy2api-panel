@@ -197,4 +197,66 @@ func TestCompensationStatusAllBoundedConcurrency(t *testing.T) {
 			t.Fatalf("行序漂移：rows[%d]=%s want %s", i, rows[i].UID, want)
 		}
 	}
+	// 扫描完成后缓存必已填充，CompensationCached 零上游请求直接返回同份结果。
+	snap := s.CompensationCached()
+	if snap.Scanning || len(snap.Rows) != accounts || snap.FetchedAt.IsZero() {
+		t.Fatalf("CompensationCached 异常: %+v", snap)
+	}
+}
+
+// TestSchedulerBatchDelayPacing 验证手动保活、手动签到与补偿领取的账号间随机间隔，
+// 且手动签到不再做双遍全池扫描。
+func TestSchedulerBatchDelayPacing(t *testing.T) {
+	var checkinCalls, streakCalls, refreshCalls, compCalls atomic.Int32
+	s, _ := newBatchTestScheduler(t, 3, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
+			checkinCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/streak"):
+			streakCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"redemption_status":{"tiers":[]}}}`))
+		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
+			refreshCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"accessToken":"new-at"}}`))
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/compensation-status"):
+			compCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"OK","data":{"active":true,"claimed":false,"credit_num":500}}`))
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/claim-compensation"):
+			w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":500}}`))
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/claim-gift"):
+			w.WriteHeader(400)
+			w.Write([]byte(`{"code":10001,"msg":"claimed"}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/heatmap"):
+			w.Write([]byte(`{"code":0,"data":{"cells":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/lottery/summary"):
+			w.Write([]byte(`{"code":0,"data":{"chances":0}}`))
+		default:
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
+		}
+	})
+	s.SetBatchDelay(20*time.Millisecond, 30*time.Millisecond)
+
+	start := time.Now()
+	s.RunKeepaliveNow()
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("3 号 RunKeepaliveNow 未按账号间隔停顿（耗时 %v）", elapsed)
+	}
+	if got := refreshCalls.Load(); got != 3 {
+		t.Fatalf("refreshCalls=%d want 3", got)
+	}
+
+	start = time.Now()
+	s.RunCheckinNow()
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("3 号 RunCheckinNow 未按账号间隔停顿（耗时 %v）", elapsed)
+	}
+	if checkinCalls.Load() != 3 || streakCalls.Load() != 3 {
+		t.Fatalf("checkin=%d streak=%d want 3/3（单遍循环不得重复扫）", checkinCalls.Load(), streakCalls.Load())
+	}
+	// RunCheckinNow 已附带领掉补偿 → 先建一份快照再测 ClaimCompensationNow 更新缓存。
+	s.CompensationStatusAll()
+	if got := len(s.CompensationCached().Rows); got != 3 {
+		t.Fatalf("cached rows=%d want 3", got)
+	}
 }

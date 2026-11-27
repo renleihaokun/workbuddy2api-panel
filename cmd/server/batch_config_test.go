@@ -22,20 +22,23 @@ func TestSaveConfigHotAppliesBatchConcurrency(t *testing.T) {
 	live := livecfg.New(livecfg.Snapshot{})
 	up := upstream.New()
 	sch := scheduler.New(scheduler.Config{})
-	if got := p.BatchConcurrency(); got != 3 {
-		t.Fatalf("初始 BatchConcurrency=%d want 3", got)
+	if got := p.BatchConcurrency(); got != 1 {
+		t.Fatalf("初始 BatchConcurrency=%d want 1", got)
 	}
 
-	restart, err := saveConfig([]byte(`{"pool":{"batch_concurrency":5}}`), fp, live, p, up, sch)
+	restart, err := saveConfig([]byte(`{"pool":{"batch_concurrency":5,"batch_delay_min_ms":100,"batch_delay_max_ms":250}}`), fp, live, p, up, sch)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := p.BatchConcurrency(); got != 5 {
 		t.Fatalf("保存后 BatchConcurrency=%d want 5（热生效）", got)
 	}
+	if minD, maxD := p.BatchDelay(); minD != 100*time.Millisecond || maxD != 250*time.Millisecond {
+		t.Fatalf("保存后 BatchDelay=(%v,%v) want (100ms,250ms)", minD, maxD)
+	}
 	for _, k := range restart {
-		if k == "pool.batch_concurrency" {
-			t.Fatalf("batch_concurrency 应热生效，不该出现在重启清单：%v", restart)
+		if k == "pool.batch_concurrency" || k == "pool.batch_delay_min_ms" || k == "pool.batch_delay_max_ms" {
+			t.Fatalf("%s 应热生效，不该出现在重启清单：%v", k, restart)
 		}
 	}
 }

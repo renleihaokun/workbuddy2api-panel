@@ -47,6 +47,7 @@ func (s *Scheduler) runBlackcat(scheduled bool) {
 		return
 	}
 	hourBase := now.Truncate(time.Hour)
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
 		// 真实模型对话」的（RunNightChats 逐条 ChatStream 发 glm-5.2 短对话），
@@ -67,6 +68,12 @@ func (s *Scheduler) runBlackcat(scheduled bool) {
 		if a.IsEnterpriseSession() {
 			continue // 企业版 / 企业切换会话门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」；切换会话不计分）
 		}
+		if !first {
+			if d := s.paceDelay(activityAccountDelay); d > 0 {
+				time.Sleep(d)
+			}
+		}
+		first = false
 		need, err := s.cfg.Upstream.BlackcatNeed(a)
 		if err != nil {
 			log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
@@ -81,6 +88,5 @@ func (s *Scheduler) runBlackcat(scheduled bool) {
 			continue
 		}
 		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
-		time.Sleep(activityAccountDelay)
 	}
 }

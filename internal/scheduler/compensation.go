@@ -13,11 +13,21 @@ package scheduler
 import (
 	"errors"
 	"log"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
+
+// CompensationSnapshot 服务端补偿状态缓存快照与扫描进度（纯内存读，零上游请求）。
+type CompensationSnapshot struct {
+	Rows      []CompensationRow `json:"rows"`
+	FetchedAt time.Time         `json:"fetched_at,omitempty"`
+	Scanning  bool              `json:"scanning"`
+	Done      int               `json:"done,omitempty"`
+	Total     int               `json:"total,omitempty"`
+}
 
 // 补偿任务的跳过原因（面板据此渲染，勿随意改字面量）。
 //
@@ -106,12 +116,46 @@ func (s *Scheduler) compTargets() []compTarget {
 	return out
 }
 
-// CompensationStatusAll 并发查全部账号的补偿状态（只读，不领取）。
-//
-// 输出与池顺序一致：先按 compTargets 预分配等长切片，每个 goroutine 只写自己那
-// 一个下标——不同下标是互不重叠的内存，无需互斥锁即可避免竞态（也避免了
-// 「goroutine 完成顺序 = 返回顺序」导致的行序漂移）。并发上限 3 与既有
-// /panel/api/packages 的账号遍历一致。
+// CompensationCached 读取最近一次补偿状态扫描的内存缓存及当前扫描进度（零上游请求）。
+func (s *Scheduler) CompensationCached() CompensationSnapshot {
+	s.compMu.Lock()
+	defer s.compMu.Unlock()
+	rows := make([]CompensationRow, len(s.compCache))
+	copy(rows, s.compCache)
+	return CompensationSnapshot{
+		Rows:      rows,
+		FetchedAt: s.compAt,
+		Scanning:  s.compActive,
+		Done:      s.compDone,
+		Total:     s.compTotal,
+	}
+}
+
+// StartCompensationScan 异步单飞触发全池补偿状态扫描：已在跑直接返回 false。
+func (s *Scheduler) StartCompensationScan() bool {
+	s.compMu.Lock()
+	if s.compActive {
+		s.compMu.Unlock()
+		return false
+	}
+	if !s.compRun.TryLock() {
+		s.compMu.Unlock()
+		return false
+	}
+	s.compActive = true
+	s.compDone = 0
+	s.compTotal = 0
+	s.compMu.Unlock()
+
+	go func() {
+		defer s.compRun.Unlock()
+		s.CompensationStatusAll()
+	}()
+	return true
+}
+
+// CompensationStatusAll 查全部账号的补偿状态（只读，不领取），并发上限与账号间停顿走 Pool 闸门，
+// 完成后刷新内存缓存。
 func (s *Scheduler) CompensationStatusAll() []CompensationRow {
 	targets := s.compTargets()
 	rows := make([]CompensationRow, len(targets))
@@ -129,8 +173,13 @@ func (s *Scheduler) CompensationStatusAll() []CompensationRow {
 		}
 		work = append(work, idxTarget{i: i, t: t})
 	}
-	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
-	s.cfg.Pool.BatchForEach(len(work), func(k int) {
+	s.compMu.Lock()
+	s.compActive = true
+	s.compDone = 0
+	s.compTotal = len(work)
+	s.compMu.Unlock()
+
+	s.cfg.Pool.BatchForEachProgress(len(work), func(k int) {
 		w := work[k]
 		row := CompensationRow{UID: w.t.uid, Nickname: w.t.nick}
 		st, err := s.cfg.Upstream.GetCompensationStatus(w.t.a)
@@ -140,33 +189,48 @@ func (s *Scheduler) CompensationStatusAll() []CompensationRow {
 			row.Status = st
 		}
 		rows[w.i] = row
+	}, func(done, total int) {
+		s.compMu.Lock()
+		s.compDone = done
+		s.compTotal = total
+		s.compMu.Unlock()
 	})
+
+	cached := make([]CompensationRow, len(rows))
+	copy(cached, rows)
+	s.compMu.Lock()
+	s.compCache = cached
+	s.compAt = time.Now()
+	s.compActive = false
+	s.compDone = len(work)
+	s.compTotal = len(work)
+	s.compMu.Unlock()
 	return rows
 }
 
-// ClaimCompensationNow 逐号「查状态 → 待领则领」，返回逐号结果。
-//
-// 供面板手动按钮与签到排程共用；单号失败不影响其余账号。
-//
-// 这里刻意**串行**而非并发：ClaimCompensation 对同一活动每号仅一次（重复领会拿到
-// 业务错误），串行让「前一个号失败」不影响后一个号的判定，且账号量是个位数。
+// ClaimCompensationNow 逐号「查状态 → 待领则领」（账号间叠加随机间隔），同时回写补偿缓存。
 func (s *Scheduler) ClaimCompensationNow() []CompensationResult {
 	targets := s.compTargets()
 	out := make([]CompensationResult, 0, len(targets))
+	first := true
 	for _, t := range targets {
 		if t.a == nil {
 			out = append(out, CompensationResult{UID: t.uid, Nickname: t.nick, Skip: t.skip, SkipMsg: t.msg})
 			continue
 		}
+		if !first {
+			if d := s.paceDelay(0); d > 0 {
+				time.Sleep(d)
+			}
+		}
+		first = false
 		out = append(out, s.claimOne(t.a))
 	}
+	s.mergeCompCacheFromResults(out)
 	return out
 }
 
-// ClaimCompensationFor 单号领取补偿（面板单号按钮）；账号不在池中返回 error。
-//
-// 门控与 compTargets 同一套判据，但直接查 Pool.Status/AuthByUID（均为 O(1) 的
-// 加锁查询，无副作用），不扫全表——pool 本来就提供单号查询，没必要造 O(n)。
+// ClaimCompensationFor 单号领取补偿（面板单号按钮）；账号不在池中返回 error，领取后同步更新内存缓存。
 func (s *Scheduler) ClaimCompensationFor(uid string) (CompensationResult, error) {
 	st, ok := s.cfg.Pool.Status(uid)
 	if !ok {
@@ -188,7 +252,43 @@ func (s *Scheduler) ClaimCompensationFor(uid string) (CompensationResult, error)
 	if a.IsEnterprise() {
 		return skip(compSkipEnterprise, "企业版无补偿体系")
 	}
-	return s.claimOne(a), nil
+	res := s.claimOne(a)
+	s.mergeCompCacheFromResults([]CompensationResult{res})
+	return res, nil
+}
+
+// mergeCompCacheFromResults 把刚执行的领取结果合并回内存补偿缓存，
+// 避免面板领完后立刻再发一轮全池并发查询刷新。
+func (s *Scheduler) mergeCompCacheFromResults(results []CompensationResult) {
+	if len(results) == 0 {
+		return
+	}
+	byUID := make(map[string]CompensationResult, len(results))
+	for _, r := range results {
+		byUID[r.UID] = r
+	}
+	s.compMu.Lock()
+	defer s.compMu.Unlock()
+	if len(s.compCache) == 0 {
+		return
+	}
+	for i := range s.compCache {
+		r, ok := byUID[s.compCache[i].UID]
+		if !ok {
+			continue
+		}
+		s.compCache[i].Skip = r.Skip
+		s.compCache[i].SkipMsg = r.SkipMsg
+		s.compCache[i].Error = r.Error
+		if r.Status.Active || r.Status.Claimed || r.Status.CreditNum > 0 {
+			s.compCache[i].Status = r.Status
+		}
+		if r.Claimed {
+			s.compCache[i].Status.Claimed = true
+			s.compCache[i].Error = ""
+		}
+	}
+	s.compAt = time.Now()
 }
 
 // claimOne 单账号「查状态 → 待领才领」的全部分支与日志。

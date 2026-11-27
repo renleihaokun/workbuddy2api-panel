@@ -18,15 +18,35 @@
 //     Acquire 的最坏等待是「前面一批请求的全部超时」，有界、不死锁。
 package batch
 
-import "sync"
+import (
+	"math/rand/v2"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
 const (
-	// Default 默认批量并发：与改造前几个手写 sem 的取值一致（3），零行为回归。
-	Default = 3
+	// Default 默认批量并发：严格串行（1），单出口 IP 下避免同刻并发多号扇出暴露反代特征；
+	// 用户仍可在 config pool.batch_concurrency 显式放宽（最高 Max）。
+	Default = 1
 	// Max 批量并发上限：再往上放就不如让用户显式关掉任务了，也避免一个误配把
 	// WAF 风险重新拉满。
 	Max = 8
+	// DefaultDelayMin / DefaultDelayMax 控制面批量任务相邻账号间的推荐随机停顿区间。
+	DefaultDelayMin = 800 * time.Millisecond
+	DefaultDelayMax = 2000 * time.Millisecond
 )
+
+// RandomDelay 返回 [min, max] 内的均匀随机时长（<=0 回落 0；max<=min 返回 min）。
+func RandomDelay(min, max time.Duration) time.Duration {
+	if min < 0 {
+		min = 0
+	}
+	if max <= min {
+		return min
+	}
+	return min + time.Duration(rand.Int64N(int64(max-min)+1))
+}
 
 // Normalize 把配置值收敛到 [1, Max]：<=0 视为未设置回落 Default，>Max 钳到 Max。
 // 与 config.normalize 中 max_in_flight_global 的「非法值回落默认」同风格。
@@ -50,6 +70,13 @@ type Gate struct {
 	cond     *sync.Cond
 	limit    int
 	inFlight int
+	delayMin time.Duration
+	delayMax time.Duration
+
+	paceMu    sync.Mutex
+	hasRan    bool
+	lastEnd   time.Time
+	nextStart time.Time
 }
 
 // NewGate 构建闸门；limit 走 Normalize（<=0 回落 Default，>Max 钳制）。
@@ -88,7 +115,34 @@ func (g *Gate) Set(n int) {
 	g.mu.Unlock()
 }
 
-// Acquire 占一个名额，返回幂等的释放函数。
+// SetDelay 运行期设置相邻获取之间的随机间隔窗口 [min, max]；<=0 关闭间隔，max<min 时收敛到 min。
+func (g *Gate) SetDelay(min, max time.Duration) {
+	if g == nil {
+		return
+	}
+	if min < 0 {
+		min = 0
+	}
+	if max < min {
+		max = min
+	}
+	g.mu.Lock()
+	g.delayMin = min
+	g.delayMax = max
+	g.mu.Unlock()
+}
+
+// Delay 返回当前配置的随机间隔窗口 [min, max]。
+func (g *Gate) Delay() (min, max time.Duration) {
+	if g == nil {
+		return 0, 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.delayMin, g.delayMax
+}
+
+// Acquire 占一个名额，返回幂等的释放函数；若配置了随机间隔窗口，会在实际执行前按窗口错峰停顿。
 func (g *Gate) Acquire() func() {
 	if g == nil {
 		return func() {}
@@ -105,12 +159,42 @@ func (g *Gate) Acquire() func() {
 		g.cond.Wait()
 	}
 	g.inFlight++
+	minD, maxD := g.delayMin, g.delayMax
 	g.mu.Unlock()
+
+	if minD > 0 || maxD > 0 {
+		var sleepFor time.Duration
+		g.paceMu.Lock()
+		now := time.Now()
+		if !g.hasRan {
+			g.hasRan = true
+			g.nextStart = now
+		} else {
+			base := g.lastEnd
+			if g.nextStart.After(base) {
+				base = g.nextStart
+			}
+			target := base.Add(RandomDelay(minD, maxD))
+			if target.After(now) {
+				sleepFor = target.Sub(now)
+				g.nextStart = target
+			} else {
+				g.nextStart = now
+			}
+		}
+		g.paceMu.Unlock()
+		if sleepFor > 0 {
+			time.Sleep(sleepFor)
+		}
+	}
 
 	// 幂等释放：重复调用只会归还一次名额，避免调用方手滑把计数减穿。
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			g.paceMu.Lock()
+			g.lastEnd = time.Now()
+			g.paceMu.Unlock()
 			g.mu.Lock()
 			g.inFlight--
 			g.cond.Signal()
@@ -157,6 +241,20 @@ func (g *Gate) ForEach(n int, fn func(int)) {
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+// ForEachProgress 在 ForEach 基础上额外报告已完成项数（done/total），便于长耗时串行任务展示进度。
+func (g *Gate) ForEachProgress(n int, fn func(int), onProgress func(done, total int)) {
+	if n <= 0 {
+		return
+	}
+	var done atomic.Int64
+	g.ForEach(n, func(i int) {
+		fn(i)
+		if onProgress != nil {
+			onProgress(int(done.Add(1)), n)
+		}
+	})
 }
 
 // Coalescer 把并发触发合并成一轮：已有在途轮次时，后来者等它结束就返回，不再

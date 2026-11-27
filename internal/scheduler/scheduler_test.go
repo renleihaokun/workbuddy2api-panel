@@ -734,8 +734,8 @@ func TestPausedStillTravels(t *testing.T) {
 	}
 }
 
-// TestKeepaliveRenewBeforeThreshold 定时保活按 AT 剩余有效期门槛跳过远期号、刷新临期号，
-// 且手动 RunKeepaliveNow() 不受门槛限制；已知 RT 已死且 AT 仍有效时不反复撞 refresh。
+// TestKeepaliveRenewBeforeThreshold 保活按 AT 剩余有效期门槛跳过远期号、刷新临期号，
+// 且定时保活与手动 RunKeepaliveNow() 统一遵守门槛与坏 RT 跳过规则（单号强刷才穿透）。
 func TestKeepaliveRenewBeforeThreshold(t *testing.T) {
 	f := &fakeUpstream{}
 	srv := f.server()
@@ -762,12 +762,12 @@ func TestKeepaliveRenewBeforeThreshold(t *testing.T) {
 		t.Fatalf("scheduled refresh calls=%d want 1（仅 u-near 刷新；u-fresh 未临期、u-rt-dead 已知 RT 死且 AT 有效）", got)
 	}
 
-	// 手动触发应忽略临期阈值（全跑，包括 u-fresh）。
+	// 手动批量保活同样遵守临期阈值与坏 RT 跳过规则，避免点击「全部保活」同 IP 集中轮换全池 RT。
 	f.refreshCalls.Store(0)
 	if !s.RunKeepaliveNow() {
 		t.Fatal("RunKeepaliveNow 返回 false")
 	}
-	if got := f.refreshCalls.Load(); got != 3 {
-		t.Fatalf("manual refresh calls=%d want 3", got)
+	if got := f.refreshCalls.Load(); got != 1 {
+		t.Fatalf("manual refresh calls=%d want 1", got)
 	}
 }

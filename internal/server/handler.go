@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/batch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -429,6 +430,8 @@ var dynamicModelsCache struct {
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
 }
 
+var dynamicModelsRun batch.Coalescer
+
 const (
 	// dynamicModelsTTL 模型目录缓存时长。曾是 1h；缩到 10min 对齐「面板实时、
 	// API 缓存」的漂移痛点（PR #38 报告）：目录新增模型时面板立即可见，公开
@@ -680,39 +683,67 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		dynamicModelsCache.RUnlock()
 		return nil
 	}
+	prevFetched := dynamicModelsCache.fetched
 	dynamicModelsCache.RUnlock()
 
-	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
-	if len(uids) == 0 {
-		return nil
-	}
-	acct := h.cfg.Pool.AuthByUID(uids[0])
-	if acct == nil {
-		return nil
-	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
-		// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
-		// models 拉取失败 ≠ 账号 chat 不可用。
-		// 只在真正打上游失败时记一行（负缓存期内前面已直接 return，不会刷屏）：
-		// 此前这里静默，CN 域不可达时 /v1/models 只剩 global 模型却毫无线索。
-		if err == nil {
-			err = fmt.Errorf("models api returned empty list")
-		}
-		log.Printf("WARN: [server] /v1/models: CN 模型目录拉取失败（%s 内不再重试，cn: 模型暂不列出）: %v",
-			modelsFetchFailCooldown, err)
+	// 若启动预热或面板手动刷新已填充了更近的 upstream CN 目录缓存，直接复用，避免重复探测。
+	if cached, cAt := h.cfg.Upstream.CNModelsCached(dynamicModelsTTL); len(cached) > 0 && cAt.After(prevFetched) {
 		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
+		dynamicModelsCache.ids = cached
+		dynamicModelsCache.fetched = cAt
+		dynamicModelsCache.lastFail = time.Time{}
 		dynamicModelsCache.Unlock()
-		return nil
+		return cached
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
-	return infos
+
+	var out []upstream.ModelInfo
+	dynamicModelsRun.Do(func() {
+		// 二次检查：Coalescer 排队期间前一位请求可能已拉完并写进缓存。
+		dynamicModelsCache.RLock()
+		if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
+			out = dynamicModelsCache.ids
+			dynamicModelsCache.RUnlock()
+			return
+		}
+		if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
+			dynamicModelsCache.RUnlock()
+			return
+		}
+		dynamicModelsCache.RUnlock()
+
+		uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
+		if len(uids) == 0 {
+			return
+		}
+		acct := h.cfg.Pool.AuthByUID(uids[0])
+		if acct == nil {
+			return
+		}
+		infos, err := h.cfg.Upstream.FetchModels(acct)
+		if err != nil || len(infos) == 0 {
+			// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
+			// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
+			// models 拉取失败 ≠ 账号 chat 不可用。
+			// 只在真正打上游失败时记一行（负缓存期内前面已直接 return，不会刷屏）：
+			// 此前这里静默，CN 域不可达时 /v1/models 只剩 global 模型却毫无线索。
+			if err == nil {
+				err = fmt.Errorf("models api returned empty list")
+			}
+			log.Printf("WARN: [server] /v1/models: CN 模型目录拉取失败（%s 内不再重试，cn: 模型暂不列出）: %v",
+				modelsFetchFailCooldown, err)
+			dynamicModelsCache.Lock()
+			dynamicModelsCache.lastFail = time.Now()
+			dynamicModelsCache.Unlock()
+			return
+		}
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids = infos
+		dynamicModelsCache.fetched = time.Now()
+		dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
+		dynamicModelsCache.Unlock()
+		out = infos
+	})
+	return out
 }
 
 // cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。

@@ -261,8 +261,12 @@ type Config struct {
 		// BatchConcurrency 控制面批量任务的账号并发上限：余额刷新 / 任务补领清扫 /
 		// 任务中心扫描等「按账号扇出」的任务，同一轮同时打上游的账号数。
 		// 与 max_in_flight* 正交（后者只管数据面 chat/search 的单号在途）。
-		// <=0 回落默认 3，>8 钳到 8；面板保存后热生效（下一轮批量任务起效）。
-		BatchConcurrency   int    `json:"batch_concurrency"`
+		// <=0 回落默认 1（严格串行），>8 钳到 8；面板保存后热生效（下一轮批量任务起效）。
+		BatchConcurrency int `json:"batch_concurrency"`
+		// BatchDelayMinMs / BatchDelayMaxMs 控制面批量任务相邻账号之间的随机停顿（毫秒）。
+		// 缺席默认 800~2000ms；显式设为 0 可关闭间隔；面板保存后热生效。
+		BatchDelayMinMs *int `json:"batch_delay_min_ms"`
+		BatchDelayMaxMs *int `json:"batch_delay_max_ms"`
 		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
@@ -353,6 +357,9 @@ type Config struct {
 	KeepaliveRenewBeforeDur time.Duration `json:"-"`
 	// BatchDeadWindowDur 解析后的批量掉号闸门窗口（默认 10m）。
 	BatchDeadWindowDur time.Duration `json:"-"`
+	// BatchDelayMinDur / BatchDelayMaxDur 解析后的控制面批量任务账号间随机停顿区间。
+	BatchDelayMinDur time.Duration `json:"-"`
+	BatchDelayMaxDur time.Duration `json:"-"`
 }
 
 // defaultJitterMinutes 账号时刻抖动的默认窗口（分钟）。
@@ -420,10 +427,13 @@ func Default() *Config {
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。
 	c.Pool.MaxInFlightGlobal = 2
-	// BatchConcurrency 缺省 3：与改造前几处手写 sem 的取值一致（零行为回归）。
-	// 它约束的是控制面批量任务（余额刷新/补领清扫/任务扫描）的账号并发，不是
-	// 数据面在途——账号多时可调低到 1 进一步防风控，上限 8。
+	// BatchConcurrency 缺省 1（严格串行）：避免同出口 IP 下多号同时打同一类接口暴露特征；
+	// 相邻账号默认叠加 800~2000ms 随机停顿，高容忍用户仍可显式调高。
+	batchDelayMin := 800
+	batchDelayMax := 2000
 	c.Pool.BatchConcurrency = batch.Default
+	c.Pool.BatchDelayMinMs = &batchDelayMin
+	c.Pool.BatchDelayMaxMs = &batchDelayMax
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
@@ -728,8 +738,9 @@ func (c *Config) normalize() error {
 	if c.Pool.MaxInFlightGlobal <= 0 {
 		c.Pool.MaxInFlightGlobal = 2
 	}
-	// 批量并发：0/负数回落默认 3，>8 钳到 8（不报错，与 max_in_flight_global 同风格）。
+	// 批量并发：0/负数回落默认 1（严格串行），>8 钳到 8（不报错，与 max_in_flight_global 同风格）。
 	c.Pool.BatchConcurrency = batch.Normalize(c.Pool.BatchConcurrency)
+	c.normalizeBatchDelay()
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5
 	}
@@ -825,6 +836,43 @@ func (c *Config) normalize() error {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+// normalizeBatchDelay 归一把控制面批量任务账号间随机停顿区间：缺席默认 800~2000ms，
+// 负值按 0（显式关闭）处理，max<min 时自动对齐。
+func (c *Config) normalizeBatchDelay() {
+	const (
+		defMinMs = 800
+		defMaxMs = 2000
+	)
+	if c.Pool.BatchDelayMinMs == nil {
+		v := defMinMs
+		c.Pool.BatchDelayMinMs = &v
+	} else if *c.Pool.BatchDelayMinMs < 0 {
+		v := 0
+		c.Pool.BatchDelayMinMs = &v
+	}
+	if c.Pool.BatchDelayMaxMs == nil {
+		v := defMaxMs
+		if *c.Pool.BatchDelayMinMs > v {
+			v = *c.Pool.BatchDelayMinMs
+		}
+		c.Pool.BatchDelayMaxMs = &v
+	} else if *c.Pool.BatchDelayMaxMs < 0 {
+		v := 0
+		c.Pool.BatchDelayMaxMs = &v
+	}
+	if *c.Pool.BatchDelayMaxMs < *c.Pool.BatchDelayMinMs {
+		if *c.Pool.BatchDelayMaxMs == 0 {
+			v := 0
+			c.Pool.BatchDelayMinMs = &v
+		} else {
+			v := *c.Pool.BatchDelayMinMs
+			c.Pool.BatchDelayMaxMs = &v
+		}
+	}
+	c.BatchDelayMinDur = time.Duration(*c.Pool.BatchDelayMinMs) * time.Millisecond
+	c.BatchDelayMaxDur = time.Duration(*c.Pool.BatchDelayMaxMs) * time.Millisecond
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

@@ -71,6 +71,11 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 
 	var total, imported, overwritten, skipped int
 	var errs []string
+	type warmJob struct {
+		a     *auth.Auth
+		realm string
+	}
+	var warmJobs []warmJob
 	// overwrite=1 才允许覆盖已存在的账号。默认跳过（覆盖会把好号写成死号：
 	// 导出文件里的 RT 往往早已被轮换，直接盖上去 = 本来能用的号变成要重登）。
 	overwrite := r.FormValue("overwrite") == "1"
@@ -157,27 +162,46 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			p.cfg.Pool.Revive(uid)
 			imported++
 		}
+		warmJobs = append(warmJobs, warmJob{a: a, realm: realm})
+	}
 
-		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-		if realm == "global" {
-			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-				log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
+	runWarmOne := func(w warmJob) {
+		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入），单号步间留微短间隔。
+		if w.realm == "global" {
+			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(w.a); err != nil {
+				log.Printf("panel: import global 注册激活 uid=%s: %v", w.a.UID, err)
 			} else if activated {
-				log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
+				log.Printf("panel: import global 注册激活 uid=%s 完成", w.a.UID)
 			}
-			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-				log.Printf("panel: import global trial uid=%s: %v", uid, err)
+			if gap := p.batchSubDelay(); gap > 0 {
+				time.Sleep(gap)
+			}
+			if claimed, err := p.cfg.Upstream.ClaimTrial(w.a); err != nil {
+				log.Printf("panel: import global trial uid=%s: %v", w.a.UID, err)
 			} else if claimed {
-				log.Printf("panel: import global trial uid=%s 已领", uid)
+				log.Printf("panel: import global trial uid=%s 已领", w.a.UID)
 			}
 		} else {
-			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
+			if err := p.cfg.Upstream.DailyCheckin(w.a); err != nil {
+				log.Printf("panel: import checkin uid=%s: %v", w.a.UID, err)
 			}
 		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+		if gap := p.batchSubDelay(); gap > 0 {
+			time.Sleep(gap)
 		}
+		if rm, tt, err := p.cfg.Upstream.UserResource(w.a); err == nil {
+			p.cfg.Pool.ReenableIfCredits(w.a.UID, rm, tt)
+		}
+	}
+	// 单号导入保持同步预热（确保 UI/基线测试立刻见效）；多号批量 JSON 导入改为走池闸门
+	// 异步串行随机停顿预热，避免一次性导入几十个号时同秒爆发上百上游请求。
+	if len(warmJobs) == 1 {
+		runWarmOne(warmJobs[0])
+	} else if len(warmJobs) > 1 {
+		jobs := warmJobs
+		go p.cfg.Pool.BatchForEach(len(jobs), func(i int) {
+			runWarmOne(jobs[i])
+		})
 	}
 
 	total = len(accounts)

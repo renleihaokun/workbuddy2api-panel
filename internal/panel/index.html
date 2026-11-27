@@ -1584,7 +1584,7 @@ button.ghost.danger:hover:not(:disabled) {
       <button class="icon ghost" id="btnTheme" title="主题：跟随系统（点击切换：跟随系统 → 浅色 → 深色）" aria-label="切换主题" aria-live="polite">
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
-      <button id="btnRefresh" title="向上游查询全部账号的真实余额并回写（不是刷新本页数据）">刷新余额</button>
+      <button id="btnRefresh" title="异步串行向全池查询真实余额并回写（防多号并发暴露）">刷新余额</button>
       <button class="primary" id="btnAdd">添加账号</button>
      </div>
     </div>
@@ -1637,6 +1637,8 @@ button.ghost.danger:hover:not(:disabled) {
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
           <button class="xs" id="btnRemarks">备注</button>
+          <button class="xs" id="btnCompCheck" title="串行检查全池 CN 个人号是否有待领官方补偿">检查补偿</button>
+          <button class="xs" id="btnNickSync" title="串行同步账号昵称（跳过 24h 内已同步过的账号）">同步昵称</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
@@ -1707,7 +1709,7 @@ button.ghost.danger:hover:not(:disabled) {
         <header>
           <h3>模型能力 <span class="hint" title="max_tokens 已修复并正常透传；官方返回的最大输出仅为参考，不保证完全正确。">输出上限参考上游目录</span></h3>
           <span class="grow"></span>
-          <span class="note" id="mdNote">实时查询上游</span>
+          <span class="note" id="mdNote">共享缓存快照</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="fbar" id="mdFilter">
@@ -2141,8 +2143,14 @@ button.ghost.danger:hover:not(:disabled) {
                 <input name="max_in_flight_global" type="number" min="1" placeholder="2">
                 <span class="hint">global 域风控更紧，默认 2</span></label>
               <label class="fld"><span class="lb">批量任务并发</span>
-                <input name="batch_concurrency" type="number" min="1" max="8" placeholder="3">
-                <span class="hint">余额刷新/任务清扫等批量任务同时打上游的账号数，默认 3、上限 8</span></label>
+                <input name="batch_concurrency" type="number" min="1" max="8" placeholder="1">
+                <span class="hint">余额刷新/任务清扫等控制面批量任务并发数，默认 1（严格串行）、上限 8</span></label>
+              <label class="fld"><span class="lb">批量最小间隔(ms)</span>
+                <input name="batch_delay_min_ms" type="number" min="0" placeholder="800">
+                <span class="hint">相邻账号随机停顿下限，默认 800ms，0 关闭</span></label>
+              <label class="fld"><span class="lb">批量最大间隔(ms)</span>
+                <input name="batch_delay_max_ms" type="number" min="0" placeholder="2000">
+                <span class="hint">相邻账号随机停顿上限，默认 2000ms，0 关闭</span></label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
             </div>

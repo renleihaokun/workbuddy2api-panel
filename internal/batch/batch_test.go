@@ -187,3 +187,28 @@ func TestNilGateSafe(t *testing.T) {
 		}
 	}
 }
+
+// TestGateDelayAndProgress 验证相邻获取随机停顿与进度回调。
+func TestGateDelayAndProgress(t *testing.T) {
+	g := NewGate(1)
+	g.SetDelay(20*time.Millisecond, 30*time.Millisecond)
+	start := time.Now()
+	var steps []int
+	g.ForEachProgress(3, func(int) {}, func(done, total int) {
+		steps = append(steps, done)
+		if total != 3 {
+			t.Errorf("total=%d want 3", total)
+		}
+	})
+	elapsed := time.Since(start)
+	// 第 1 项无初始等待，第 2、3 项各等待 >=20ms，合计应 >=35ms（留 5ms 计时器误差）。
+	if elapsed < 35*time.Millisecond {
+		t.Fatalf("3 项间隔 >=20ms 实际仅耗时 %v", elapsed)
+	}
+	if len(steps) != 3 || steps[0] != 1 || steps[1] != 2 || steps[2] != 3 {
+		t.Fatalf("progress=%v want [1 2 3]", steps)
+	}
+	if minD, maxD := g.Delay(); minD != 20*time.Millisecond || maxD != 30*time.Millisecond {
+		t.Fatalf("Delay=(%v,%v) want (20ms,30ms)", minD, maxD)
+	}
+}

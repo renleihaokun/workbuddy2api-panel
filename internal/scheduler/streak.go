@@ -16,8 +16,9 @@ import (
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
-// 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
+// 独立调用时账号间同样应用随机间隔，避免 0ms 连打全池。
 func (s *Scheduler) RunStreakBonusNow() {
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -32,6 +33,12 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsEnterpriseSession() {
 			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 企业号 403；切换会话 200 但不计分）
 		}
+		if !first {
+			if d := s.paceDelay(0); d > 0 {
+				time.Sleep(d)
+			}
+		}
+		first = false
 		s.streakBonusAccount(a)
 	}
 }

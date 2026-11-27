@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -184,5 +186,62 @@ func TestLegacyCatalogProbeDisabledSkipsOldUAs(t *testing.T) {
 		if strings.HasPrefix(ua, "CodeBuddyIDE/") || strings.HasPrefix(ua, "CLI/") {
 			t.Errorf("关闭 legacyCatalogProbe 后仍发出了旧探测 UA: %q", ua)
 		}
+	}
+}
+
+// TestModelsSequentialProbesAndSharedCache 验证：
+// 1) FetchModels 对同一账号顺序探测企业端点与 /v3/config（并发峰值为 1，不再同毫秒并发）；
+// 2) CNModelsCached 纯读缓存不打上游；
+// 3) RefreshCNModels 在冷却窗口内防抖跳过重复探测。
+func TestModelsSequentialProbesAndSharedCache(t *testing.T) {
+	var cur, peak, calls atomic.Int32
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		n := cur.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		calls.Add(1)
+		time.Sleep(10 * time.Millisecond)
+		defer cur.Add(-1)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.3","name":"GLM-5.3"}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.3","name":"GLM-5.3"}],"agents":[{"name":"cli","models":["glm-5.3"]}]}}`), nil
+		default:
+			return jsonResp(404, `{"code":404}`), nil
+		}
+	})
+	c.SetLegacyCatalogProbe(false)
+	acct := &auth.Auth{AccessToken: "at", UID: "cn-1"}
+
+	// 冷缓存纯读不发请求。
+	if cached, _ := c.CNModelsCached(time.Minute); len(cached) != 0 || calls.Load() != 0 {
+		t.Fatalf("冷缓存不应发请求或非空: len=%d calls=%d", len(cached), calls.Load())
+	}
+
+	if _, err := c.RefreshCNModels(acct, time.Minute); err != nil {
+		t.Fatalf("RefreshCNModels: %v", err)
+	}
+	if peak.Load() != 1 {
+		t.Fatalf("FetchModels 峰值并发=%d want 1（顺序探测不得并发）", peak.Load())
+	}
+	firstCalls := calls.Load()
+	if firstCalls != 2 {
+		t.Fatalf("首次刷新调用次数=%d want 2", firstCalls)
+	}
+
+	// 冷却窗口内再次刷新应直接复用缓存，0 上游请求。
+	if _, err := c.RefreshCNModels(acct, time.Minute); err != nil {
+		t.Fatalf("cooldown RefreshCNModels: %v", err)
+	}
+	if calls.Load() != firstCalls {
+		t.Fatalf("冷却期内再次刷新触发了上游请求: calls=%d want %d", calls.Load(), firstCalls)
+	}
+	if cached, at := c.CNModelsCached(time.Minute); len(cached) != 1 || at.IsZero() {
+		t.Fatalf("CNModelsCached 异常: len=%d at=%v", len(cached), at)
 	}
 }

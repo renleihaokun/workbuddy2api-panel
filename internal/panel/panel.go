@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/batch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/channelstat"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
@@ -126,6 +127,62 @@ type Panel struct {
 	// SetDegradeState 事后接线；未接线时看板显示「状态不可用」而不是编造。
 	degradeMu    sync.RWMutex
 	degradeState func() DegradeState
+
+	// pkg* / vc* / scan* / nick* 面板全量扫描结果缓存与异步单飞状态：
+	// GET 端点一律只读内存缓存，只有显式点击刷新才走异步单飞 + 串行抖动拉取。
+	pkgMu       sync.Mutex
+	pkgCache    []packageRow
+	pkgAt       time.Time
+	pkgScanning bool
+	pkgDone     int
+	pkgTotal    int
+	pkgRun      batch.Coalescer
+
+	vcMu       sync.Mutex
+	vcCache    []voucherRow
+	vcAt       time.Time
+	vcScanning bool
+	vcDone     int
+	vcTotal    int
+	vcRun      batch.Coalescer
+
+	scanMu       sync.Mutex
+	scanCache    []scanAccountItem
+	scanPending  int
+	scanAt       time.Time
+	scanScanning bool
+	scanDone     int
+	scanTotal    int
+	scanRun      batch.Coalescer
+
+	nickMu       sync.Mutex
+	nickScanning bool
+	nickLastAt   time.Time
+	nickByUID    map[string]time.Time
+}
+
+type packageRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Realm    string                   `json:"realm"`
+	Remain   int64                    `json:"remain"`
+	Size     int64                    `json:"size"`
+	Packages []upstream.CreditPackage `json:"packages"`
+	Error    string                   `json:"error,omitempty"`
+}
+
+type voucherRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Vouchers []upstream.SchoolVoucher `json:"vouchers"`
+	Err      string                   `json:"error,omitempty"`
+}
+
+type cacheMeta struct {
+	FetchedAt time.Time `json:"fetched_at,omitempty"`
+	Scanning  bool      `json:"scanning"`
+	Done      int       `json:"done,omitempty"`
+	Total     int       `json:"total,omitempty"`
 }
 
 // DegradeState 反代通道的当前状态（面板看板用；与请求路径同一口径）。
@@ -302,6 +359,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/credit_trend", p.withAuth(p.creditTrend))
 	p.mux.HandleFunc("GET /panel/api/channel_health", p.withAuth(p.channelHealth))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("POST /panel/api/models/refresh", p.withAuth(p.modelsRefresh))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -325,22 +383,27 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAuth(p.accountTaskClaim))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAuth(p.accountTaskAuto))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAuth(p.accountTaskAutoAll))
+	p.mux.HandleFunc("GET /panel/api/tasks/scan", p.withAuth(p.tasksScanCached))
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
+	p.mux.HandleFunc("POST /panel/api/school/vouchers/refresh", p.withAuth(p.schoolVouchersRefresh))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
+	p.mux.HandleFunc("POST /panel/api/nicknames/sync", p.withAuth(p.nicknamesSync))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("POST /panel/api/packages/refresh", p.withAuth(p.packagesRefresh))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensation))
+	p.mux.HandleFunc("POST /panel/api/compensation/scan", p.withAuth(p.compensationScan))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensationClaim))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
 }
@@ -433,6 +496,20 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
+		"packages_cache":       p.packagesMeta(),
+		"vouchers_cache":       p.vouchersMeta(),
+		"tasks_scan":           p.tasksScanMeta(),
+		"nicknames_sync":       p.nicknamesMeta(),
+	}
+	if p.cfg.Scheduler != nil {
+		out["tasks"] = p.cfg.Scheduler.TasksStatus()
+		cs := p.cfg.Scheduler.CompensationCached()
+		out["compensation_cache"] = cacheMeta{
+			FetchedAt: cs.FetchedAt,
+			Scanning:  cs.Scanning,
+			Done:      cs.Done,
+			Total:     cs.Total,
+		}
 	}
 	if p.cfg.Upstream != nil {
 		if until := p.cfg.Upstream.RefreshPausedUntil(); !until.IsZero() {
@@ -628,75 +705,114 @@ func filterHiddenModels(hidden map[string]struct{}, realm string, infos []upstre
 	return out, hiddenN
 }
 
-// models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
-// 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 与 /v1/models 同口径的双域输出：ID 写法随 models.id_style（默认 cn:model，
-// slash 时 cn/model）——前端显示的 id 就是调用时要填的完整 model 值。
-// 额外下发 realm（cn/global）与 model（裸名）字段，前端判断域的稳定性不再依赖
-// 解析 ID 字符串（换标准写法时不会连带把筛选/可用性标签搞坏）。
-// 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
-// （有错误明细回 502，一个账号都没有回 503）。
-//
-// models.hidden 口径与 /v1/models 完全一致（modelid.Key(realm, bare)）：此前本页
-// 不看黑名单，配了 hidden 之后面板还是把藏掉的模型全列出来，看着像"没生效"。
-// 隐藏条数单独回给前端（hidden_count），免得"少了东西"却没有解释。
+// models 读取共享模型目录缓存（零上游请求），供模型目录与用量倍率预热无负担展示；
+// 真正触发上游重探仅限显式 POST /panel/api/models/refresh。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	out := make([]map[string]any, 0)
-	var fetchErrs []string
-	style, namePrefix := p.modelStyle()
-	hidden := p.hiddenModels()
-	hiddenCount := 0
+	cnInfos, cnAt := p.cfg.Upstream.CNModelsCached(0)
+	var glInfos []upstream.ModelInfo
+	var glAt time.Time
+	if p.cfg.Upstream != nil && p.cfg.Upstream.GlobalEnabled {
+		glInfos, glAt = p.cfg.Upstream.GlobalModelInfosCached(0)
+	}
+	fetchedAt := cnAt
+	if glAt.After(fetchedAt) {
+		fetchedAt = glAt
+	}
+	out, hiddenCount := p.assemblePanelModels(cnInfos, glInfos)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"models":       out,
+		"hidden_count": hiddenCount,
+		"cached":       true,
+		"fetched_at":   fetchedAt,
+	})
+}
 
-	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
-	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
+const panelModelsRefreshCooldown = 60 * time.Second
+
+// modelsRefresh 面板「刷新模型」显式探测入口：CN/Global 共用 60s 防抖冷却与 Coalescer 单飞，
+// 且两域与双端点顺序探测，绝不在页面切页时穿透打上游。
+func (p *Panel) modelsRefresh(w http.ResponseWriter, r *http.Request) {
+	var (
+		cnInfos   []upstream.ModelInfo
+		glInfos   []upstream.ModelInfo
+		fetchErrs []string
+	)
 	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
 		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-			infos, err := p.cfg.Upstream.FetchModels(acct)
+			infos, err := p.cfg.Upstream.RefreshCNModels(acct, panelModelsRefreshCooldown)
 			if err != nil {
 				fetchErrs = append(fetchErrs, "cn: "+err.Error())
 			} else {
-				visible, hid := filterHiddenModels(hidden, modelid.RealmCN, infos)
-				hiddenCount += hid
-				for _, mi := range visible {
-					out = append(out, panelModelEntry(style, namePrefix, "cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
-				}
+				cnInfos = infos
 			}
 		}
 	}
-
-	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
-	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
-	if p.cfg.Upstream.GlobalEnabled {
+	if p.cfg.Upstream != nil && p.cfg.Upstream.GlobalEnabled {
 		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
 			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
+				if len(cnInfos) > 0 || len(fetchErrs) > 0 {
+					if gap := p.batchSubDelay(); gap > 0 {
+						time.Sleep(gap)
+					}
+				}
+				infos := p.cfg.Upstream.RefreshGlobalModelInfos(acct, panelModelsRefreshCooldown)
 				if len(infos) == 0 {
 					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
 				} else {
-					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					visible, hid := filterHiddenModels(hidden, modelid.RealmGlobal, infos)
-					hiddenCount += hid
-					for _, mi := range visible {
-						out = append(out, panelModelEntry(style, namePrefix, "global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
-					}
+					glInfos = infos
 				}
 			}
 		}
 	}
 
+	out, hiddenCount := p.assemblePanelModels(cnInfos, glInfos)
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
 			return
 		}
-		// 全部被 models.hidden 藏掉 ≠ 没有账号：前者是配置结果（200 + 空列表 +
-		// hidden_count），后者才是 503。混在一起会让"藏太多"看起来像故障。
 		if hiddenCount == 0 {
 			writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out, "hidden_count": hiddenCount})
+	_, cnAt := p.cfg.Upstream.CNModelsCached(0)
+	_, glAt := p.cfg.Upstream.GlobalModelInfosCached(0)
+	fetchedAt := cnAt
+	if glAt.After(fetchedAt) {
+		fetchedAt = glAt
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"models":       out,
+		"hidden_count": hiddenCount,
+		"cached":       false,
+		"fetched_at":   fetchedAt,
+	})
+}
+
+func (p *Panel) assemblePanelModels(cnInfos, glInfos []upstream.ModelInfo) ([]map[string]any, int) {
+	out := make([]map[string]any, 0, len(cnInfos)+len(glInfos))
+	style, namePrefix := p.modelStyle()
+	hidden := p.hiddenModels()
+	hiddenCount := 0
+	if len(cnInfos) > 0 {
+		visible, hid := filterHiddenModels(hidden, modelid.RealmCN, cnInfos)
+		hiddenCount += hid
+		for _, mi := range visible {
+			out = append(out, panelModelEntry(style, namePrefix, "cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+		}
+	}
+	if p.cfg.Upstream != nil && p.cfg.Upstream.GlobalEnabled && len(glInfos) > 0 {
+		efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+		visible, hid := filterHiddenModels(hidden, modelid.RealmGlobal, glInfos)
+		hiddenCount += hid
+		for _, mi := range visible {
+			out = append(out, panelModelEntry(style, namePrefix, "global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
+		}
+	}
+	return out, hiddenCount
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 按 style 拼 realm 前缀
@@ -1105,32 +1221,104 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": started, "message": msg})
 }
 
-// balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
-// 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
-// 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+// balanceAll 异步单飞触发全量刷新余额（默认严格串行+随机抖动），立即返回当前运行态与进度。
+// 不再连带发一轮浏览器 UA 的 /console/account 全池昵称同步（昵称改为显式低频触发 POST /panel/api/nicknames/sync）。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	p.cfg.Scheduler.RunBalanceRefreshNow()
-	p.syncNicknames()
-	log.Printf("panel: 手动全量余额刷新完成")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+	started := p.cfg.Scheduler.StartBalanceRefreshNow()
+	st := p.cfg.Scheduler.TasksStatus().Balance
+	msg := "全量余额刷新已启动（串行防探测节奏），结果将在下方自动更新"
+	if !started {
+		msg = "余额刷新正在进行中，已合并到当前轮次"
+	}
+	log.Printf("panel: 手动全量余额刷新触发：started=%v", started)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"started": started,
+		"balance": st,
+		"message": msg,
+	})
 }
 
-// compensation 查询全部账号的补偿活动状态（**只读**，不发起任何领取）。
-//
-// 与 balanceAll 同构：同步等待而非「触发后盲刷」——账号量小（个位数），
-// 面板拿到响应即可直接渲染横幅，不用再轮询。
+// nicknamesSync 显式低频同步账号昵称（异步单飞，默认跳过 24h 内已同步过的账号，?force=1 强制重查）。
+func (p *Panel) nicknamesSync(w http.ResponseWriter, r *http.Request) {
+	force := r.URL.Query().Get("force") == "1"
+	p.nickMu.Lock()
+	if p.nickScanning {
+		last := p.nickLastAt
+		p.nickMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"started":  false,
+			"scanning": true,
+			"last_at":  last,
+			"message":  "昵称同步正在进行中",
+		})
+		return
+	}
+	p.nickScanning = true
+	p.nickMu.Unlock()
+
+	go func() {
+		defer func() {
+			p.nickMu.Lock()
+			p.nickScanning = false
+			p.nickLastAt = time.Now()
+			p.nickMu.Unlock()
+		}()
+		p.syncNicknames(force)
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"started":  true,
+		"scanning": true,
+		"message":  "昵称同步已开始（跳过近期已同步账号）",
+	})
+}
+
+// compensation 读取最近一次补偿活动扫描的缓存快照与进度（只读，零上游请求）。
 func (p *Panel) compensation(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
+	snap := p.cfg.Scheduler.CompensationCached()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"accounts": p.cfg.Scheduler.CompensationStatusAll(),
+		"ok":         true,
+		"accounts":   snap.Rows,
+		"fetched_at": snap.FetchedAt,
+		"scanning":   snap.Scanning,
+		"done":       snap.Done,
+		"total":      snap.Total,
+		"cached":     true,
+	})
+}
+
+// compensationScan 显式触发补偿活动异步单飞扫描（面板「检查」按钮用）。
+func (p *Panel) compensationScan(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	started := p.cfg.Scheduler.StartCompensationScan()
+	snap := p.cfg.Scheduler.CompensationCached()
+	msg := "补偿状态检查已启动（串行扫描中）"
+	if !started {
+		msg = "补偿状态检查正在进行中"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"started":    started,
+		"accounts":   snap.Rows,
+		"fetched_at": snap.FetchedAt,
+		"scanning":   snap.Scanning,
+		"done":       snap.Done,
+		"total":      snap.Total,
+		"message":    msg,
 	})
 }
 
@@ -1155,15 +1343,22 @@ func (p *Panel) accountCompensationClaim(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": res.Error == "", "result": res})
 }
 
-// compensationAll 手动全量领取补偿（逐号查状态后领取；无待领的号静默跳过）。
+// compensationAll 手动全量领取补偿（逐号查状态后领取；账号间叠加随机间隔，回写缓存免全池重扫）。
 func (p *Panel) compensationAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
 	results := p.cfg.Scheduler.ClaimCompensationNow()
+	claimedIdx := 0
 	for _, res := range results {
 		if res.Claimed {
+			if claimedIdx > 0 {
+				if d := p.batchPaceDelay(); d > 0 {
+					time.Sleep(d)
+				}
+			}
+			claimedIdx++
 			p.refreshCreditsQuiet(res.UID)
 		}
 	}
@@ -1212,25 +1407,35 @@ func (p *Panel) refreshCreditsQuiet(uid string) {
 	})
 }
 
-// syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。
-// 只在面板手动「刷新」路径调用——后台余额定时器不触发（用户明确要求资料接口
-// 仅手动触达）。逐号拉 /console/account，只取 nickname（手机号等敏感字段在
-// upstream.FetchAccountProfile 内即被丢弃）；单号失败静默跳过，不打断余额刷新
-// 的既有结果。
-func (p *Panel) syncNicknames() {
+const nicknameSyncTTL = 24 * time.Hour
+
+// syncNicknames 昵称同步（仅显式触发）：逐号拉 /console/account（受 Pool 串行/间隔闸门约束），
+// 默认跳过 24h 内已同步且未过期的账号，避免每次刷余额把全池账号发往 web 域指纹。
+func (p *Panel) syncNicknames(force bool) {
 	type job struct {
 		uid string
 		a   *auth.Auth
 	}
 	var jobs []job
+	p.nickMu.Lock()
+	if p.nickByUID == nil {
+		p.nickByUID = make(map[string]time.Time)
+	}
+	now := time.Now()
 	for _, st := range p.cfg.Pool.List() {
 		if st.Disabled {
 			continue
+		}
+		if !force {
+			if last, ok := p.nickByUID[st.UID]; ok && now.Sub(last) < nicknameSyncTTL && strings.TrimSpace(st.Nickname) != "" {
+				continue
+			}
 		}
 		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
 			jobs = append(jobs, job{uid: st.UID, a: a})
 		}
 	}
+	p.nickMu.Unlock()
 	if len(jobs) == 0 {
 		return
 	}
@@ -1239,7 +1444,7 @@ func (p *Panel) syncNicknames() {
 		updated int
 		failed  int
 	)
-	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
+	// 并发上限与账号间停顿走 pool 闸门（与余额刷新/任务清扫共享同一闸门）。
 	p.cfg.Pool.BatchForEach(len(jobs), func(k int) {
 		j := jobs[k]
 		nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
@@ -1249,6 +1454,9 @@ func (p *Panel) syncNicknames() {
 			mu.Unlock()
 			return
 		}
+		p.nickMu.Lock()
+		p.nickByUID[j.uid] = time.Now()
+		p.nickMu.Unlock()
 		if p.cfg.Pool.SetNickname(j.uid, nick) {
 			mu.Lock()
 			updated++
@@ -1257,6 +1465,38 @@ func (p *Panel) syncNicknames() {
 	})
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
+	}
+}
+
+func (p *Panel) batchPaceDelay() time.Duration {
+	if p.cfg.Pool == nil {
+		return 0
+	}
+	minD, maxD := p.cfg.Pool.BatchDelay()
+	if minD <= 0 && maxD <= 0 {
+		return 0
+	}
+	return batch.RandomDelay(minD, maxD)
+}
+
+func (p *Panel) batchSubDelay() time.Duration {
+	d := p.batchPaceDelay()
+	if d <= 0 {
+		return 0
+	}
+	gap := batch.RandomDelay(200*time.Millisecond, 500*time.Millisecond)
+	if gap > d {
+		return d
+	}
+	return gap
+}
+
+func (p *Panel) nicknamesMeta() map[string]any {
+	p.nickMu.Lock()
+	defer p.nickMu.Unlock()
+	return map[string]any{
+		"scanning": p.nickScanning,
+		"last_at":  p.nickLastAt,
 	}
 }
 
@@ -1342,27 +1582,113 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// packages 返回全部账号的积分包构成，供「积分构成」视图对比。
-//
-// 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
-// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
-func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
-	accts := p.cfg.Pool.List()
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Realm    string                   `json:"realm"`
-		Remain   int64                    `json:"remain"`
-		Size     int64                    `json:"size"`
-		Packages []upstream.CreditPackage `json:"packages"`
-		Error    string                   `json:"error,omitempty"`
+func (p *Panel) packagesMeta() cacheMeta {
+	p.pkgMu.Lock()
+	defer p.pkgMu.Unlock()
+	return cacheMeta{
+		FetchedAt: p.pkgAt,
+		Scanning:  p.pkgScanning,
+		Done:      p.pkgDone,
+		Total:     p.pkgTotal,
 	}
-	out := make([]row, len(accts))
+}
 
-	// 并发上限走 pool.batch_concurrency（与余额刷新/任务清扫共享同一闸门）。
-	p.cfg.Pool.BatchForEach(len(accts), func(i int) {
-		s := accts[i]
-		it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+// packages 只读返回积分包构成缓存快照（零上游请求），供切换「积分构成」页或刷新页面时秒开；
+// 缓存尚冷时仅用池内已有余额字段合成基线列表（不跳过/不触达禁用账号），显式刷新走 packagesRefresh。
+func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	p.pkgMu.Lock()
+	rows := make([]packageRow, len(p.pkgCache))
+	copy(rows, p.pkgCache)
+	at := p.pkgAt
+	scanning := p.pkgScanning
+	done := p.pkgDone
+	total := p.pkgTotal
+	p.pkgMu.Unlock()
+
+	if at.IsZero() {
+		for _, s := range p.cfg.Pool.List() {
+			if s.Disabled {
+				continue
+			}
+			rows = append(rows, packageRow{
+				UID:      s.UID,
+				Nickname: s.Nickname,
+				Realm:    s.Realm,
+				Remain:   s.Credits,
+				Size:     s.CreditsMax,
+			})
+		}
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remain > rows[j].Remain })
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"accounts":   rows,
+		"cached":     true,
+		"fetched_at": at,
+		"scanning":   scanning,
+		"done":       done,
+		"total":      total,
+	})
+}
+
+// packagesRefresh 显式异步单飞触发全池（启用账号）积分明细刷新。
+func (p *Panel) packagesRefresh(w http.ResponseWriter, r *http.Request) {
+	started := p.startPackagesRefresh()
+	meta := p.packagesMeta()
+	msg := "积分构成明细扫描已开始（串行防探测节奏）"
+	if !started {
+		msg = "积分构成明细正在扫描中"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"started":    started,
+		"scanning":   meta.Scanning,
+		"done":       meta.Done,
+		"total":      meta.Total,
+		"fetched_at": meta.FetchedAt,
+		"message":    msg,
+	})
+}
+
+func (p *Panel) startPackagesRefresh() bool {
+	p.pkgMu.Lock()
+	if p.pkgScanning {
+		p.pkgMu.Unlock()
+		return false
+	}
+	p.pkgScanning = true
+	p.pkgDone = 0
+	p.pkgTotal = 0
+	p.pkgMu.Unlock()
+
+	go func() {
+		p.pkgRun.Do(func() {
+			p.refreshPackagesSync()
+		})
+	}()
+	return true
+}
+
+// refreshPackagesSync 真正向启用账号拉取积分包明细，严格跳过禁用账号，结果降序缓存。
+func (p *Panel) refreshPackagesSync() []packageRow {
+	var active []pool.AccountStatus
+	for _, s := range p.cfg.Pool.List() {
+		if s.Disabled {
+			continue
+		}
+		active = append(active, s)
+	}
+	out := make([]packageRow, len(active))
+	p.pkgMu.Lock()
+	p.pkgScanning = true
+	p.pkgDone = 0
+	p.pkgTotal = len(active)
+	p.pkgMu.Unlock()
+
+	p.cfg.Pool.BatchForEachProgress(len(active), func(i int) {
+		s := active[i]
+		it := packageRow{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
 		a := p.cfg.Pool.AuthByUID(s.UID)
 		if a == nil {
 			it.Error = "account not loaded"
@@ -1379,11 +1705,24 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 		it.Remain = remain
 		it.Size = size
 		out[i] = it
+	}, func(done, total int) {
+		p.pkgMu.Lock()
+		p.pkgDone = done
+		p.pkgTotal = total
+		p.pkgMu.Unlock()
 	})
 
-	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+	cached := make([]packageRow, len(out))
+	copy(cached, out)
+	p.pkgMu.Lock()
+	p.pkgCache = cached
+	p.pkgAt = time.Now()
+	p.pkgScanning = false
+	p.pkgDone = len(active)
+	p.pkgTotal = len(active)
+	p.pkgMu.Unlock()
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

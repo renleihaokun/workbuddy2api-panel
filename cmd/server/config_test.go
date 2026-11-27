@@ -212,22 +212,25 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 }
 
-// TestBatchConcurrencyConfig 控制面批量并发上限：默认 3、显式值生效、越界收敛。
+// TestBatchConcurrencyConfig 控制面批量并发上限与账号间停顿：默认 1 / 800~2000ms、显式值生效、越界收敛。
 func TestBatchConcurrencyConfig(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.Pool.BatchConcurrency != 3 {
-		t.Fatalf("默认 batch_concurrency=%d want 3", c.Pool.BatchConcurrency)
+	if c.Pool.BatchConcurrency != 1 {
+		t.Fatalf("默认 batch_concurrency=%d want 1", c.Pool.BatchConcurrency)
+	}
+	if c.BatchDelayMinDur != 800*time.Millisecond || c.BatchDelayMaxDur != 2000*time.Millisecond {
+		t.Fatalf("默认 batch delay=(%v,%v) want (800ms,2s)", c.BatchDelayMinDur, c.BatchDelayMaxDur)
 	}
 	cases := []struct {
 		raw  string
 		want int
 	}{
 		{`{"pool":{"batch_concurrency":5}}`, 5},
-		{`{"pool":{"batch_concurrency":0}}`, 3},
-		{`{"pool":{"batch_concurrency":-2}}`, 3},
+		{`{"pool":{"batch_concurrency":0}}`, 1},
+		{`{"pool":{"batch_concurrency":-2}}`, 1},
 		{`{"pool":{"batch_concurrency":99}}`, 8},
 	}
 	for _, tc := range cases {
@@ -237,6 +240,27 @@ func TestBatchConcurrencyConfig(t *testing.T) {
 		}
 		if got := cfg.Pool.BatchConcurrency; got != tc.want {
 			t.Errorf("%s -> batch_concurrency=%d want %d", tc.raw, got, tc.want)
+		}
+	}
+	delayCases := []struct {
+		raw     string
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{`{}`, 800 * time.Millisecond, 2000 * time.Millisecond},
+		{`{"pool":{"batch_delay_min_ms":0,"batch_delay_max_ms":0}}`, 0, 0},
+		{`{"pool":{"batch_delay_max_ms":0}}`, 0, 0},
+		{`{"pool":{"batch_delay_min_ms":-5,"batch_delay_max_ms":500}}`, 0, 500 * time.Millisecond},
+		{`{"pool":{"batch_delay_min_ms":3000}}`, 3000 * time.Millisecond, 3000 * time.Millisecond},
+		{`{"pool":{"batch_delay_min_ms":1500,"batch_delay_max_ms":1000}}`, 1500 * time.Millisecond, 1500 * time.Millisecond},
+	}
+	for _, tc := range delayCases {
+		cfg, err := ParseConfig([]byte(tc.raw))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if cfg.BatchDelayMinDur != tc.wantMin || cfg.BatchDelayMaxDur != tc.wantMax {
+			t.Errorf("%s -> batch_delay=(%v,%v) want (%v,%v)", tc.raw, cfg.BatchDelayMinDur, cfg.BatchDelayMaxDur, tc.wantMin, tc.wantMax)
 		}
 	}
 }
