@@ -1615,7 +1615,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 				Nickname: s.Nickname,
 				Realm:    s.Realm,
 				Remain:   s.Credits,
-				Size:     s.CreditsMax,
+				Size:     s.CreditsTotal,
 			})
 		}
 		sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remain > rows[j].Remain })
@@ -1672,7 +1672,7 @@ func (p *Panel) startPackagesRefresh() bool {
 
 // refreshPackagesSync 真正向启用账号拉取积分包明细，严格跳过禁用账号，结果降序缓存。
 func (p *Panel) refreshPackagesSync() []packageRow {
-	var active []pool.AccountStatus
+	var active []pool.Status
 	for _, s := range p.cfg.Pool.List() {
 		if s.Disabled {
 			continue
