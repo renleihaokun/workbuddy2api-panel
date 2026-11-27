@@ -209,9 +209,19 @@ async function askConfirm(opts) {
   }
   return window.confirm((opts && (opts.body || opts.title)) || '确认操作');
 }
-function ago(iso) {
-  if (!iso || iso.startsWith('0001-')) return '—';
-  const s = (Date.now() - new Date(iso)) / 1000;
+// ago 相对时间文案。入参三种形态都收：ISO 字符串（后端 time.Time）、
+// **毫秒数**、Date。注意单位只能是毫秒——传秒会静默算成「两万天前」。
+function ago(v) {
+  let ms;
+  if (typeof v === 'number') ms = v;
+  else if (v instanceof Date) ms = v.getTime();
+  else {
+    const t = String(v || '');
+    if (!t || t.startsWith('0001-')) return '—';
+    ms = Date.parse(t);
+  }
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  const s = (Date.now() - ms) / 1000;
   if (s < 0) return '刚刚';
   if (s < 60) return Math.floor(s) + ' 秒前';
   if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
@@ -247,8 +257,12 @@ function fmtLocalDateTime(ms) {
    请求记录、积分历史、运行日志都可能跨天，只给时分秒会出现两行都写 14:05:06、
    却分不清哪天的情形。年份不进列宽，完整值挂在单元格 title 上。 */
 function fmtStampShort(ts) {
+  // Go 零值 time.Time 序列化成 "0001-01-01T00:00:00Z"，Date.parse 给它 -62135596800000
+  // （**不是 NaN**），直接渲染就成了「01-01 07:36:42」——一个看着很像真数据的假时间。
+  // 凡是非正毫秒（零值 / 未设置 / "0"）一律 —，别再让「从未有过」伪装成某个时刻。
+  if (ts == null || ts === '') return '—';
   const d = new Date(ts);
-  if (isNaN(d.getTime())) return '—';
+  if (isNaN(d.getTime()) || d.getTime() <= 0) return '—';
   const p = n => String(n).padStart(2, '0');
   return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
     p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
@@ -1157,7 +1171,7 @@ async function loadModels(force) {
       mdProbeOf = m => mdProbeByKey[mdProbeKey(m)] || mdProbes[mdModelBare(m)] || undefined;
       const hit = mdAll.filter(m => mdProbeOf(m)).length;
       const hiddenN = Number(d.hidden_count) || 0;
-      const age = d.fetched_at ? ' · 更新于 ' + ago(new Date(d.fetched_at).getTime()) : '';
+      const age = parseAPITime(d.fetched_at) ? ' · 更新于 ' + ago(d.fetched_at) : '';
       $('mdNote').textContent = mdAll.length + ' 个模型 · 共享缓存快照' + age
         + (hit ? ' · ' + hit + ' 个有实测上限' : '')
         + (hiddenN ? ' · 已按 models.hidden 隐藏 ' + hiddenN + ' 个' : '');
@@ -2788,7 +2802,7 @@ function renderVouchers(d) {
     $('vcNote').textContent = '扫描中 (' + (d.done || 0) + '/' + (d.total || 0) + ')…';
     return;
   }
-  if (!d || (!d.fetched_at && !arr.length)) {
+  if (!d || (!parseAPITime(d.fetched_at) && !arr.length)) {
     body.innerHTML = '<div class="empty"><div class="big">🎟️</div>尚未查询券码<div class="d">点击右下角「刷新」按串行防探测节奏查询全部 CN 账号</div></div>';
     $('vcNote').textContent = '尚未查询（仅展示缓存）';
     return;
@@ -2800,7 +2814,7 @@ function renderVouchers(d) {
     '<span>' + a.vouchers.length + ' 张</span></div>' +
     a.vouchers.map(vcCard).join('')
   ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
-  const age = d.fetched_at ? ' · 更新于 ' + ago(new Date(d.fetched_at).getTime()) : '';
+  const age = parseAPITime(d.fetched_at) ? ' · 更新于 ' + ago(d.fetched_at) : '';
   $('vcNote').textContent = (total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '0 张券') + age;
   const errs = arr.filter(a => a.error);
   if (errs.length) {
@@ -3036,7 +3050,7 @@ function reattachQueueView() {
       // 队列没在跑且当前清单为空时，尝试只读缓存的扫描结果（零上游请求）。
       if (!$('qcList').children.length) {
         const s = await api('tasks/scan').catch(() => null);
-        if (s && s.fetched_at) applyScanView(s);
+        if (s && parseAPITime(s.fetched_at) > 0) applyScanView(s);
       }
     } catch (e) { /* 静默 */ }
   })();
@@ -4294,7 +4308,7 @@ async function refreshPackagesAsync(triggerBtn, idleLabel) {
         d = await api('packages');
       }
       lastPackages = d;
-      lastPackagesAt = d && d.fetched_at ? new Date(d.fetched_at).getTime() : Date.now();
+      lastPackagesAt = parseAPITime(d && d.fetched_at) || Date.now();
       return d;
     } finally {
       pkgRefreshInFlight = null;
@@ -4330,7 +4344,7 @@ async function loadPackages(force) {
       api('config').catch(() => null),
     ]);
     lastPackages = d;
-    lastPackagesAt = d && d.fetched_at ? new Date(d.fetched_at).getTime() : 0;
+    lastPackagesAt = parseAPITime(d && d.fetched_at);
     lastDetailLimit = pkDetailLimit(c && c.config);
     renderPackages(d, lastDetailLimit);
     if (!lastPackagesAt && $('pkNote')) {
@@ -4562,13 +4576,16 @@ function renderExpirySnapshot(d) {
 // 「renderExpirySnapshot 起」切片求值，函数声明提升让它在同一切片内可用。
 function snapshotNoteText(count, d) {
   const iv = Number(d && d.balance_refresh_sec) || 0;
-  const at = d && d.balance_refreshed_at ? new Date(d.balance_refreshed_at).getTime() : 0;
+  // balance_refreshed_at 在「进程刚起来、首轮后台刷新还没跑完」时是 Go 零值。
+  // 裸 new Date().getTime() 会拿到 -62135596800000（真值负数），(Date.now()-它)/60000
+  // 约等于 1.07e9，页面上就出现「1065522846 分钟前更新」。必须经 parseAPITime 归一化。
+  const at = parseAPITime(d && d.balance_refreshed_at);
   if (iv <= 0) {
     return count + ' 个账号 · 本地快照（未开启后台刷新）';
   }
   const every = iv % 60 === 0 ? iv / 60 + ' 分钟' : iv + ' 秒';
   let tail = '每 ' + every + '后台刷新';
-  if (at && !isNaN(at)) {
+  if (at > 0) {
     const min = Math.floor((Date.now() - at) / 60000);
     tail += '，' + (min < 1 ? '刚刚更新' : min + ' 分钟前更新');
   }
@@ -4589,7 +4606,7 @@ async function loadExpiry(force) {
       ? await refreshPackagesAsync($('btnExp'), '刷新明细')
       : await api('packages');
     lastPackages = d;
-    lastPackagesAt = d && d.fetched_at ? new Date(d.fetched_at).getTime() : 0;
+    lastPackagesAt = parseAPITime(d && d.fetched_at);
     renderExpiry(d);
     if (force) await loadOverview(true);
   } catch (e) {
@@ -5657,9 +5674,11 @@ function renderCreditTrend(d) {
   }
   out += '</svg>';
   host.innerHTML = out;
+  // last_sample_at 同样是 Go time.Time：账本为空时是零值，裸解析会印出 0001 年。
+  const lastAt = parseAPITime(d && d.last_sample_at);
   $('ctChartNote').textContent = pts.length + ' 个采样点 · ' +
     (d.bucket === 'day' ? '按日' : '按小时') + ' · 最近 ' +
-    (d.last_sample_at ? fmtStampShort(d.last_sample_at) : '—');
+    (lastAt ? fmtStampShort(lastAt) : '—');
 }
 
 async function loadCreditTrend() {

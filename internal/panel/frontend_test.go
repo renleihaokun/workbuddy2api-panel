@@ -978,6 +978,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function renderExpirySnapshot');
 const end = src.indexOf('async function loadExpiry');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry snapshot region not found');
+// snapshotNoteText 经 parseAPITime 归一化 balance_refreshed_at，它定义在页首、
+// 不在本切片内，单独带上。
+const timeStart = src.indexOf('function parseAPITime');
+const timeEnd = src.indexOf('function fmtLocalDateTime');
+if (timeStart < 0 || timeEnd <= timeStart) throw new Error('parseAPITime not found');
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
 const ctx = {
@@ -987,7 +992,7 @@ const ctx = {
   Date, Math, Number, String, Map, Array, Object, isNaN,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext(src.slice(timeStart, timeEnd) + src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const day = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
   return d.toISOString();
@@ -1050,6 +1055,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function expBatches');
 const end = src.indexOf('async function loadExpiry');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+// 快照分支会调 snapshotNoteText，它经 parseAPITime 归一化 balance_refreshed_at；
+// 该函数定义在页首、不在切片内，单独带上。
+const timeStart = src.indexOf('function parseAPITime');
+const timeEnd = src.indexOf('function fmtLocalDateTime');
+if (timeStart < 0 || timeEnd <= timeStart) throw new Error('parseAPITime not found');
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', children: [], textContent: '', hidden: true });
 const ctx = {
@@ -1060,7 +1070,7 @@ const ctx = {
   lastPackages: null, lastPackagesAt: 0,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry; this.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext(src.slice(timeStart, timeEnd) + src.slice(start, end) + '\nthis.renderExpiry = renderExpiry; this.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const iso = n => {
   const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
   const p = x => String(x).padStart(2, '0');
@@ -1141,6 +1151,11 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function expBatches');
 const end = src.indexOf('async function loadExpiry');
 if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+// snapshotNoteText 现在经 parseAPITime 归一化 balance_refreshed_at；它定义在页首、
+// 不在本切片内，单独带上（否则零值用例会 ReferenceError 而不是断言失败）。
+const timeStart = src.indexOf('function parseAPITime');
+const timeEnd = src.indexOf('function fmtLocalDateTime');
+if (timeStart < 0 || timeEnd <= timeStart) throw new Error('parseAPITime not found');
 const sinks = {};
 const mk = id => (sinks[id] = { innerHTML: '', children: [], textContent: '', hidden: true });
 const ctx = {
@@ -1151,7 +1166,7 @@ const ctx = {
   lastPackages: null, lastPackagesAt: 0,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
+vm.runInContext(src.slice(timeStart, timeEnd) + src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const refreshedAt = new Date(Date.now() - 3 * 60000).toISOString();
 ctx.renderExpirySnapshot({ accounts: [
   { uid: 'a', nickname: 'n', credits_expiry_buckets: [{ date: '2099-01-01', remain: 1 }] },
@@ -1161,9 +1176,16 @@ ctx.renderExpirySnapshot({ accounts: [
   { uid: 'a', nickname: 'n', credits_expiry_buckets: [{ date: '2099-01-01', remain: 1 }] },
 ] });
 const withoutCadence = sinks['expNote'].textContent;
+// Go 零值时间（"0001-01-01T00:00:00Z"）：不得换算成天文数字的天数。
+// 回归点：裸 new Date(零值).getTime() = -62135596800000 → 约 1.07e9 分钟前。
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'a', nickname: 'n', credits_expiry_buckets: [{ date: '2099-01-01', remain: 1 }] },
+], balance_refresh_sec: 300, balance_refreshed_at: '0001-01-01T00:00:00Z' });
+const zeroAge = sinks['expNote'].textContent;
 process.stdout.write(JSON.stringify({
   cadence: withCadence.includes('每 5 分钟后台刷新') && withCadence.includes('3 分钟前更新'),
   noCadence: withoutCadence.includes('未开启后台刷新'),
+  zeroNoFakeAge: zeroAge.includes('每 5 分钟后台刷新') && !zeroAge.includes('分钟前更新'),
   note: withCadence,
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expnote-*.cjs")
@@ -1178,7 +1200,7 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry note node test failed: %v\n%s", err, out)
 	}
-	const want = `{"cadence":true,"noCadence":true,"note":`
+	const want = `{"cadence":true,"noCadence":true,"zeroNoFakeAge":true,"note":`
 	if !strings.HasPrefix(strings.TrimSpace(string(out)), want) {
 		t.Fatalf("expiry note=%s\nwant prefix %s", strings.TrimSpace(string(out)), want)
 	}

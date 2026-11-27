@@ -31,8 +31,12 @@ const stampStart = src.indexOf('function fmtStampShort');
 const stampEnd = src.indexOf('function dtLocalValue');
 const trendStart = src.indexOf('function renderCreditTrend');
 const trendEnd = src.indexOf('async function loadCreditTrend');
-if ([chartStart, chartEnd, escStart, escEnd, fmtStart, fmtEnd, stampStart, stampEnd, trendStart, trendEnd].some(v => v < 0) ||
-    chartEnd <= chartStart || escEnd <= escStart || fmtEnd <= fmtStart || stampEnd <= stampStart || trendEnd <= trendStart) {
+// renderCreditTrend 的脚注现在经 parseAPITime 归一化 last_sample_at（Go 零值时间
+// 会被裸解析成 0001 年），所以要把这个页首函数一并带进沙箱。
+const timeStart = src.indexOf('function parseAPITime');
+const timeEnd = src.indexOf('function fmtLocalDateTime');
+if ([chartStart, chartEnd, escStart, escEnd, fmtStart, fmtEnd, stampStart, stampEnd, trendStart, trendEnd, timeStart, timeEnd].some(v => v < 0) ||
+    chartEnd <= chartStart || escEnd <= escStart || fmtEnd <= fmtStart || stampEnd <= stampStart || trendEnd <= trendStart || timeEnd <= timeStart) {
   throw new Error('credit trend helpers not found or slices inverted');
 }
 const hosts = {};
@@ -41,7 +45,7 @@ const ctx = { Date, Number, String, Math, RegExp, isNaN, Set, Array, Object, Inf
 vm.createContext(ctx);
 vm.runInContext(
   src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(stampStart, stampEnd) +
-  src.slice(chartStart, chartEnd) + src.slice(trendStart, trendEnd) +
+  src.slice(timeStart, timeEnd) + src.slice(chartStart, chartEnd) + src.slice(trendStart, trendEnd) +
   '\nthis.renderCreditTrend=renderCreditTrend;', ctx);
 
 const points = [
