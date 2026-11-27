@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -150,10 +151,13 @@ func TestProbePublicEndpoints(t *testing.T) {
 // TestLegacyCatalogProbeDisabledSkipsOldUAs 关闭 legacyCatalogProbe 后，
 // FetchModels（CN）与 FetchGlobalModels（global）均不得发出 CodeBuddyIDE/ 或 CLI/2.63.2 旧 UA。
 func TestLegacyCatalogProbeDisabledSkipsOldUAs(t *testing.T) {
+	var mu sync.Mutex
 	var seenUAs []string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		ua := r.Header.Get("User-Agent")
+		mu.Lock()
 		seenUAs = append(seenUAs, ua)
+		mu.Unlock()
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.3","name":"GLM-5.3"}]}}`), nil
@@ -173,7 +177,10 @@ func TestLegacyCatalogProbeDisabledSkipsOldUAs(t *testing.T) {
 	if names := c.FetchGlobalModels(&auth.Auth{AccessToken: "at", UID: "gl-1", Domain: "www.workbuddy.ai"}); len(names) == 0 {
 		t.Fatal("FetchGlobalModels(global) 返回空")
 	}
-	for _, ua := range seenUAs {
+	mu.Lock()
+	uas := append([]string(nil), seenUAs...)
+	mu.Unlock()
+	for _, ua := range uas {
 		if strings.HasPrefix(ua, "CodeBuddyIDE/") || strings.HasPrefix(ua, "CLI/") {
 			t.Errorf("关闭 legacyCatalogProbe 后仍发出了旧探测 UA: %q", ua)
 		}
