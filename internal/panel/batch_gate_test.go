@@ -125,7 +125,7 @@ func TestPackagesBoundedConcurrency(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
 	})
-	p.SetDisable("u04", true, "disabled-test", pool.DisableKindManual)
+	p.DisableWithKind("u04", "disabled-test", pool.DisableKindManual)
 	p.SetBatchConcurrency(2)
 
 	// GET 默认只读缓存/基线快照，不得直接打上游。
