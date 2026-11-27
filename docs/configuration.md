@@ -58,6 +58,20 @@
 - 只影响定时排程，不影响面板手动“立即签到 / 上报 / 保活”。
 - 任务按服务端本地时区解释，裸机部署请显式设置 `TZ`。
 
+### `schedule.keepalive_renew_before`
+
+- 默认 `"168h"`（7 天）；`"0"` 表示每次保活都刷新。
+- 只影响定时保活排程：access token 剩余有效期高于该阈值（或已知 RT 已死但 AT 仍可用）时跳过刷新，减少无谓的 OAuth 轮换。
+
+### `upstream.legacy_catalog_probe`
+
+- 默认 `false`（仅发当前官方桌面 UA）；设为 `true` 时在 `/v3/config` 额外携带历史 `CodeBuddyIDE` / `CLI` UA 补全模型目录。
+
+### `pool.batch_dead_threshold` / `pool.batch_dead_window`
+
+- 默认 `3` / `"10m"`；`0` 表示关闭闸门。
+- 滑动窗口内至少 N 个不同账号判 `session_dead` 时自动暂停全部定时后台任务；面板可通过 `POST /panel/api/pool/resume-gate` 恢复。
+
 ### 请求体上限
 
 可配置的 `server.max_body_mb` 已移除，但代码仍有固定安全网：

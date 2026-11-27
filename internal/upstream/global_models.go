@@ -207,11 +207,14 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		}()
 		return ch
 	}
-	// 三路并集：官方桌面端 UA（真机形态，主路）+ 两条历史探测 UA（拿官方 UA
-	// 拿不到的那部分模型）。历史 UA **只在这里出现**，不进任何用户链路。
+	// 主路桌面端 UA（真机形态）；仅当 LegacyCatalogProbe=true 时并发补两条历史 UA。
 	v3DesktopCh := probeV3(c.chatUA(a))
-	v3IDECh := probeV3(legacyIDEProbeUA)
-	v3CLICh := probeV3(legacyCLIProbeUA)
+	var v3IDECh, v3CLICh chan probeResult
+	legacy := c.LegacyCatalogProbe()
+	if legacy {
+		v3IDECh = probeV3(legacyIDEProbeUA)
+		v3CLICh = probeV3(legacyCLIProbeUA)
+	}
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
@@ -227,21 +230,29 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		}
 		enterpriseCh <- probeResult{err: lastErr}
 	}()
-	v3Desktop := <-v3DesktopCh
-	v3IDE := <-v3IDECh
-	v3CLI := <-v3CLICh
-	enterprise := <-enterpriseCh
-	// v3 三路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
-	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
-	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。
-	v3 := mergeV3Routes([]struct {
+	routes := []struct {
 		label string
 		res   probeResult
 	}{
-		{"desktop-UA", v3Desktop},
-		{"IDE-UA", v3IDE},
-		{"CLI-UA", v3CLI},
-	})
+		{"desktop-UA", <-v3DesktopCh},
+	}
+	if legacy {
+		routes = append(routes,
+			struct {
+				label string
+				res   probeResult
+			}{"IDE-UA", <-v3IDECh},
+			struct {
+				label string
+				res   probeResult
+			}{"CLI-UA", <-v3CLICh},
+		)
+	}
+	enterprise := <-enterpriseCh
+	// v3 多路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
+	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
+	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。
+	v3 := mergeV3Routes(routes)
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。

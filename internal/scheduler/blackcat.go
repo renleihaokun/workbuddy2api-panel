@@ -17,18 +17,44 @@ import (
 // 只有 CI 恰好落在 UTC 夜里才真正执行。属典型的「随环境静默失效」的测试。
 var nowForNightWindow = time.Now
 
-// RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
-// 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
+// RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过，手动触发口径）。
+// 由面板/测试触发；执行前二次校验 InNightWindow。
 func (s *Scheduler) RunBlackcatNow() {
-	if !upstream.InNightWindow(nowForNightWindow()) {
+	s.runBlackcatLocked(false)
+}
+
+// runBlackcatScheduled 定时排程口径：按账号抖动错开执行。
+func (s *Scheduler) runBlackcatScheduled() {
+	if s.BatchPaused() {
+		return
+	}
+	s.runBlackcatLocked(true)
+}
+
+func (s *Scheduler) runBlackcatLocked(scheduled bool) {
+	if !s.blackcatRun.TryLock() {
+		log.Printf("blackcat: 上一轮仍在执行，跳过本次触发")
+		return
+	}
+	defer s.blackcatRun.Unlock()
+	s.runBlackcat(scheduled)
+}
+
+func (s *Scheduler) runBlackcat(scheduled bool) {
+	now := nowForNightWindow()
+	if !upstream.InNightWindow(now) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
+	hourBase := now.Truncate(time.Hour)
 	for _, st := range s.cfg.Pool.List() {
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
 		// 真实模型对话」的（RunNightChats 逐条 ChatStream 发 glm-5.2 短对话），
 		// 与「让位防风控」正面冲突。旅行/成长任务都是纯上报或领奖 RPC，照常跑。
 		if st.Disabled || st.Paused {
+			continue
+		}
+		if !s.shouldFire(now, hourBase, st.UID, "blackcat", scheduled) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)

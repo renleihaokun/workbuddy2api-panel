@@ -7,10 +7,17 @@ package scheduler
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // TestAccountSlotMinuteStable 同一 (uid, task, day) 恒得同一分钟——幂等是前提：
@@ -563,5 +570,101 @@ func TestShouldFireConcurrentNoDoubleFire(t *testing.T) {
 		if fired[uid] != 1 {
 			t.Errorf("%s 并发场景下被执行 %d 次，want 恰好 1 次", uid, fired[uid])
 		}
+	}
+}
+
+// TestCheckinJitterRunsStreakBonusOncePerAccount 回归（生产 45× 重放 bug）：
+// 定时签到在 45 分钟抖动窗口内每分钟唤醒一次时，每个账号的连登/补签/补偿链路
+// 必须只执行 1 次，绝不能因为循环末尾无条件调用 RunStreakBonusNow() 而重放 45 遍。
+func TestCheckinJitterRunsStreakBonusOncePerAccount(t *testing.T) {
+	var checkinCalls, streakCalls, heatmapCalls, compCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
+			checkinCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
+		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/heatmap"):
+			heatmapCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"cells":[]}}`))
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/claim-gift"):
+			w.WriteHeader(400)
+			w.Write([]byte(`{"code":10001,"msg":"already claimed"}`))
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/compensation-status"):
+			compCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"eligible":false}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/streak"):
+			streakCalls.Add(1)
+			w.Write([]byte(`{"code":0,"data":{"redemption_status":{"tiers":[]}}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/lottery/summary"):
+			w.Write([]byte(`{"code":0,"data":{"chances":0}}`))
+		default:
+			http.Error(w, "not found: "+r.URL.Path, 404)
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	for _, uid := range []string{"cn-1", "cn-2", "cn-3"} {
+		p.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	def := DefaultJitterMinutes
+	s := New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, JitterMinutes: &def})
+
+	hourBase := time.Date(2026, 11, 27, 9, 0, 0, 0, time.Local)
+	for m := 0; m < def; m++ {
+		s.runCheckinAt(hourBase.Add(time.Duration(m)*time.Minute), true)
+	}
+
+	if got := checkinCalls.Load(); got != 3 {
+		t.Errorf("checkin calls=%d want 3", got)
+	}
+	if got := streakCalls.Load(); got != 3 {
+		t.Errorf("streak calls=%d want 3（绝不能 45×3=135 次）", got)
+	}
+	if got := heatmapCalls.Load(); got != 3 {
+		t.Errorf("heatmap calls=%d want 3", got)
+	}
+	if got := compCalls.Load(); got != 3 {
+		t.Errorf("compensation-status calls=%d want 3", got)
+	}
+}
+
+// TestTravelJitterRunsOncePerAccount 定时旅行同样受抖动窗口与台账门控，每个账号每小时只执行一次。
+func TestTravelJitterRunsOncePerAccount(t *testing.T) {
+	oldDelay := travelAccountDelay
+	travelAccountDelay = 0
+	defer func() { travelAccountDelay = oldDelay }()
+
+	var statusCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/activity/growth/buddy/info":
+			w.Write([]byte(`{"code":0,"msg":"ok","data":{"buddy":{"id":1,"name":"cat"}}}`))
+		case "/activity/growth/buddy/travel/status":
+			statusCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"ok","data":{"state":"idle","daily_limit_reached":true}}`))
+		default:
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	for _, uid := range []string{"cn-1", "cn-2", "cn-3"} {
+		p.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	def := DefaultJitterMinutes
+	s := New(Config{Pool: p, Upstream: up, TravelHours: []int{9, 21}, JitterMinutes: &def})
+
+	hourBase := time.Date(2026, 11, 27, 9, 0, 0, 0, time.Local)
+	for m := 0; m < def; m++ {
+		s.runTravelAt(hourBase.Add(time.Duration(m)*time.Minute), true)
+	}
+	if got := statusCalls.Load(); got != 3 {
+		t.Errorf("travel status calls=%d want 3（每号恰好一次）", got)
 	}
 }

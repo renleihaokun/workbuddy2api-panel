@@ -173,3 +173,39 @@ func TestRefreshDoesNotRetryWhenDiskTokenUnchanged(t *testing.T) {
 		t.Errorf("refresh attempts = %d, want 1 (no retry when disk token unchanged)", got)
 	}
 }
+
+// TestRefresh429ProtectivePause 验证 refresh 端点返回 429 后触发全局保护性暂停：
+// 暂停期间后续 RefreshToken 直接返回 429 而不打上游，且 VerifySession 返回
+// SessionInconclusive（绝不误判为 SessionDead）。
+func TestRefresh429ProtectivePause(t *testing.T) {
+	var hits int32
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&hits, 1)
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Content-Type": []string{"application/json"}, "Retry-After": []string{"120"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":429,"msg":"too many refresh requests"}`)),
+		}, nil
+	})
+	a1 := &auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 1}
+	a2 := &auth.Auth{UID: "u2", AccessToken: "at2", RefreshToken: "rt2", ExpiresAt: 1}
+
+	err := c.RefreshToken(a1)
+	if err == nil {
+		t.Fatal("want 429 error")
+	}
+	if c.RefreshPausedUntil().IsZero() {
+		t.Fatal("429 后应设置全局 refresh 暂停截止时刻")
+	}
+	if v := c.VerifySession(a2); v != SessionInconclusive {
+		t.Errorf("暂停期间 VerifySession=%s want inconclusive", v)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("暂停期间不应再打上游 refresh，hits=%d want 1", got)
+	}
+
+	c.ClearRefreshPause()
+	if !c.RefreshPausedUntil().IsZero() {
+		t.Error("ClearRefreshPause 后应解除暂停")
+	}
+}

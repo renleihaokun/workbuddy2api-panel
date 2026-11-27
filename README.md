@@ -542,6 +542,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `pool.verify_session_on_401` | `true` | **401 先求证再计数**。请求路径拿到 401 时先用 refresh 端点问一次（活 / 死 / 无判词），只有「上游应用层明确拒绝」才计入会话失效；`false` = 旧行为（401 直接进连续计数，不发求证请求）。这是本次吊销处置的**回滚闸**。**热生效** |
 | `pool.session_verify_interval` | `60s` | 同一账号两次 401 求证的最小间隔。窗口内复用上次结论——上游大面积 401 时，每个失败请求都去 refresh 等于给刷新端点造风暴。`<=0` 回落默认值。**热生效** |
+| `pool.batch_dead_threshold` | `3` | 批量掉号风控闸门阈值：在 `pool.batch_dead_window` 内达到该数量的不同账号连续判 `session_dead` 时自动暂停全部定时后台调度并记录告警；`0` = 关闭；面板可通过 `POST /panel/api/pool/resume-gate` 复位。**热生效** |
+| `pool.batch_dead_window` | `10m` | 批量掉号风控闸门的滑动统计窗口。**热生效** |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
 | `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
@@ -559,7 +561,8 @@ curl -s http://localhost:7863/v1/search/messages \
 | `schedule.balance_refresh_minutes` | `5` | 余额后台刷新周期（分钟）；并发上限受 `pool.batch_concurrency` 约束 |
 | `schedule.task_sweep_enabled` | `true` | 任务补领清扫开关：分钟级、幂等地 accept 未接受任务、claim 已达标未领奖励（不跑任何行为链路）。默认开启 |
 | `schedule.task_sweep_minutes` | `15` | 补领清扫周期（分钟）；与成长队列（行为链路、成本高）不同，清扫只做 accept/claim 两条幂等 RPC |
-| `schedule.jitter_minutes` | `45` | 按账号的分钟级时刻抖动窗口。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换、按任务区分）。显式 `0` = 关闭。**只影响定时排程**：面板手动「立即签到/上报/保活」仍立刻对全部账号执行。**热生效** |
+| `schedule.jitter_minutes` | `45` | 按账号的分钟级时刻抖动窗口。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/旅行/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换、按任务区分）。显式 `0` = 关闭。**只影响定时排程**：面板手动「立即签到/上报/保活」仍立刻对全部账号执行。**热生效** |
+| `schedule.keepalive_renew_before` | `168h` | 定时保活临期刷新阈值：只有 access token 剩余有效期 `<=` 该值时才执行定时刷新，避免每晚对长有效期账号无谓轮换 RT；`0` = 每次保活都刷新。手动「全部保活」不受限。**热生效** |
 | `global.enabled` | `true` | global 域路由总开关。`false` = 纯 CN 逃生门：即便 auth 写了 `realm=global` 也不路由 global base（`auth.Realm()` 的第一道闸）。改动需重启 |
 | `global.chat_base` / `global.billing_base` | 空 | 国际版上游 base 覆盖；空 = 内置默认 `https://www.workbuddy.ai`。改动需重启 |
 | `cn.chat_base` | 空 | 国内版 chat / 模型目录上游 base 覆盖；空 = 内置默认 `https://copilot.tencent.com`。`copilot.tencent.com` 对部分海外出口（Clash 全局 + TUN 等）会 TLS 复位，可改官方桌面端同构的 `https://www.workbuddy.cn`。改动需重启 |
@@ -567,6 +570,7 @@ curl -s http://localhost:7863/v1/search/messages \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.identity_mode` | `capture` | 出站身份实现模式。`capture`（缺省）= 对齐真机抓包：不发自造头、UA 分三族、补 `x-stainless-*` / `X-Agent-*` / `baggage` 等真机头族、会话 ID 用 UUIDv7。`legacy` = **逐字节还原改造前**形态（含 `X-Machine-ID`/`X-Session-ID`、Origin/Referer/Accept-Language 全覆盖、旧三段式 UA 5.5.4/2.137.1），作为逃生门。**热生效**。可用 `go run ./cmd/hdrprobe capture` / `legacy` 实际对比两种模式的出站头 |
+| `upstream.legacy_catalog_probe` | `false` | 是否在 `/v3/config` 模型目录探测中额外发送历史 UA（`CodeBuddyIDE/4.12.0`、`CLI/2.63.2`）。默认关闭，仅用当前官方桌面 UA 探测，避免真实账号 Bearer 反复携带已暴露旧指纹。**热生效** |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 按 realm 的三族默认：CN `WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0`、global `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0`；billing 用 `axios/1.16.1`；可用 `client_version` / `cli_version` 调版本段）。官网「使用端」列按出站 UA 服务端归因。**热生效** |
 | `upstream.client_version` | 空 | UA 的品牌段与 `X-IDE-Version`（单一来源）；空 = 按 realm：CN `5.11.3` / global `5.9.4`。**热生效** |
 | `upstream.cli_version` | 空 | UA 的 `CLI/<ver>` 段；空 = 按 realm：CN `2.176.0` / global `2.165.0`。**热生效** |
@@ -847,10 +851,10 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 | 任务 | 开关（默认 true） | 时刻（默认） | 行为 |
 |---|---|---|---|
-| 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**末尾追加连登管家**（见下） |
+| 签到 | `schedule.checkin_enabled` | `checkin_hours` `[9, 21]` 整点 | 签到 + 余额查询；余额恢复则解冻冷却账号。**定时抖动模式下连登管家随单账号抖动窗口各执行一次**（不再每分钟全号重放；见下） |
 | 活跃上报 | `schedule.activity_enabled` | `activity_hours` `[10]` 整点 | 对话活跃上报（`chat_request_send` 事件，必须含 `userId`）；点亮连登 + 解锁 `first_buddy`；每号每天 1 次 |
 | 猫猫旅行 | `schedule.travel_enabled` | `travel_hours` `[9, 21]` 整点 | 独立排程：无猫领养 / `idle` 派出 / `arrived` 领奖 |
-| 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 全账号刷新 token；session 失效**连续 3 次**才自动禁用 |
+| 保活 | `schedule.keepalive_enabled` | `keepalive_hours` `[22]` 整点 | 临期刷新 token（剩余有效期 ≤ `keepalive_renew_before`，默认 `168h`；已知 `rt_dead` 且 AT 仍可用时跳过）；session 失效**连续 3 次**才自动禁用 |
 | 夜猫子 | `schedule.blackcat_enabled` | `blackcat_hours` `[23]` 整点 | **先查任务进度再决定**：`black_cat` 未达标才在 23:00–08:00 计数窗口内补足 glm-5.2 短对话（每天 1 次累计 3 天，漏跑次日窗口自动补） |
 | 成长任务队列 | `schedule.growth_enabled` | `growth_hours` `[1]` 整点 | 自动扫描全部账号未完成待办并执行（与面板「执行全部待办」同管线）；Sequential 任务链零点解锁后自动推进，建议零点后跑 |
 

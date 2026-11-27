@@ -3,12 +3,12 @@
 package scheduler
 
 import (
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -49,20 +49,40 @@ func travelDay(t time.Time) string {
 //
 // 返回 false 表示上一轮仍在执行、本次触发被单飞跳过。
 func (s *Scheduler) RunTravelNow() bool {
+	return s.runTravelLocked(false)
+}
+
+// runTravelScheduled 定时排程口径：按账号抖动错开执行。
+func (s *Scheduler) runTravelScheduled() bool {
+	if s.BatchPaused() {
+		return false
+	}
+	return s.runTravelLocked(true)
+}
+
+func (s *Scheduler) runTravelLocked(scheduled bool) bool {
 	if !s.travelRun.TryLock() {
 		log.Printf("travel: 上一轮仍在执行，跳过本次触发")
 		return false
 	}
 	defer s.travelRun.Unlock()
-	s.runTravel()
+	s.runTravel(scheduled)
 	return true
 }
 
 // runTravel 旅行巡检任务体（不含单飞锁）。
-func (s *Scheduler) runTravel() {
+func (s *Scheduler) runTravel(scheduled bool) {
+	s.runTravelAt(time.Now(), scheduled)
+}
+
+func (s *Scheduler) runTravelAt(now time.Time, scheduled bool) {
 	first := true
+	hourBase := now.Truncate(time.Hour)
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			continue
+		}
+		if !s.shouldFire(now, hourBase, st.UID, "travel", scheduled) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -150,7 +170,7 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 		return
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
-	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := s.cfg.Upstream.ReportChatActivity(a, session.NewTimeOrderedID(), session.NewMessageID()); err != nil {
 		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
 	} else {
 		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）

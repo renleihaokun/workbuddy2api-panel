@@ -40,7 +40,8 @@
     "task_sweep_minutes": 15,
     "include_disabled_in_tasks": false,
     "_comment_jitter": "按账号的分钟级时刻抖动窗口（分钟）。排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到/上报/保活/夜猫子），上游不需要任何指纹就能把它们归到一起。默认 45：每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换）。显式填 0 = 关闭抖动（回到整点同时打，与老版本逐秒一致）。",
-    "jitter_minutes": 45
+    "jitter_minutes": 45,
+    "keepalive_renew_before": "168h"
   },
   "global": {
     "enabled": true,
@@ -55,6 +56,7 @@
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
     "identity_mode": "",
+    "legacy_catalog_probe": false,
     "user_agent": "",
     "client_version": "",
     "cli_version": "",
@@ -108,7 +110,9 @@
     "cross_domain_fallback": false,
     "cross_domain_model_fallback": false,
     "verify_session_on_401": true,
-    "session_verify_interval": "60s"
+    "session_verify_interval": "60s",
+    "batch_dead_threshold": 3,
+    "batch_dead_window": "10m"
   },
   "session_sticky": {
     "enabled": true,

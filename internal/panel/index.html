@@ -2101,6 +2101,9 @@ button.ghost.danger:hover:not(:disabled) {
               <label class="fld"><span class="lb">账号时刻抖动窗口（分钟）</span>
                 <input name="jitter_minutes" type="number" min="0" placeholder="45">
                 <span class="hint">默认 45；填 0 = 关闭</span></label>
+              <label class="fld"><span class="lb">保活临期刷新阈值</span>
+                <input name="keepalive_renew_before" placeholder="168h">
+                <span class="hint">默认 168h（7 天）；0 = 每次都刷</span></label>
             </div>
             <div class="hint">排程只精确到小时，而网关出口只有一个 IP——不抖动时全部账号会在同一整点做完全相同的动作（签到 / 上报 / 保活 / 夜猫子），上游不需要任何指纹就能把它们归到一起。开启后每个账号按 uid 稳定散列到该小时内的不同分钟（跨重启不漂、按自然日轮换）。<br>只影响<b>定时排程</b>：面板上手动点「立即签到 / 上报 / 保活」仍会立刻对全部账号执行。改动即时生效。</div>
           </div>
@@ -2181,6 +2184,12 @@ button.ghost.danger:hover:not(:disabled) {
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">批量掉号闸门阈值</span>
+                <input name="batch_dead_threshold" type="number" min="0" placeholder="3">
+                <span class="hint">窗口内判死 N 个号暂停定时任务，0 关闭</span></label>
+              <label class="fld"><span class="lb">批量掉号统计窗口</span>
+                <input name="batch_dead_window" placeholder="10m">
+                <span class="hint">默认 10m</span></label>
             </div>
             <label class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></label>
@@ -2246,6 +2255,8 @@ button.ghost.danger:hover:not(:disabled) {
               <input type="checkbox" name="system_as_user_fallback"></label>
             <label class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></label>
+            <label class="switch"><span class="lb">目录探测携带历史 UA（CodeBuddyIDE / CLI）</span>
+              <input type="checkbox" name="legacy_catalog_probe"></label>
             <div class="hint mt-3">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>

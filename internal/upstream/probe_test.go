@@ -146,3 +146,36 @@ func TestProbePublicEndpoints(t *testing.T) {
 		t.Errorf("传输层失败应带 err: %+v", got[2])
 	}
 }
+
+// TestLegacyCatalogProbeDisabledSkipsOldUAs 关闭 legacyCatalogProbe 后，
+// FetchModels（CN）与 FetchGlobalModels（global）均不得发出 CodeBuddyIDE/ 或 CLI/2.63.2 旧 UA。
+func TestLegacyCatalogProbeDisabledSkipsOldUAs(t *testing.T) {
+	var seenUAs []string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		ua := r.Header.Get("User-Agent")
+		seenUAs = append(seenUAs, ua)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.3","name":"GLM-5.3"}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"),
+			strings.HasSuffix(r.URL.Path, "/v2/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.3","name":"GLM-5.3"}],"agents":[{"name":"cli","models":["glm-5.3"]}]}}`), nil
+		default:
+			return jsonResp(404, `{"code":404}`), nil
+		}
+	})
+	c.GlobalEnabled = true
+	c.SetLegacyCatalogProbe(false)
+
+	if _, err := c.FetchModels(&auth.Auth{AccessToken: "at", UID: "cn-1"}); err != nil {
+		t.Fatalf("FetchModels(cn): %v", err)
+	}
+	if names := c.FetchGlobalModels(&auth.Auth{AccessToken: "at", UID: "gl-1", Domain: "www.workbuddy.ai"}); len(names) == 0 {
+		t.Fatal("FetchGlobalModels(global) 返回空")
+	}
+	for _, ua := range seenUAs {
+		if strings.HasPrefix(ua, "CodeBuddyIDE/") || strings.HasPrefix(ua, "CLI/") {
+			t.Errorf("关闭 legacyCatalogProbe 后仍发出了旧探测 UA: %q", ua)
+		}
+	}
+}

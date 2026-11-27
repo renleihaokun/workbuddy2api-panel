@@ -733,3 +733,41 @@ func TestPausedStillTravels(t *testing.T) {
 		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
 	}
 }
+
+// TestKeepaliveRenewBeforeThreshold 定时保活按 AT 剩余有效期门槛跳过远期号、刷新临期号，
+// 且手动 RunKeepaliveNow() 不受门槛限制；已知 RT 已死且 AT 仍有效时不反复撞 refresh。
+func TestKeepaliveRenewBeforeThreshold(t *testing.T) {
+	f := &fakeUpstream{}
+	srv := f.server()
+	defer srv.Close()
+
+	now := time.Now()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u-fresh", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(20 * 24 * time.Hour).Unix()})
+	p.Add(&auth.Auth{UID: "u-near", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(48 * time.Hour).Unix()})
+	p.Add(&auth.Auth{UID: "u-rt-dead", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(24 * time.Hour).Unix()})
+	p.MarkRefreshTokenDead("u-rt-dead")
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{
+		Pool:                 p,
+		Upstream:             up,
+		KeepaliveRenewBefore: 7 * 24 * time.Hour,
+	})
+
+	if !s.runKeepaliveScheduled() {
+		t.Fatal("runKeepaliveScheduled 返回 false")
+	}
+	if got := f.refreshCalls.Load(); got != 1 {
+		t.Fatalf("scheduled refresh calls=%d want 1（仅 u-near 刷新；u-fresh 未临期、u-rt-dead 已知 RT 死且 AT 有效）", got)
+	}
+
+	// 手动触发应忽略临期阈值（全跑，包括 u-fresh）。
+	f.refreshCalls.Store(0)
+	if !s.RunKeepaliveNow() {
+		t.Fatal("RunKeepaliveNow 返回 false")
+	}
+	if got := f.refreshCalls.Load(); got != 3 {
+		t.Fatalf("manual refresh calls=%d want 3", got)
+	}
+}

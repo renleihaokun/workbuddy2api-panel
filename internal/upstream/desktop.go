@@ -23,6 +23,8 @@ package upstream
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,12 +57,18 @@ type DesktopEvent map[string]any
 func (c *Client) desktopFingerprint(a *auth.Auth) map[string]any {
 	now := time.Now().UnixMilli()
 	ver := c.clientVersion(a)
+	var uid, nick string
+	if a != nil {
+		uid = a.UID
+		nick = a.Nickname
+	}
+	osVer, cpuCores, memGB := desktopHardwareProfile(uid)
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
-		"userId":       a.UID,
-		"username":     a.Nickname,
-		"userNickname": a.Nickname,
+		"userId":       uid,
+		"username":     nick,
+		"userNickname": nick,
 		"product":      "SaaS",
 		"releaseDate":  int64(1789036585355),
 		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
@@ -73,12 +81,30 @@ func (c *Client) desktopFingerprint(a *auth.Auth) map[string]any {
 		"extVersion":   ver,
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
+		"osVersion":    osVer,
+		"cpuCores":     cpuCores,
+		"memorySize":   memGB,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
+}
+
+// desktopHardwareProfile 按账号 UID 确定性派生一台合理的 Windows 机器配置，
+// 避免全账号池在遥测里都报成同一台 20 核 24G 克隆机。
+func desktopHardwareProfile(uid string) (osVersion string, cpuCores int, memGB int) {
+	osVersions := []string{"10.0.22631", "10.0.26100", "10.0.26200", "10.0.26220"}
+	cpuOptions := []int{8, 12, 16, 20, 24}
+	memOptions := []int{16, 24, 32, 64}
+	if uid == "" {
+		uid = "anonymous"
+	}
+	sum := sha256.Sum256([]byte("wb2a:hw:" + uid))
+	v0 := binary.BigEndian.Uint32(sum[0:4])
+	v1 := binary.BigEndian.Uint32(sum[4:8])
+	v2 := binary.BigEndian.Uint32(sum[8:12])
+	return osVersions[int(v0%uint32(len(osVersions)))],
+		cpuOptions[int(v1%uint32(len(cpuOptions)))],
+		memOptions[int(v2%uint32(len(memOptions)))]
 }
 
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
@@ -534,7 +560,7 @@ func (c *Client) MarketExpertFindByName(a *auth.Auth, name string) (*MarketExper
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	conversationID = session.NewTimeOrderedID()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{

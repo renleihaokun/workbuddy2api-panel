@@ -964,3 +964,37 @@ func TestExampleConfigParses(t *testing.T) {
 			cfg.Models.IDStyle, cfg.Models.RealmNamePrefix)
 	}
 }
+
+// TestKeepaliveRenewBeforeAndLegacyCatalogProbeAndBatchGate 覆盖 P1 新增配置项的默认值、合法值与非法值校验。
+func TestKeepaliveRenewBeforeAndLegacyCatalogProbeAndBatchGate(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("Default normalize: %v", err)
+	}
+	if c.KeepaliveRenewBeforeDur != 168*time.Hour {
+		t.Errorf("default KeepaliveRenewBeforeDur=%v want 168h", c.KeepaliveRenewBeforeDur)
+	}
+	if c.Upstream.LegacyCatalogProbe {
+		t.Error("default LegacyCatalogProbe should be false")
+	}
+	if c.Pool.BatchDeadThreshold != 3 || c.BatchDeadWindowDur != 10*time.Minute {
+		t.Errorf("default batch gate = (%d, %v) want (3, 10m)", c.Pool.BatchDeadThreshold, c.BatchDeadWindowDur)
+	}
+
+	// "0" 关闭临期阈值（总是刷新），0 关闭批量闸门。
+	cfg0, err := ParseConfig([]byte(`{"schedule":{"keepalive_renew_before":"0"},"pool":{"batch_dead_threshold":0}}`))
+	if err != nil {
+		t.Fatalf("ParseConfig zero overrides: %v", err)
+	}
+	if cfg0.KeepaliveRenewBeforeDur != 0 || cfg0.Pool.BatchDeadThreshold != 0 {
+		t.Errorf("zero overrides got (%v, %d)", cfg0.KeepaliveRenewBeforeDur, cfg0.Pool.BatchDeadThreshold)
+	}
+
+	// 非法时长必须 fail fast。
+	if _, err := ParseConfig([]byte(`{"schedule":{"keepalive_renew_before":"-1h"}}`)); err == nil {
+		t.Error("negative keepalive_renew_before should fail")
+	}
+	if _, err := ParseConfig([]byte(`{"pool":{"batch_dead_window":"0s"}}`)); err == nil {
+		t.Error("non-positive batch_dead_window should fail")
+	}
+}

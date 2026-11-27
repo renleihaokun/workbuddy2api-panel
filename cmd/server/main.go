@@ -22,6 +22,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/creditline"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/losslog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/modelid"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -36,7 +37,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.28.0-panel"
+const appVersion = "1.29.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -111,6 +112,7 @@ func main() {
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)           // 裸名跨域回退（issue #135，默认关闭）
 	p.SetCrossDomainModelFallback(cfg.Pool.CrossDomainModelFallback) // 同名模型跨域回退（默认关闭）
+	p.SetBatchDeadGate(cfg.Pool.BatchDeadThreshold, cfg.BatchDeadWindowDur)
 	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
 	// 会话粘性路由（可配关闭）。
@@ -172,6 +174,7 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	up.SetLegacyCatalogProbe(cfg.Upstream.LegacyCatalogProbe)
 	// 出站身份模式（capture 对齐真机 / legacy 逐字节还原改造前）。
 	// normalize 已校验过枚举，这里解析不会失败。
 	if mode, err := upstream.ParseIdentityMode(cfg.Upstream.IdentityMode); err == nil {
@@ -225,6 +228,20 @@ func main() {
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 		// 按账号的分钟级抖动窗口：单出口 IP 下让各账号错开整点（nil = 默认 45）。
 		JitterMinutes: cfg.Schedule.JitterMinutes,
+		// 定时保活临期刷新阈值（默认 168h=7d；0 = 总是刷新）。
+		KeepaliveRenewBefore: cfg.KeepaliveRenewBeforeDur,
+	})
+	lossLogPath := stateSibling(cfg.StateFile, "account-loss.jsonl")
+	lossLog := losslog.New(lossLogPath)
+	p.SetLossObserver(func(ev pool.LossEvent) {
+		lossLog.Record(losslog.EntryFromAuth(ev.Event, ev.UID, ev.Reason, ev.Auth))
+	})
+	log.Printf("[losslog] 账号失效台账：%s", lossLogPath)
+	if cfg.Pool.BatchDeadThreshold > 0 {
+		log.Printf("[pool] 批量失活熔断阈值：%s 内 %d 个账号", cfg.Pool.BatchDeadWindow, cfg.Pool.BatchDeadThreshold)
+	}
+	p.SetBatchDeadTripHook(func(count int, window time.Duration) {
+		sch.SetBatchPaused(true, fmt.Sprintf("%s 内 %d 个账号判 session_dead", window, count))
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -247,7 +264,7 @@ func main() {
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
 	} else {
-		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
+		log.Printf("token 保活已启用：%v 点（临期阈值 keepalive_renew_before=%s）", cfg.Schedule.KeepaliveHours, cfg.Schedule.KeepaliveRenewBefore)
 	}
 	switch {
 	case !cfg.Schedule.BlackcatEnabled:
@@ -655,6 +672,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if mode, err := upstream.ParseIdentityMode(newCfg.Upstream.IdentityMode); err == nil {
 		up.SetIdentityMode(mode)
 	}
+	up.SetLegacyCatalogProbe(newCfg.Upstream.LegacyCatalogProbe)
 	// 其余上游身份字段（UA 覆盖 / 版本段）在面板保存后同样热生效：
 	// 版本号错了要能立刻改，而不是等重启。
 	up.UserAgent = newCfg.Upstream.UserAgent
@@ -673,6 +691,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback)           // 裸名跨域回退热生效（issue #135）
 	p.SetCrossDomainModelFallback(newCfg.Pool.CrossDomainModelFallback) // 同名模型跨域回退热生效
+	p.SetBatchDeadGate(newCfg.Pool.BatchDeadThreshold, newCfg.BatchDeadWindowDur)
 	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
@@ -686,6 +705,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetJitterMinutes(newCfg.Schedule.JitterMinutes)
+	sch.SetKeepaliveRenewBefore(newCfg.KeepaliveRenewBeforeDur)
 
 	return restartRequiredFields(newCfg), nil
 }

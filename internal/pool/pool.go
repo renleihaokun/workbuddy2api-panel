@@ -98,6 +98,16 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+
+	// 批量掉号风控闸门与失效台账观察者（见 loss_gate.go）。
+	batchDeadThreshold    int
+	batchDeadWindow       time.Duration
+	batchDeadEvents       []batchDeadEvent
+	batchDeadTripped      bool
+	batchDeadTrippedAt    time.Time
+	batchDeadTrippedCount int
+	onBatchDeadTrip       func(count int, window time.Duration)
+	onLoss                func(LossEvent)
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。

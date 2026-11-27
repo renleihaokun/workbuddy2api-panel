@@ -895,6 +895,11 @@ type Client struct {
 	// atomic：面板保存配置热改，chat 热路径并发读。零值 = ModeCapture。
 	identityMode atomic.Int32
 
+	// disableLegacyCatalogProbe 关闭在 /v3/config 目录探测中额外附带历史 UA（CodeBuddyIDE/4.12.0、
+	// CLI/2.63.2）。生产装配经 SetLegacyCatalogProbe(false) 启用屏蔽，避免真实账号 Bearer
+	// 反复向服务端发送已暴露的旧客户端指纹；零值默认 false 以保持单包 &Client{} 测试兼容。
+	disableLegacyCatalogProbe atomic.Bool
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
@@ -948,6 +953,10 @@ type Client struct {
 	refreshMu       sync.Mutex
 	refreshInFlight map[string]*refreshFlight
 
+	// refreshPauseUntil refresh 端点触发 429 后的全局保护性暂停截止时刻（UnixNano）。
+	// 期间不再继续打刷新端点，避免触发更严厉的 idsvc 风控（借鉴 workbuddy-manager）。
+	refreshPauseUntil atomic.Int64
+
 	// verifyMu/verifyLast 是「401 求证」的节流表：同一账号 sessionVerifyInterval
 	// 内只向上游发一次 refresh 求证，窗口内后来者直接复用上次结论（见 verify.go）。
 	// 为什么要节流：上游大面积 401（issue #215 那种）时，每个失败请求都去求证等于
@@ -990,6 +999,18 @@ func New() *Client {
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c
+}
+
+// SetLegacyCatalogProbe 热切换是否启用 /v3/config 的历史 UA 补充探测（CodeBuddyIDE / CLI）。
+func (c *Client) SetLegacyCatalogProbe(v bool) {
+	if c != nil {
+		c.disableLegacyCatalogProbe.Store(!v)
+	}
+}
+
+// LegacyCatalogProbe 报告是否启用历史 UA 补充探测。
+func (c *Client) LegacyCatalogProbe() bool {
+	return c != nil && !c.disableLegacyCatalogProbe.Load()
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -1211,6 +1232,35 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 // refreshIOTimeout 刷新端点网络 I/O 上限（两段式锁外执行，防上游 hang 长占锁）。
 const refreshIOTimeout = 30 * time.Second
 
+const (
+	defaultRefresh429Pause = 5 * time.Minute
+	minRefresh429Pause     = 60 * time.Second
+	maxRefresh429Pause     = 30 * time.Minute
+)
+
+// RefreshPausedUntil 返回 refresh 429 保护性暂停的截止时刻（未暂停或已过期返回零值）。
+func (c *Client) RefreshPausedUntil() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	ns := c.refreshPauseUntil.Load()
+	if ns <= 0 {
+		return time.Time{}
+	}
+	until := time.Unix(0, ns)
+	if !time.Now().Before(until) {
+		return time.Time{}
+	}
+	return until
+}
+
+// ClearRefreshPause 清除 refresh 429 保护性暂停。
+func (c *Client) ClearRefreshPause() {
+	if c != nil {
+		c.refreshPauseUntil.Store(0)
+	}
+}
+
 // refreshTokenExpiresInMax refresh 响应 expiresIn 的量级上限（10 年，纯防御值：
 // 实测 R-D 响应恒 5184000=60d）。超限视为上游脏数据，不写 ExpiresAt（保留旧值），
 // 防止 NeedsRefresh 永假导致 token 永不刷新反而真过期失效。
@@ -1335,6 +1385,14 @@ func (c *Client) refreshTokenOnce(a *auth.Auth, timeout time.Duration) error {
 	if strings.TrimSpace(rtSnapshot) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
+	if until := c.RefreshPausedUntil(); !until.IsZero() {
+		return &Error{
+			Kind:       ErrSoftRate,
+			Status:     http.StatusTooManyRequests,
+			Msg:        "refresh endpoint paused after 429",
+			RetryAfter: time.Until(until),
+		}
+	}
 
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -1362,6 +1420,21 @@ func (c *Client) refreshTokenOnce(a *auth.Auth, timeout time.Duration) error {
 	// 网络 I/O（锁外，30s 上限）。
 	data, err := c.doJSON(req)
 	if err != nil {
+		var ue *Error
+		if errors.As(err, &ue) && ue.Status == http.StatusTooManyRequests {
+			pause := ue.RetryAfter
+			if pause <= 0 {
+				pause = defaultRefresh429Pause
+			}
+			if pause < minRefresh429Pause {
+				pause = minRefresh429Pause
+			}
+			if pause > maxRefresh429Pause {
+				pause = maxRefresh429Pause
+			}
+			c.refreshPauseUntil.Store(time.Now().Add(pause).UnixNano())
+			log.Printf("WARN: [upstream] refresh 端点返回 429，保护性暂停全局刷新 %s", pause.Round(time.Second))
+		}
 		return err
 	}
 	var tok struct {
@@ -1850,12 +1923,19 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 		return ch
 	}
 	r1 := <-probe(c.v3ConfigUA(a))
-	r2 := <-probe(legacyIDEProbeUA)
-	if r1.err != nil && r2.err != nil {
+	var results []v3Result
+	results = append(results, r1)
+	if c.LegacyCatalogProbe() {
+		r2 := <-probe(legacyIDEProbeUA)
+		results = append(results, r2)
+		if r1.err != nil && r2.err != nil {
+			return nil, r1.err
+		}
+	} else if r1.err != nil {
 		return nil, r1.err
 	}
-	merged := make(map[string]ModelInfo, len(r1.byID)+len(r2.byID))
-	for _, r := range []v3Result{r1, r2} {
+	merged := make(map[string]ModelInfo, len(r1.byID))
+	for _, r := range results {
 		for id, mi := range r.byID {
 			if _, exists := merged[id]; !exists { // 官方 UA 结果优先（先写入者胜）
 				merged[id] = mi

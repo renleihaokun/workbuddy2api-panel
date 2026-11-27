@@ -20,6 +20,7 @@
 |---|---|---|
 | [outbound-identity.md](outbound-identity.md) | 当前出站身份形态、开关与代码落点 | 代码改动导致头族/UA/开关变化时同步更新 |
 | [refresh-token-lifecycle.md](refresh-token-lifecycle.md) | refresh token 生命周期与 401 处置 | 账号处置状态机变化时同步更新 |
+| [account-loss-log.md](account-loss-log.md) | 掉号台账：按日期记录损失、上游判词与证据边界 | 每次确认批量掉号后追加一节，不覆盖历史；不可证的部分标注“未确认” |
 | [outbound-fingerprint-research.md](outbound-fingerprint-research.md) | 2026-11-25 调研快照 | 保留历史证据；现行口径以 outbound-identity 为准 |
 | [competitive-research.md](competitive-research.md) | 2026-11-11 竞品与路线图快照 | 不是现行 API 清单；落地状态以代码/README 为准 |
 | [ui-v3/README.md](ui-v3/README.md) | v1.20.0 面板视觉归档 | 历史截图，不承诺对应当前面板 |

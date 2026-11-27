@@ -132,6 +132,11 @@ type Config struct {
 		// 正值 = 该窗口。窗口不取 60，留余量避免尾部账号撞进下一小时。
 		// nil 的默认值在 normalize 里落地（见那里的说明：scheduler 零值 = 不抖动）。
 		JitterMinutes *int `json:"jitter_minutes"`
+
+		// KeepaliveRenewBefore 定时保活的临期刷新阈值（如 "168h"=7 天）：
+		// 只有 access_token 剩余有效期 <= 该值时才执行定时刷新；"0" 表示每次保活都刷新。
+		// 默认 "168h"，避免每晚无条件对尚有数周/数月有效期的账号批量轮换 RT。
+		KeepaliveRenewBefore string `json:"keepalive_renew_before"`
 	} `json:"schedule"`
 
 	Global struct {
@@ -195,6 +200,11 @@ type Config struct {
 		// 为什么留这条退路：capture 模式的所有口径来自同类项目的逆向结论，我们没有
 		// 自己的抓包能本地自证，生产上必须能立刻回到已知可跑的形态。
 		IdentityMode string `json:"identity_mode"`
+
+		// LegacyCatalogProbe 是否在 /v3/config 目录探测中额外附带历史 UA
+		// （CodeBuddyIDE/4.12.0、CLI/2.63.2）。默认 false（只用当前官方桌面 UA），
+		// 避免用真实账号 Bearer 反复向服务端发出已暴露的非官方旧指纹。
+		LegacyCatalogProbe bool `json:"legacy_catalog_probe"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -306,6 +316,13 @@ type Config struct {
 		// 窗口内复用上次结论——上游大面积 401（issue #215 那种）时，每个失败请求都去
 		// 求证等于给刷新端点造风暴。<=0 回落默认。
 		SessionVerifyInterval string `json:"session_verify_interval"`
+
+		// BatchDeadThreshold 批量掉号风控闸门阈值：在 BatchDeadWindow 窗口内至少
+		// 该数量的不同账号连续判 session_dead 时，自动暂停全部定时后台调度并告警。
+		// 默认 3；显式 0 表示关闭闸门（负值钳 0）。
+		BatchDeadThreshold int `json:"batch_dead_threshold"`
+		// BatchDeadWindow 批量掉号闸门的滑动统计窗口，默认 "10m"。
+		BatchDeadWindow string `json:"batch_dead_window"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -332,6 +349,10 @@ type Config struct {
 	SessionVerifyIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// KeepaliveRenewBeforeDur 解析后的定时保活临期刷新阈值；0 = 总是刷新。
+	KeepaliveRenewBeforeDur time.Duration `json:"-"`
+	// BatchDeadWindowDur 解析后的批量掉号闸门窗口（默认 10m）。
+	BatchDeadWindowDur time.Duration `json:"-"`
 }
 
 // defaultJitterMinutes 账号时刻抖动的默认窗口（分钟）。
@@ -378,6 +399,7 @@ func Default() *Config {
 	// 账号时刻抖动默认 45 分钟：24 个号共用一个出口 IP，不抖动就会同刻同动作。
 	jitterDef := defaultJitterMinutes
 	c.Schedule.JitterMinutes = &jitterDef
+	c.Schedule.KeepaliveRenewBefore = "168h"
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -415,6 +437,8 @@ func Default() *Config {
 	// JSON 显式写 false 才退回旧行为。
 	c.Pool.VerifySessionOn401 = true
 	c.Pool.SessionVerifyInterval = "60s"
+	c.Pool.BatchDeadThreshold = 3
+	c.Pool.BatchDeadWindow = "10m"
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
@@ -670,6 +694,19 @@ func (c *Config) normalize() error {
 		c.SessionVerifyIntervalDur = 60 * time.Second
 		c.Pool.SessionVerifyInterval = "60s"
 	}
+	// 批量掉号风控闸门：threshold 负值钳 0（0 = 关闭）；window 空回落 "10m"，<=0 报错。
+	if c.Pool.BatchDeadThreshold < 0 {
+		c.Pool.BatchDeadThreshold = 0
+	}
+	if c.Pool.BatchDeadWindow == "" {
+		c.Pool.BatchDeadWindow = "10m"
+	}
+	if c.BatchDeadWindowDur, err = time.ParseDuration(c.Pool.BatchDeadWindow); err != nil {
+		return fmt.Errorf("pool.batch_dead_window: %w", err)
+	}
+	if c.BatchDeadWindowDur <= 0 {
+		return fmt.Errorf("pool.batch_dead_window: 必须为正时长，收到 %q", c.Pool.BatchDeadWindow)
+	}
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
@@ -773,6 +810,16 @@ func (c *Config) normalize() error {
 	} else if *c.Schedule.JitterMinutes < 0 {
 		zero := 0
 		c.Schedule.JitterMinutes = &zero
+	}
+	// 定时保活临期刷新阈值：空回落 "168h"（7 天）；"0" = 每次保活都刷新；负值报错。
+	if c.Schedule.KeepaliveRenewBefore == "" {
+		c.Schedule.KeepaliveRenewBefore = "168h"
+	}
+	if c.KeepaliveRenewBeforeDur, err = time.ParseDuration(c.Schedule.KeepaliveRenewBefore); err != nil {
+		return fmt.Errorf("schedule.keepalive_renew_before: %w", err)
+	}
+	if c.KeepaliveRenewBeforeDur < 0 {
+		return fmt.Errorf("schedule.keepalive_renew_before: 负时长 %q 无意义", c.Schedule.KeepaliveRenewBefore)
 	}
 	if err := c.validateScheduleHours(); err != nil {
 		return err

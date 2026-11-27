@@ -86,7 +86,7 @@ systemctl start workbuddy-panel
 | 单次 401 / 12153 | 不足以判定吊销 | 默认先求证；查 `pool.verify_session_on_401` 与日志 |
 | 429 / 5xx / 网络错误 | 不是吊销证据 | 不应触发账号禁用 |
 
-详细状态机见 [refresh-token-lifecycle.md](refresh-token-lifecycle.md)。
+详细状态机见 [refresh-token-lifecycle.md](refresh-token-lifecycle.md)；历史掉号的时间线与证据见 [account-loss-log.md](account-loss-log.md)。运行期首次确证 `rt_dead` / `session_dead` / `banned` 时会自动追加记录到 `data/account-loss.jsonl`；触发批量掉号闸门（`pool.batch_dead_threshold`）时会自动暂停定时后台任务，核查后可调用 `POST /panel/api/pool/resume-gate` 恢复。
 
 ## 5. 配置变更
 

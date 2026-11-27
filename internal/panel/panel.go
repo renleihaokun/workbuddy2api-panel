@@ -312,6 +312,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/refresh", p.withAuth(p.accountRefresh))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/relogin/start", p.withAuth(p.accountReloginStart))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
+	p.mux.HandleFunc("POST /panel/api/pool/resume-gate", p.withAuth(p.poolResumeGate))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
@@ -406,7 +407,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
 		"auth_required":   p.apiKey() != "",
@@ -426,10 +427,31 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
+		// batch_dead_gate 批量掉号风控闸门状态（触发时定时任务暂停，避免扩大损失）。
+		"batch_dead_gate": p.cfg.Pool.BatchDeadGateStatus(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
 		"balance_refresh_sec":  p.balanceRefreshSec(),
 		"balance_refreshed_at": p.balanceRefreshedAt(),
+	}
+	if p.cfg.Upstream != nil {
+		if until := p.cfg.Upstream.RefreshPausedUntil(); !until.IsZero() {
+			out["refresh_paused_until"] = until
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// poolResumeGate 手动复位批量掉号风控闸门并恢复定时后台任务。
+func (p *Panel) poolResumeGate(w http.ResponseWriter, r *http.Request) {
+	p.cfg.Pool.ResetBatchDeadGate()
+	if p.cfg.Scheduler != nil {
+		p.cfg.Scheduler.SetBatchPaused(false, "panel resume")
+	}
+	log.Printf("panel: 已手动复位批量掉号闸门并恢复定时后台任务")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"batch_dead_gate": p.cfg.Pool.BatchDeadGateStatus(),
 	})
 }
 

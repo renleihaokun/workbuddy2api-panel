@@ -22,10 +22,23 @@ func (p *Pool) Disable(uid, reason string) {
 // banned → 提示申诉（重登无效）；manual → 给「解冻」。用枚举而不是解析 reason
 // 文案：reason 是给人看的、各调用点措辞会漂，拿它当判据迟早出错。
 func (p *Pool) DisableWithKind(uid, reason, kind string) {
+	var lossEv *LossEvent
+	var cb func(LossEvent)
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
+		wasBanned := e.disabled && e.disabledKind == DisableKindBanned
+		authSnap := e.a
 		p.disableLocked(e, reason, kind)
+		if kind == DisableKindBanned && !wasBanned {
+			lossEv = &LossEvent{Event: "banned", UID: uid, Reason: reason, Auth: authSnap}
+			cb = p.onLoss
+		}
+	}
+	p.mu.Unlock()
+
+	if lossEv != nil && cb != nil {
+		cb(*lossEv)
 	}
 }
 
@@ -39,19 +52,55 @@ func (p *Pool) DisableWithKind(uid, reason, kind string) {
 // 即使账号已 disabled，计数仍累计并返回 false 前 N-1 次——但 keepalive 会跳过
 // disabled 号，实际只有「已 disabled 后复活且计数未清」这类场景才会走到这里。
 func (p *Pool) NoteSessionDead(uid string) bool {
+	var disabledNow bool
+	var events []LossEvent
+	var lossCb func(LossEvent)
+	var tripCb func(int, time.Duration)
+	var tripCount int
+	var tripWin time.Duration
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
-	if !ok {
-		return false
+	if ok {
+		e.sessionDeadFails++
+		if e.sessionDeadFails >= sessionDeadThreshold {
+			wasSessionDead := e.disabled && e.disabledKind == DisableKindSessionDead
+			authSnap := e.a
+			e.sessionDeadFails = 0
+			p.disableLocked(e, sessionDeadReason, DisableKindSessionDead)
+			disabledNow = true
+			if !wasSessionDead {
+				lossCb = p.onLoss
+				events = append(events, LossEvent{
+					Event:  "session_dead",
+					UID:    uid,
+					Reason: sessionDeadReason,
+					Auth:   authSnap,
+				})
+				if tripped, count, win := p.recordBatchDeadLocked(uid, time.Now()); tripped {
+					tripCb = p.onBatchDeadTrip
+					tripCount = count
+					tripWin = win
+					events = append(events, LossEvent{
+						Event:  "batch_gate_tripped",
+						UID:    uid,
+						Reason: formatBatchTripReason(count, win),
+					})
+				}
+			}
+		}
 	}
-	e.sessionDeadFails++
-	if e.sessionDeadFails < sessionDeadThreshold {
-		return false
+	p.mu.Unlock()
+
+	if lossCb != nil {
+		for _, ev := range events {
+			lossCb(ev)
+		}
 	}
-	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason, DisableKindSessionDead)
-	return true
+	if tripCb != nil {
+		tripCb(tripCount, tripWin)
+	}
+	return disabledNow
 }
 
 // MarkRefreshTokenDead 记录「refresh token 已被上游判死」，但**不禁用、不冷却**。
@@ -64,15 +113,31 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 // 与 sessionDeadFails 的关系：RT 判死是「凭证层」事实，与「账号是否还可用」是两个
 // 维度，各自独立记账——这里**不动**连续计数（AT 过期后的 401 还要正常三振）。
 func (p *Pool) MarkRefreshTokenDead(uid string) bool {
+	var lossEv *LossEvent
+	var cb func(LossEvent)
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
-	if !ok {
-		return false
+	if ok {
+		wasDead := !e.rtDeadAt.IsZero()
+		e.rtDeadAt = time.Now()
+		p.dirty.Store(true)
+		if !wasDead {
+			lossEv = &LossEvent{
+				Event:  "rt_dead",
+				UID:    uid,
+				Reason: "refresh token invalidated",
+				Auth:   e.a,
+			}
+			cb = p.onLoss
+		}
 	}
-	e.rtDeadAt = time.Now()
-	p.dirty.Store(true)
-	return true
+	p.mu.Unlock()
+
+	if lossEv != nil && cb != nil {
+		cb(*lossEv)
+	}
+	return ok
 }
 
 // ClearRefreshTokenDead 清「RT 已死」标记——只在 refresh 成功（会话被证明活着）时调用。
